@@ -31,8 +31,16 @@ Design pillars (do not violate them casually):
   against. **Its crate docs define the term representation contract**; read
   them before touching either side.
 - `crates/manac/` — CLI driver: runs `erlc +to_core` on `.erl` input, parses,
-  compiles, links with `cc`.
-- `examples/` — `.erl` programs used as end-to-end tests.
+  compiles code reachable from `--entry` (default `main/0`), links with `cc`.
+- `hex/mana/` — the Hex package Elixir projects depend on. Its
+  `mix mana.compile --entry Mod.fun/0` task compiles the Mix project,
+  extracts textual Core Erlang from the entry module's `.beam` debug_info
+  (`Mana.CoreDump`: `backend.debug_info(:core_v1, ...)` + `:core_pp.format/1`),
+  and invokes `manac`. Locates the compiler via `--bin` /
+  `config :mana, :bin` / `MANA_BIN` / PATH.
+- `examples/` — `.erl` programs used as end-to-end tests;
+  `examples/elixir/` holds Mix-project examples built via `mix mana.compile`.
+- `test/conformance/` — the correctness gate (see below).
 
 ## Term representation (the one contract that must never drift)
 
@@ -53,20 +61,32 @@ the other in the same commit and re-run the end-to-end check below.
 ## Build, test, verify
 
 ```sh
-cargo build                 # builds everything incl. libmana_rt.a
-cargo test                  # unit tests (parser, etc.)
+make build                  # cargo build — everything incl. libmana_rt.a
+make test                   # cargo test — unit tests (parser, etc.)
+make test-conformance       # THE correctness gate (see below)
 
-# End-to-end check — ALWAYS run this before considering work done:
+# Quick end-to-end smoke checks:
 ./target/debug/manac -o /tmp/demo examples/demo.erl && /tmp/demo
 ./target/debug/manac -o /tmp/fib  examples/fib.erl  && /tmp/fib   # expect 832040
+make example-elixir                                               # expect 832040
 ```
 
+**Conformance is the gate.** `test/conformance/` holds `Conf.*` Elixir
+modules with a `go/0` that prints via `:erlang.display/1`. The harness runs
+each program on BEAM (as a separate OS process — the oracle) and as a
+mana-compiled binary, and asserts the stdouts are identical. There are no
+golden files; BEAM is always the reference. **A language or runtime feature
+without a conformance program covering it is not done.** Add programs by
+dropping a module in `test/conformance/lib/`.
+
 A change is not done because `cargo build` passes. Codegen bugs surface only
-when a compiled program runs; always execute the examples. When you add a
-language feature, add or extend an example in `examples/` that exercises it.
+when a compiled program runs; always run the conformance suite and the
+examples. When you add a language feature, add a conformance program that
+exercises it.
 
 Requirements: Rust stable (pinned by `rust-toolchain.toml`, needs ≥ 1.88),
-LLVM 22 (`llvm-config` on PATH), Erlang/OTP (`erlc`), a C compiler (`cc`).
+LLVM 22 (`llvm-config` on PATH), Erlang/OTP (`erlc`) + Elixir (`mix`), a C
+compiler (`cc`).
 
 ## Conventions
 
@@ -133,7 +153,9 @@ When asked to open a PR:
 - **Comparisons are int-only.** `<`, `=<` etc. compare raw tagged words,
   which is correct for small ints and identity of immediates, wrong across
   types and for boxed terms. Full term ordering is future work.
-- `module_info/0,1` definitions are intentionally skipped by codegen; every
-  erlc-produced module contains them.
-- `examples/*.core`, `*.beam`, and compiled example binaries are gitignored
-  build artifacts — never commit them.
+- `module_info/0,1` and Elixir's `__info__/1` are never compiled in
+  practice: codegen only compiles functions reachable from the entry point.
+  Don't remove the reachability pruning — those generated functions use
+  constructs codegen rejects (binaries, unsupported BIFs).
+- `examples/*.core`, `*.beam`, `_mana/`, `_build/`, `deps/`, and compiled
+  example binaries are gitignored build artifacts — never commit them.

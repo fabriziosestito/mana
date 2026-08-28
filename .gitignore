@@ -5,3 +5,7 @@ examples/fib
 *.o
 examples/demo
 examples/bench
+_mana/
+_build/
+deps/
+erl_crash.dump
