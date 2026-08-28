@@ -10,11 +10,11 @@ defmodule Mix.Tasks.Mana.Compile do
   exits. Accepted entry formats: `Mod.fun/0`, `Nested.Mod.fun/0`,
   `mod:fun/0` (Erlang-style, module taken verbatim).
 
-  Current limitations (early days): the entry module must be
-  self-contained — it may call only `:erlang` BIFs supported by the mana
-  runtime, not other modules or the Elixir standard library.
+  Current limitations (early days): modules of this project may call each
+  other and supported `:erlang` BIFs, but the Elixir/Erlang standard library
+  and Hex dependencies are not available yet.
 
-  Output goes to `_mana/` by default: the extracted `.core` file (kept for
+  Output goes to `_mana/` by default: the extracted `.core` files (kept for
   debugging) and the final binary `_mana/app`.
   """
 
@@ -32,13 +32,30 @@ defmodule Mix.Tasks.Mana.Compile do
     out = Path.expand(opts[:out] || "_mana")
     File.mkdir_p!(out)
 
-    beam = beam_path!(mod)
-    core = Path.join(out, "#{mod}.core")
-    Mana.CoreDump.dump!(beam, core)
+    # Dump every module of the project; manac compiles only what the entry
+    # reaches (and only errors on parse failures of modules it needs).
+    beams = Path.wildcard(Path.join(Mix.Project.compile_path(), "*.beam"))
+
+    if beams == [] do
+      Mix.raise("no compiled modules under #{Mix.Project.compile_path()}")
+    end
+
+    entry_beam = Path.join(Mix.Project.compile_path(), "#{mod}.beam")
+
+    unless entry_beam in beams do
+      Mix.raise("no compiled module #{inspect(mod)} at #{entry_beam}")
+    end
+
+    cores =
+      for beam <- beams do
+        core = Path.join(out, Path.basename(beam, ".beam") <> ".core")
+        Mana.CoreDump.dump!(beam, core)
+        core
+      end
 
     manac = Mana.compiler_path(bin: opts[:bin])
     app = Path.join(out, "app")
-    args = ["--entry", "#{fun}/#{arity}", "-o", app, core]
+    args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ cores
 
     case System.cmd(manac, args, stderr_to_stdout: true, into: IO.stream(:stdio, :line)) do
       {_, 0} -> :ok
@@ -77,16 +94,6 @@ defmodule Mix.Tasks.Mana.Compile do
 
       true ->
         :error
-    end
-  end
-
-  defp beam_path!(mod) do
-    path = Path.join(Mix.Project.compile_path(), "#{mod}.beam")
-
-    if File.exists?(path) do
-      path
-    else
-      Mix.raise("no compiled module #{inspect(mod)} at #{path}")
     end
   end
 end
