@@ -8,7 +8,7 @@
 //! tail position. TODO(lco): switch to tailcc + musttail with a uniform
 //! signature so cross-function tail calls are guaranteed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use inkwell::basic_block::BasicBlock;
@@ -37,10 +37,19 @@ const KIND_FLOAT: u64 = 1;
 type CgResult<T> = Result<T, String>;
 type Env<'ctx> = HashMap<String, IntValue<'ctx>>;
 
-pub fn compile_module(ast: &Module, out_obj: &Path, dump_ir: bool) -> CgResult<()> {
+/// Compile `ast` to an object file. Only functions reachable from `entry`
+/// are compiled (closed world) — this is what lets us ignore generated
+/// functions like `__info__/1` and `module_info/0,1` that use unsupported
+/// constructs. A C `main` calling `entry` (arity 0) is emitted.
+pub fn compile_module(
+    ast: &Module,
+    out_obj: &Path,
+    dump_ir: bool,
+    entry: &FunName,
+) -> CgResult<()> {
     let context = Context::create();
     let cg = Cg::new(&context, &ast.name);
-    cg.compile(ast)?;
+    cg.compile(ast, entry)?;
     if dump_ir {
         eprintln!("{}", cg.module.print_to_string().to_string());
     }
@@ -156,10 +165,18 @@ impl<'ctx> Cg<'ctx> {
 
     // ---- module compilation ----
 
-    fn compile(&self, ast: &Module) -> CgResult<()> {
-        // Declare all functions first so any order of definition works.
+    fn compile(&self, ast: &Module, entry: &FunName) -> CgResult<()> {
+        if entry.arity != 0 {
+            return Err(format!(
+                "entry function {}/{} must have arity 0",
+                entry.name, entry.arity
+            ));
+        }
+        let reachable = reachable_funs(ast, entry)?;
+
+        // Declare reachable functions first so any order of definition works.
         for (fname, fun) in &ast.definitions {
-            if is_module_info(fname) {
+            if !reachable.contains(fname) {
                 continue;
             }
             let params: Vec<BasicMetadataTypeEnum> = (0..fun.params.len())
@@ -173,19 +190,13 @@ impl<'ctx> Cg<'ctx> {
         }
 
         for (fname, fun) in &ast.definitions {
-            if is_module_info(fname) {
+            if !reachable.contains(fname) {
                 continue;
             }
             self.compile_fn(fname, fun)?;
         }
 
-        if ast.exports.iter().any(|f| f.name == "main" && f.arity == 0) {
-            self.emit_main(&FunName {
-                name: "main".into(),
-                arity: 0,
-            })?;
-        }
-        Ok(())
+        self.emit_main(entry)
     }
 
     fn compile_fn(&self, fname: &FunName, fun: &Fun) -> CgResult<()> {
@@ -348,6 +359,7 @@ impl<'ctx> Cg<'ctx> {
                 Ok(phi.as_basic_value().into_int_value())
             }
             Expr::Values(_) => Err("multi-value expression outside let/case".into()),
+            Expr::Binary(_) => Err("bitstring construction is not supported yet".into()),
             Expr::Fun(_) => Err("fun expressions (closures) are not supported yet".into()),
             Expr::LetRec { .. } => {
                 Err("letrec is not supported yet (list comprehensions)".into())
@@ -497,6 +509,7 @@ impl<'ctx> Cg<'ctx> {
                 self.match_pattern(f, val, inner, env, fail)
             }
             Pattern::Lit(Literal::Float(_)) => Err("float patterns not supported yet".into()),
+            Pattern::Binary(_) => Err("bitstring patterns are not supported yet".into()),
             Pattern::Lit(l) => {
                 let expect = self.compile_literal(l)?;
                 let eq = self
@@ -807,12 +820,89 @@ impl<'ctx> Cg<'ctx> {
     }
 }
 
-fn is_module_info(f: &FunName) -> bool {
-    f.name == "module_info" && (f.arity == 0 || f.arity == 1)
-}
-
 fn is_raise(primop: &str) -> bool {
     matches!(primop, "match_fail" | "raise" | "error" | "exit" | "throw")
+}
+
+/// Functions transitively reachable from `entry` via `apply` of local fnames.
+/// (Fun-value escapes don't exist yet — closures are unsupported.)
+fn reachable_funs(ast: &Module, entry: &FunName) -> CgResult<HashSet<FunName>> {
+    let defs: HashMap<&FunName, &Fun> = ast.definitions.iter().map(|(f, b)| (f, b)).collect();
+    if !defs.contains_key(entry) {
+        let known: Vec<String> = ast
+            .definitions
+            .iter()
+            .map(|(f, _)| format!("{}/{}", f.name, f.arity))
+            .collect();
+        return Err(format!(
+            "entry function {}/{} is not defined in module '{}' (defined: {})",
+            entry.name,
+            entry.arity,
+            ast.name,
+            known.join(", ")
+        ));
+    }
+    let mut seen: HashSet<FunName> = HashSet::new();
+    let mut work = vec![entry.clone()];
+    while let Some(f) = work.pop() {
+        if !seen.insert(f.clone()) {
+            continue;
+        }
+        if let Some(fun) = defs.get(&f) {
+            let mut targets = Vec::new();
+            collect_applies(&fun.body, &mut targets);
+            work.extend(targets);
+        }
+    }
+    Ok(seen)
+}
+
+fn collect_applies(e: &Expr, out: &mut Vec<FunName>) {
+    match e {
+        Expr::Var(_) | Expr::Lit(_) => {}
+        Expr::Tuple(items) | Expr::Values(items) => {
+            items.iter().for_each(|i| collect_applies(i, out))
+        }
+        Expr::Cons(h, t) => {
+            collect_applies(h, out);
+            collect_applies(t, out);
+        }
+        Expr::Fun(f) => collect_applies(&f.body, out),
+        Expr::Let { arg, body, .. } => {
+            collect_applies(arg, out);
+            collect_applies(body, out);
+        }
+        Expr::LetRec { defs, body } => {
+            defs.iter().for_each(|(_, f)| collect_applies(&f.body, out));
+            collect_applies(body, out);
+        }
+        Expr::Apply { target, args } => {
+            if let ApplyTarget::LocalFun(f) = target {
+                out.push(f.clone());
+            }
+            args.iter().for_each(|a| collect_applies(a, out));
+        }
+        Expr::Call { args, .. } | Expr::PrimOp { args, .. } => {
+            args.iter().for_each(|a| collect_applies(a, out))
+        }
+        Expr::Case { arg, clauses } => {
+            collect_applies(arg, out);
+            for c in clauses {
+                collect_applies(&c.guard, out);
+                collect_applies(&c.body, out);
+            }
+        }
+        Expr::Binary(segs) => {
+            for s in segs {
+                collect_applies(&s.value, out);
+                s.spec.iter().for_each(|x| collect_applies(x, out));
+            }
+        }
+        Expr::Do(a, b) => {
+            collect_applies(a, out);
+            collect_applies(b, out);
+        }
+    }
 }
 
 fn is_true_atom(e: &Expr) -> bool {

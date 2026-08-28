@@ -1,8 +1,9 @@
 //! manac — Core Erlang → native binary compiler driver.
 //!
-//! Usage: manac [-o OUT] [--emit-ir] FILE.{erl,core}
+//! Usage: manac [-o OUT] [--entry NAME/ARITY] [--emit-ir] FILE.{erl,core}
 //!
-//! .erl inputs are first run through `erlc +to_core`.
+//! .erl inputs are first run through `erlc +to_core`. Only code reachable
+//! from the entry function (default `main/0`) is compiled.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -20,6 +21,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut entry = String::from("main/0");
     let mut emit_ir = false;
 
     let mut args = std::env::args().skip(1);
@@ -30,9 +32,10 @@ fn run() -> Result<(), String> {
                     args.next().ok_or("-o requires an argument")?,
                 ))
             }
+            "--entry" => entry = args.next().ok_or("--entry requires NAME/ARITY")?,
             "--emit-ir" => emit_ir = true,
             "-h" | "--help" => {
-                println!("usage: manac [-o OUT] [--emit-ir] FILE.{{erl,core}}");
+                println!("usage: manac [-o OUT] [--entry NAME/ARITY] [--emit-ir] FILE.{{erl,core}}");
                 return Ok(());
             }
             other if other.starts_with('-') => return Err(format!("unknown flag {}", other)),
@@ -40,6 +43,7 @@ fn run() -> Result<(), String> {
         }
     }
     let input = input.ok_or("no input file (try --help)")?;
+    let entry = parse_entry(&entry)?;
 
     let core_path = match input.extension().and_then(|e| e.to_str()) {
         Some("core") => input.clone(),
@@ -53,12 +57,25 @@ fn run() -> Result<(), String> {
 
     let out = output.unwrap_or_else(|| PathBuf::from(&ast.name));
     let obj = out.with_extension("o");
-    mana_codegen::compile_module(&ast, &obj, emit_ir)?;
+    mana_codegen::compile_module(&ast, &obj, emit_ir, &entry)?;
 
     link(&obj, &out)?;
     let _ = std::fs::remove_file(&obj);
     println!("{}", out.display());
     Ok(())
+}
+
+fn parse_entry(s: &str) -> Result<mana_syntax::FunName, String> {
+    let (name, arity) = s
+        .rsplit_once('/')
+        .ok_or_else(|| format!("bad --entry '{}': expected NAME/ARITY", s))?;
+    let arity: usize = arity
+        .parse()
+        .map_err(|_| format!("bad --entry arity in '{}'", s))?;
+    Ok(mana_syntax::FunName {
+        name: name.to_string(),
+        arity,
+    })
 }
 
 fn erl_to_core(input: &Path) -> Result<PathBuf, String> {
