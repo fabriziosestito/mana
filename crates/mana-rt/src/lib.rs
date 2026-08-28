@@ -32,6 +32,19 @@ pub const TAG_CONS: u64 = 0b100;
 
 pub const KIND_TUPLE: u64 = 0;
 pub const KIND_FLOAT: u64 = 1;
+/// Fun object: `[header | code_ptr | captured terms...]`.
+/// Header: bits 0-7 kind, bits 8-15 arity, bits 16+ number of captures.
+pub const KIND_FUN: u64 = 2;
+
+/// A fun was applied to the wrong number of arguments, or a non-fun value
+/// was applied. Exceptions proper are a later milestone.
+#[no_mangle]
+pub extern "C" fn mana_rt_badfun(term: u64) -> ! {
+    let mut out = String::new();
+    write_term(term, &mut out);
+    eprintln!("mana: bad fun application: {}", out);
+    std::process::exit(1);
+}
 
 /// Bump allocation straight from malloc; leaks by design until the GC lands.
 #[no_mangle]
@@ -121,6 +134,7 @@ fn write_term(t: u64, out: &mut String) {
                     let f = f64::from_bits(*p.add(1));
                     out.push_str(&format!("{:?}", f));
                 }
+                KIND_FUN => out.push_str("#Fun<mana>"),
                 _ => out.push_str("#<unknown-boxed>"),
             }
         },
