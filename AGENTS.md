@@ -145,17 +145,24 @@ When asked to open a PR:
   name is derived from the atom text — the linker keeps one per name. Do
   not merge everything into a single LLVM module, change atom linkage, or
   make atom symbol names non-deterministic.
-- **Processes: shared heap, zero-copy messages, single scheduler.** All
-  processes share one heap (safe: terms are immutable) — `!` just pushes
-  the term into the target mailbox, no copying. Each process is a
-  corosensei coroutine; the scheduler swaps the per-process ctx fields
-  (roots_head, exc, reductions — word 5 is the reduction counter contract)
-  while heap words 0/1 stay put. **Yield points are a subset of GC points**:
-  reduction checks only at framed-function entries after params are rooted
-  — preemption must never be added anywhere a live term sits in an SSA
-  register. GC walks every process (saved frame chains, mailboxes, pending
-  spawn closures, exc slots). Known limits: CPU-bound frameless loops don't
-  preempt; stacks are fixed (root 32MB, spawned 1MB — TODO(stacks)).
+- **Processes: SMP, per-scheduler nurseries, shared old generation.**
+  `MANA_SCHEDULERS=N` (default 1). Processes are corosensei coroutines
+  **pinned to home schedulers** — only the home thread touches a process's
+  coroutine/cursor/saved fields; cross-thread interaction is mailbox push,
+  state flip, condvar wake. Same-scheduler sends are zero-copy (local
+  minors scan local mailboxes); cross-scheduler payloads are **promoted to
+  the shared old space at send** (young parts copied once; old parts always
+  zero-copy). Minors are scheduler-local; majors stop the world (schedulers
+  park at safepoints: scheduler loop + alloc slow path). **Yield points are
+  a subset of GC points**: reduction checks (ctx word 5) only at framed
+  entries after params are rooted — never add preemption where a live term
+  sits in an SSA register. When touching scheduler/GC code, run the SMP
+  stress matrix: `Conf.Smp` at MANA_SCHEDULERS=2/4/8, 10 runs each, output
+  must be identical. Known limits: frameless CPU loops don't preempt or
+  reach STW safepoints (unbounded pause latency, not unsoundness); fixed
+  stacks (root 32MB, spawned 1MB — TODO(stacks)); per-message mutex costs
+  ~7x on the message micro-bench vs the old single-thread runtime — the
+  designed fix is BEAM-style ingress/private mailbox splitting (TODO(mailbox)).
 - **Exceptions unwind by sentinel, not EH tables.** A raise stores class/
   reason into ctx words 3/4 and returns the reserved word `0b101` (tag 101 —
   never a valid term); calls to may-raise functions (a whole-program
