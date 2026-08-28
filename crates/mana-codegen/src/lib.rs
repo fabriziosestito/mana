@@ -2,25 +2,42 @@
 //!
 //! Term representation matches mana-rt (see its crate docs): i64 words,
 //! 3-bit tags — 001 small int, 010 atom ptr, 011 nil, 100 cons ptr,
-//! 000 boxed ptr. Boxed kinds: 0 tuple, 1 float, 2 fun.
+//! 000 boxed ptr (kinds: 0 tuple, 1 float, 2 fun). Tag 111 is the GC
+//! forwarding marker, never visible here.
 //!
-//! A program is one or more Core Erlang modules compiled to **one object
-//! file per module** (keeps incremental caching and parallel codegen
-//! possible). Atoms are emitted as `linkonce_odr` globals named by the atom
-//! text, so the system linker merges duplicates across objects: atom
-//! identity is one static address per name per binary. Cross-module calls
-//! are direct calls to the target's mangled symbol.
+//! # Process-context ABI
 //!
-//! Closures are lambda-lifted in closure-passing style: every lifted fun has
-//! signature `(args..., closure_term)`; the closure object is
-//! `[header | code_ptr | captures...]`. `letrec` groups share one capture
-//! environment and call each other directly. Fun references to top-level
-//! functions go through a generated shim so top-level functions keep their
-//! plain `(args...)` signature.
+//! Every compiled function takes `ctx: ptr` (mana-rt's `ProcCtx`) as its
+//! first argument. Codegen touches ctx only at word offset 2 (`roots_head`)
+//! for the root-frame chain; allocation goes through `mana_rt_alloc(ctx, n)`
+//! which may run a moving collection.
 //!
-//! Functions use the C calling convention with `tail` markers on calls in
-//! tail position. TODO(lco): switch to tailcc + musttail with a uniform
-//! signature so cross-function tail calls are guaranteed.
+//! # GC roots — effect analysis + frames + spills
+//!
+//! A term held in an SSA register is invalid after any *GC point* (a call
+//! into compiled code that may allocate, or an allocation). Three layers
+//! keep this sound without paying where it doesn't matter:
+//!
+//! 1. Whole-program **may-GC analysis** (fixpoint over the call graph):
+//!    functions whose bodies can't reach an allocation get **no frame and
+//!    no spills** — pure register code (fib stays fast).
+//! 2. Framed functions alloca a root frame `[prev, len, slots...]`, link it
+//!    into `ctx.roots_head` on entry and unlink before every return
+//!    (including before tail calls). Slots are NIL-initialized; all named
+//!    variables live in slots; reads load, binds store.
+//! 3. Intermediates are spilled **structurally**: a sibling value is rooted
+//!    only if a later sibling's evaluation contains a GC point; children of
+//!    an allocation (tuple/cons/closure) are always rooted because the
+//!    allocation itself is a GC point. Call arguments consumed by a callee
+//!    need no rooting across that call (the callee roots its own params).
+//!    TODO(liveness): per-variable liveness to shrink frames further.
+//!
+//! A program is one or more Core Erlang modules compiled to one object file
+//! per module. Atoms are `linkonce_odr` globals (linker-deduplicated,
+//! static, never collected). Closures are lambda-lifted in closure-passing
+//! style: lifted signature `(ctx, args..., closure)`.
+//!
+//! TODO(lco): tailcc + musttail for guaranteed cross-function tail calls.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -34,7 +51,10 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{BasicMetadataTypeEnum, FunctionType, IntType, PointerType};
-use inkwell::values::{CallSiteValue, FunctionValue, GlobalValue, IntValue, ValueKind};
+use inkwell::values::{
+    BasicMetadataValueEnum, CallSiteValue, FunctionValue, GlobalValue, IntValue, PointerValue,
+    ValueKind,
+};
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -50,34 +70,42 @@ const KIND_TUPLE: u64 = 0;
 const KIND_FLOAT: u64 = 1;
 const KIND_FUN: u64 = 2;
 
-type CgResult<T> = Result<T, String>;
+/// ctx word offset of `roots_head` (ProcCtx contract).
+const CTX_ROOTS: u64 = 2;
 
-/// Lexical scope: term variables, plus letrec-bound local funs (their
-/// lifted function and the shared-environment closure to pass them).
+type CgResult<T> = Result<T, String>;
+type GcSet = HashSet<(String, FunName)>;
+
+/// Where a variable's current value lives.
+#[derive(Clone, Copy)]
+enum Binding<'ctx> {
+    /// Frame slot index (framed functions — survives GC).
+    Slot(u64),
+    /// SSA value (frameless functions — no GC can occur).
+    Reg(IntValue<'ctx>),
+}
+
 #[derive(Clone, Default)]
 struct Scope<'ctx> {
-    vars: HashMap<String, IntValue<'ctx>>,
-    funs: HashMap<FunName, (FunctionValue<'ctx>, IntValue<'ctx>)>,
+    vars: HashMap<String, Binding<'ctx>>,
+    /// letrec-bound funs: lifted function + frame slot of the shared closure.
+    funs: HashMap<FunName, (FunctionValue<'ctx>, u64)>,
 }
 
 /// A lambda-lifted function whose body still needs compiling.
 struct Lift {
-    f_index: usize, // index into Cg::lifted
+    f_index: usize,
     params: Vec<String>,
     captures: Vec<String>,
-    sibs: Vec<(FunName, usize)>, // letrec group, as lifted indices
+    sibs: Vec<(FunName, usize)>,
     body: Expr,
 }
 
-/// Compile a program (one or more Core Erlang modules) to one object file
-/// per module in `out_dir`; returns the object paths. Only functions
-/// reachable from `entry` in `entry_mod` are compiled (closed world) — this
-/// is what lets us ignore generated functions like `__info__/1` and
-/// `module_info/0,1` that use unsupported constructs. A C `main` calling
-/// the entry (arity 0) is emitted into the entry module's object.
-///
-/// `poisoned` maps module names that failed to parse to their parse errors;
-/// if reachability needs one of them, that error is surfaced.
+/// Compile a program to one object file per module in `out_dir`; returns
+/// the object paths. Only functions reachable from `entry` are compiled
+/// (closed world). A C `main` (init ctx, call entry) lands in the entry
+/// module's object. `poisoned` maps unparseable module names to their
+/// errors, surfaced if reachability needs them.
 pub fn compile_program(
     mods: &[Module],
     entry_mod: &str,
@@ -101,6 +129,7 @@ pub fn compile_program(
         }
     }
     let reachable = reachable_funs(mods, entry_mod, entry, poisoned)?;
+    let gc_set = compute_may_gc(mods, &reachable);
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("creating {}: {}", out_dir.display(), e))?;
@@ -112,10 +141,10 @@ pub fn compile_program(
             .map(|(_, f)| f.clone())
             .collect();
         if include.is_empty() {
-            continue; // nothing from this module is reachable
+            continue;
         }
         let context = Context::create();
-        let cg = Cg::new(&context, &m.name);
+        let cg = Cg::new(&context, &m.name, &gc_set);
         let entry_here = (m.name == entry_mod).then_some(entry);
         cg.compile(m, &include, entry_here)?;
         if dump_ir {
@@ -131,7 +160,7 @@ pub fn compile_program(
     Ok(objs)
 }
 
-struct Cg<'ctx> {
+struct Cg<'ctx, 'p> {
     ctx: &'ctx Context,
     module: LlvmModule<'ctx>,
     builder: Builder<'ctx>,
@@ -143,10 +172,17 @@ struct Cg<'ctx> {
     pending: RefCell<Vec<Lift>>,
     lift_counter: Cell<u32>,
     module_name: String,
+    gc_set: &'p GcSet,
+    // per-function state
+    cur_ctx: Cell<Option<PointerValue<'ctx>>>,
+    cur_frame: Cell<Option<PointerValue<'ctx>>>,
+    var_slots: RefCell<HashMap<String, u64>>,
+    next_slot: Cell<u64>,
+    slot_cap: Cell<u64>,
 }
 
-impl<'ctx> Cg<'ctx> {
-    fn new(ctx: &'ctx Context, module_name: &str) -> Self {
+impl<'ctx, 'p> Cg<'ctx, 'p> {
+    fn new(ctx: &'ctx Context, module_name: &str, gc_set: &'p GcSet) -> Self {
         let module = ctx.create_module(module_name);
         Cg {
             ctx,
@@ -160,14 +196,34 @@ impl<'ctx> Cg<'ctx> {
             pending: Default::default(),
             lift_counter: Cell::new(0),
             module_name: module_name.to_string(),
+            gc_set,
+            cur_ctx: Cell::new(None),
+            cur_frame: Cell::new(None),
+            var_slots: Default::default(),
+            next_slot: Cell::new(0),
+            slot_cap: Cell::new(0),
         }
     }
 
+    /// `(ctx, term × arity) -> term`
     fn term_fn_type(&self, arity: usize) -> FunctionType<'ctx> {
-        let params: Vec<BasicMetadataTypeEnum> = (0..arity)
-            .map(|_| BasicMetadataTypeEnum::IntType(self.i64t))
-            .collect();
+        let mut params: Vec<BasicMetadataTypeEnum> =
+            vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
+        params.extend((0..arity).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
         self.i64t.fn_type(&params, false)
+    }
+
+    fn ctx_val(&self) -> PointerValue<'ctx> {
+        self.cur_ctx.get().expect("ctx param not set")
+    }
+
+    fn framed(&self) -> bool {
+        self.cur_frame.get().is_some()
+    }
+
+    fn expr_gc(&self, e: &Expr) -> bool {
+        let mut letrec = HashSet::new();
+        expr_may_gc(e, &self.module_name, self.gc_set, &mut letrec)
     }
 
     // ---- runtime externs ----
@@ -182,6 +238,10 @@ impl<'ctx> Cg<'ctx> {
             .unwrap_or_else(|| self.module.add_function(name, mk(), None))
     }
 
+    fn rt_init(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_init", || self.ptrt.fn_type(&[], false))
+    }
+
     fn rt_display(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_display", || {
             self.ctx
@@ -192,8 +252,13 @@ impl<'ctx> Cg<'ctx> {
 
     fn rt_alloc(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_alloc", || {
-            self.ptrt
-                .fn_type(&[BasicMetadataTypeEnum::IntType(self.i64t)], false)
+            self.ptrt.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
         })
     }
 
@@ -217,8 +282,7 @@ impl<'ctx> Cg<'ctx> {
 
     fn small_int(&self, n: i64) -> IntValue<'ctx> {
         // TODO(bignum): values outside the small range wrap silently.
-        self.i64t
-            .const_int(((n as u64) << 3) | TAG_SMALL, false)
+        self.i64t.const_int(((n as u64) << 3) | TAG_SMALL, false)
     }
 
     fn nil(&self) -> IntValue<'ctx> {
@@ -243,8 +307,8 @@ impl<'ctx> Cg<'ctx> {
                 g.set_initializer(&init);
                 g.set_constant(true);
                 g.set_alignment(8);
-                // Same atom name → same symbol name in every object; the
-                // linker keeps exactly one, giving program-wide identity.
+                // Same atom name → same symbol in every object; the linker
+                // keeps exactly one, giving program-wide identity.
                 g.set_linkage(Linkage::LinkOnceODR);
                 atoms.insert(name.to_string(), g);
                 g
@@ -259,6 +323,136 @@ impl<'ctx> Cg<'ctx> {
             .map_err(be)
     }
 
+    // ---- frames & slots ----
+
+    /// Set up the root frame for the function whose entry block the builder
+    /// is positioned in. `body` decides framedness; `var_names` are all
+    /// names that may be bound (params, captures, body binds).
+    fn setup_frame(
+        &self,
+        body: &Expr,
+        var_names: &[String],
+        letrec_sibs: &[FunName],
+    ) -> CgResult<()> {
+        self.var_slots.borrow_mut().clear();
+        let mut letrec: HashSet<FunName> = letrec_sibs.iter().cloned().collect();
+        if !expr_may_gc(body, &self.module_name, self.gc_set, &mut letrec) {
+            self.cur_frame.set(None);
+            return Ok(());
+        }
+
+        let mut vars: BTreeSet<String> = var_names.iter().cloned().collect();
+        let mut nodes = 0usize;
+        frame_prepass(body, &mut vars, &mut nodes);
+        let nvars = vars.len() as u64;
+        let cap = nvars + nodes as u64 + 8;
+
+        {
+            let mut slots = self.var_slots.borrow_mut();
+            for (i, v) in vars.iter().enumerate() {
+                slots.insert(v.clone(), i as u64);
+            }
+        }
+        self.next_slot.set(nvars);
+        self.slot_cap.set(cap);
+
+        let frame_ty = self.i64t.array_type((cap + 2) as u32);
+        let frame = self
+            .builder
+            .build_alloca(frame_ty, "gc.frame")
+            .map_err(be)?;
+        let ctx = self.ctx_val();
+        let prev = self.load_word(ctx, CTX_ROOTS)?;
+        self.store_word(frame, 0, prev)?;
+        self.store_word(frame, 1, self.i64t.const_int(cap, false))?;
+        for i in 0..cap {
+            self.store_word(frame, 2 + i, self.nil())?;
+        }
+        let frame_int = self
+            .builder
+            .build_ptr_to_int(frame, self.i64t, "frame.addr")
+            .map_err(be)?;
+        self.store_word(ctx, CTX_ROOTS, frame_int)?;
+        self.cur_frame.set(Some(frame));
+        Ok(())
+    }
+
+    /// Unlink the frame (before any return or tail call).
+    fn pop_frame(&self) -> CgResult<()> {
+        if let Some(frame) = self.cur_frame.get() {
+            let prev = self.load_word(frame, 0)?;
+            self.store_word(self.ctx_val(), CTX_ROOTS, prev)?;
+        }
+        Ok(())
+    }
+
+    fn emit_ret(&self, v: IntValue<'ctx>) -> CgResult<()> {
+        self.pop_frame()?;
+        self.builder.build_return(Some(&v)).map_err(be)?;
+        Ok(())
+    }
+
+    fn slot_ptr(&self, idx: u64) -> CgResult<PointerValue<'ctx>> {
+        let frame = self.cur_frame.get().expect("slot in frameless function");
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    self.i64t,
+                    frame,
+                    &[self.i64t.const_int(2 + idx, false)],
+                    "slot",
+                )
+                .map_err(be)
+        }
+    }
+
+    fn alloc_temp(&self) -> u64 {
+        let n = self.next_slot.get();
+        assert!(n < self.slot_cap.get(), "frame slot capacity exceeded");
+        self.next_slot.set(n + 1);
+        n
+    }
+
+    fn spill(&self, v: IntValue<'ctx>) -> CgResult<u64> {
+        let idx = self.alloc_temp();
+        let p = self.slot_ptr(idx)?;
+        self.builder.build_store(p, v).map_err(be)?;
+        Ok(idx)
+    }
+
+    fn reload(&self, idx: u64) -> CgResult<IntValue<'ctx>> {
+        let p = self.slot_ptr(idx)?;
+        Ok(self
+            .builder
+            .build_load(self.i64t, p, "reload")
+            .map_err(be)?
+            .into_int_value())
+    }
+
+    fn bind_var(&self, scope: &mut Scope<'ctx>, name: &str, v: IntValue<'ctx>) -> CgResult<()> {
+        if self.framed() {
+            let idx = *self
+                .var_slots
+                .borrow()
+                .get(name)
+                .unwrap_or_else(|| panic!("no slot preassigned for variable {}", name));
+            let p = self.slot_ptr(idx)?;
+            self.builder.build_store(p, v).map_err(be)?;
+            scope.vars.insert(name.to_string(), Binding::Slot(idx));
+        } else {
+            scope.vars.insert(name.to_string(), Binding::Reg(v));
+        }
+        Ok(())
+    }
+
+    fn read_var(&self, scope: &Scope<'ctx>, name: &str) -> CgResult<IntValue<'ctx>> {
+        match scope.vars.get(name) {
+            Some(Binding::Reg(v)) => Ok(*v),
+            Some(Binding::Slot(idx)) => self.reload(*idx),
+            None => Err(format!("unbound variable {}", name)),
+        }
+    }
+
     // ---- module compilation ----
 
     fn compile(
@@ -267,7 +461,6 @@ impl<'ctx> Cg<'ctx> {
         include: &HashSet<FunName>,
         entry: Option<&FunName>,
     ) -> CgResult<()> {
-        // Declare included functions first so any order of definition works.
         for (fname, fun) in &ast.definitions {
             if !include.contains(fname) {
                 continue;
@@ -298,17 +491,19 @@ impl<'ctx> Cg<'ctx> {
         let f = self.fns.borrow()[fname];
         let entry = self.ctx.append_basic_block(f, "entry");
         self.builder.position_at_end(entry);
+        self.cur_ctx
+            .set(Some(f.get_nth_param(0).unwrap().into_pointer_value()));
+        self.setup_frame(&fun.body, &fun.params, &[])?;
         let mut scope = Scope::default();
         for (i, p) in fun.params.iter().enumerate() {
-            let v = f.get_nth_param(i as u32).unwrap().into_int_value();
+            let v = f.get_nth_param(1 + i as u32).unwrap().into_int_value();
             v.set_name(p);
-            scope.vars.insert(p.clone(), v);
+            self.bind_var(&mut scope, p, v)?;
         }
         self.compile_tail(f, &fun.body, &mut scope)
     }
 
     /// Compile bodies of lambda-lifted funs queued during compilation.
-    /// Lifted bodies can themselves lift more funs, so drain to fixpoint.
     fn drain_lifts(&self) -> CgResult<()> {
         loop {
             // NB: pop in its own statement — a `while let` scrutinee would
@@ -318,18 +513,31 @@ impl<'ctx> Cg<'ctx> {
             let f = self.lifted.borrow()[l.f_index];
             let entry = self.ctx.append_basic_block(f, "entry");
             self.builder.position_at_end(entry);
+            self.cur_ctx
+                .set(Some(f.get_nth_param(0).unwrap().into_pointer_value()));
+
+            let closure_slot_name = "closure$".to_string();
+            let mut var_names: Vec<String> = l.params.clone();
+            var_names.extend(l.captures.iter().cloned());
+            if !l.sibs.is_empty() {
+                var_names.push(closure_slot_name.clone());
+            }
+            let sib_names: Vec<FunName> = l.sibs.iter().map(|(n, _)| n.clone()).collect();
+            self.setup_frame(&l.body, &var_names, &sib_names)?;
+
             let mut scope = Scope::default();
             for (i, p) in l.params.iter().enumerate() {
-                let v = f.get_nth_param(i as u32).unwrap().into_int_value();
+                let v = f.get_nth_param(1 + i as u32).unwrap().into_int_value();
                 v.set_name(p);
-                scope.vars.insert(p.clone(), v);
+                self.bind_var(&mut scope, p, v)?;
             }
             let closure = f
-                .get_nth_param(l.params.len() as u32)
+                .get_nth_param(1 + l.params.len() as u32)
                 .unwrap()
                 .into_int_value();
             closure.set_name("closure");
             if !l.captures.is_empty() {
+                // loads happen before any GC point (entry, no allocs yet)
                 let p = self
                     .builder
                     .build_int_to_ptr(closure, self.ptrt, "env.ptr")
@@ -337,12 +545,21 @@ impl<'ctx> Cg<'ctx> {
                 for (i, cap) in l.captures.iter().enumerate() {
                     let v = self.load_word(p, 2 + i as u64)?;
                     v.set_name(cap);
-                    scope.vars.insert(cap.clone(), v);
+                    self.bind_var(&mut scope, cap, v)?;
                 }
             }
-            for (fname, idx) in &l.sibs {
-                let sib = self.lifted.borrow()[*idx];
-                scope.funs.insert(fname.clone(), (sib, closure));
+            if !l.sibs.is_empty() && self.framed() {
+                // the closure term itself must be rooted for sibling calls;
+                // a member that never calls siblings can be frameless, in
+                // which case no sibling binding is ever consulted.
+                self.bind_var(&mut scope, &closure_slot_name, closure)?;
+                let Binding::Slot(cl_slot) = scope.vars[&closure_slot_name] else {
+                    unreachable!("framed bind produced a register");
+                };
+                for (fname, idx) in &l.sibs {
+                    let sib = self.lifted.borrow()[*idx];
+                    scope.funs.insert(fname.clone(), (sib, cl_slot));
+                }
             }
             self.compile_tail(f, &l.body, &mut scope)?;
         }
@@ -351,11 +568,20 @@ impl<'ctx> Cg<'ctx> {
 
     fn emit_main(&self, entry: &FunName) -> CgResult<()> {
         let i32t = self.ctx.i32_type();
-        let main = self.module.add_function("main", i32t.fn_type(&[], false), None);
+        let main = self
+            .module
+            .add_function("main", i32t.fn_type(&[], false), None);
         let bb = self.ctx.append_basic_block(main, "entry");
         self.builder.position_at_end(bb);
+        let init = self
+            .builder
+            .build_call(self.rt_init(), &[], "ctx")
+            .map_err(be)?;
+        let ctx = call_result(init)?.into_pointer_value();
         let target = self.fns.borrow()[entry];
-        self.builder.build_call(target, &[], "ret").map_err(be)?;
+        self.builder
+            .build_call(target, &[ctx.into()], "ret")
+            .map_err(be)?;
         self.builder
             .build_return(Some(&i32t.const_zero()))
             .map_err(be)?;
@@ -364,7 +590,6 @@ impl<'ctx> Cg<'ctx> {
 
     // ---- expression compilation ----
 
-    /// Compile `e` in tail position: every path ends in `ret` (or unreachable).
     fn compile_tail(
         &self,
         f: FunctionValue<'ctx>,
@@ -385,21 +610,31 @@ impl<'ctx> Cg<'ctx> {
                 self.compile_tail(f, then, scope)
             }
             Expr::Case { arg, clauses } => {
-                let vals = self.compile_case_arg(f, arg, scope)?;
+                let vals = self.compile_case_arg(f, arg, clauses, scope)?;
                 self.compile_case(f, &vals, clauses, scope, None)
             }
+            Expr::Try {
+                arg, vars, body, ..
+            } => {
+                // TODO(exceptions): degenerates to a let-binding for now.
+                if vars.len() != 1 {
+                    return Err("multi-value try is not supported".into());
+                }
+                let v = self.compile_value(f, arg, scope)?;
+                self.bind_var(scope, &vars[0], v)?;
+                self.compile_tail(f, body, scope)
+            }
             Expr::Apply { target, args } => {
-                let call = self.compile_apply(f, target, args, scope)?;
+                let call = self.compile_apply(f, target, args, scope, true)?;
                 call.set_tail_call(true);
                 let v = call_result(call)?;
                 self.builder.build_return(Some(&v)).map_err(be)?;
                 Ok(())
             }
-            // cross-module call in tail position (erlang: goes through the
-            // BIF path in compile_value instead)
             Expr::Call { module, name, args } if module != "erlang" => {
                 let callee = self.remote_fn(module, name, args.len());
-                let argv = self.compile_args(f, args, scope)?;
+                let argv = self.eval_args(f, args, scope)?;
+                self.pop_frame()?;
                 let call = self.builder.build_call(callee, &argv, "tail").map_err(be)?;
                 call.set_tail_call(true);
                 let v = call_result(call)?;
@@ -411,13 +646,11 @@ impl<'ctx> Cg<'ctx> {
             }
             _ => {
                 let v = self.compile_value(f, e, scope)?;
-                self.builder.build_return(Some(&v)).map_err(be)?;
-                Ok(())
+                self.emit_ret(v)
             }
         }
     }
 
-    /// Compile `e` for its value in the current block.
     fn compile_value(
         &self,
         f: FunctionValue<'ctx>,
@@ -425,35 +658,31 @@ impl<'ctx> Cg<'ctx> {
         scope: &mut Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
         match e {
-            Expr::Var(v) => scope
-                .vars
-                .get(v)
-                .copied()
-                .ok_or_else(|| format!("unbound variable {}", v)),
+            Expr::Var(v) => self.read_var(scope, v),
             Expr::Lit(l) => self.compile_literal(l),
             Expr::Tuple(items) => {
-                let vals = items
-                    .iter()
-                    .map(|it| self.compile_value(f, it, scope))
-                    .collect::<CgResult<Vec<_>>>()?;
-                let p = self.alloc_words(1 + vals.len() as u64)?;
+                let refs: Vec<&Expr> = items.iter().collect();
+                let slots = self.eval_all_rooted(f, &refs, scope)?;
+                let p = self.alloc_words(1 + slots.len() as u64)?;
                 let header = self
                     .i64t
-                    .const_int(((vals.len() as u64) << 8) | KIND_TUPLE, false);
+                    .const_int(((slots.len() as u64) << 8) | KIND_TUPLE, false);
                 self.store_word(p, 0, header)?;
-                for (i, v) in vals.iter().enumerate() {
-                    self.store_word(p, 1 + i as u64, *v)?;
+                for (i, s) in slots.iter().enumerate() {
+                    let v = self.reload(*s)?;
+                    self.store_word(p, 1 + i as u64, v)?;
                 }
                 self.builder
                     .build_ptr_to_int(p, self.i64t, "tuple")
                     .map_err(be)
             }
             Expr::Cons(h, t) => {
-                let hv = self.compile_value(f, h, scope)?;
-                let tv = self.compile_value(f, t, scope)?;
+                let slots = self.eval_all_rooted(f, &[h.as_ref(), t.as_ref()], scope)?;
                 let p = self.alloc_words(2)?;
-                self.store_word(p, 0, hv)?;
-                self.store_word(p, 1, tv)?;
+                for (i, s) in slots.iter().enumerate() {
+                    let v = self.reload(*s)?;
+                    self.store_word(p, i as u64, v)?;
+                }
                 let as_int = self
                     .builder
                     .build_ptr_to_int(p, self.i64t, "cons.addr")
@@ -464,8 +693,7 @@ impl<'ctx> Cg<'ctx> {
             }
             Expr::Fun(fun) => {
                 let free: Vec<String> = {
-                    let mut bound: HashSet<String> =
-                        fun.params.iter().cloned().collect();
+                    let mut bound: HashSet<String> = fun.params.iter().cloned().collect();
                     let mut out = BTreeSet::new();
                     free_vars(&fun.body, &mut bound, &mut out);
                     out.into_iter().collect()
@@ -478,16 +706,8 @@ impl<'ctx> Cg<'ctx> {
                     sibs: Vec::new(),
                     body: fun.body.clone(),
                 });
-                let caps = free
-                    .iter()
-                    .map(|v| {
-                        scope.vars.get(v).copied().ok_or_else(|| {
-                            format!("unbound variable {} captured by fun", v)
-                        })
-                    })
-                    .collect::<CgResult<Vec<_>>>()?;
                 let fv = self.lifted.borrow()[lifted];
-                self.make_closure(fv, fun.params.len(), &caps)
+                self.make_closure(fv, fun.params.len(), &free, scope)
             }
             Expr::FunRef { module, fun } => {
                 if module.is_none() && scope.funs.contains_key(fun) {
@@ -497,7 +717,7 @@ impl<'ctx> Cg<'ctx> {
                     ));
                 }
                 let shim = self.fun_shim(module.as_deref(), fun)?;
-                self.make_closure(shim, fun.arity, &[])
+                self.make_closure(shim, fun.arity, &[], scope)
             }
             Expr::Let { vars, arg, body } => {
                 self.bind_let(f, vars, arg, scope)?;
@@ -511,33 +731,40 @@ impl<'ctx> Cg<'ctx> {
                 self.compile_value(f, first, scope)?;
                 self.compile_value(f, then, scope)
             }
+            Expr::Try {
+                arg, vars, body, ..
+            } => {
+                // TODO(exceptions): degenerates to a let-binding for now.
+                if vars.len() != 1 {
+                    return Err("multi-value try is not supported".into());
+                }
+                let v = self.compile_value(f, arg, scope)?;
+                self.bind_var(scope, &vars[0], v)?;
+                self.compile_value(f, body, scope)
+            }
             Expr::Apply { target, args } => {
-                let call = self.compile_apply(f, target, args, scope)?;
+                let call = self.compile_apply(f, target, args, scope, false)?;
                 Ok(call_result(call)?.into_int_value())
             }
             Expr::Call { module, name, args } => {
                 if module == "erlang" {
                     self.compile_bif(f, name, args, scope)
                 } else {
-                    // Reachability already verified the target module and
-                    // function exist among the compiled modules.
                     let callee = self.remote_fn(module, name, args.len());
-                    let argv = self.compile_args(f, args, scope)?;
-                    let call =
-                        self.builder.build_call(callee, &argv, "call").map_err(be)?;
+                    let argv = self.eval_args(f, args, scope)?;
+                    let call = self.builder.build_call(callee, &argv, "call").map_err(be)?;
                     Ok(call_result(call)?.into_int_value())
                 }
             }
             Expr::PrimOp { name, args } if is_raise(name) => {
                 self.compile_raise(f, name, args, scope)?;
-                // continue in a dead block so callers can keep building
                 let dead = self.ctx.append_basic_block(f, "dead");
                 self.builder.position_at_end(dead);
                 Ok(self.i64t.get_undef())
             }
             Expr::PrimOp { name, .. } => Err(format!("unsupported primop {}", name)),
             Expr::Case { arg, clauses } => {
-                let vals = self.compile_case_arg(f, arg, scope)?;
+                let vals = self.compile_case_arg(f, arg, clauses, scope)?;
                 let merge = self.ctx.append_basic_block(f, "case.merge");
                 let mut incoming: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
                 self.compile_case(f, &vals, clauses, scope, Some((merge, &mut incoming)))?;
@@ -548,66 +775,123 @@ impl<'ctx> Cg<'ctx> {
                 }
                 Ok(phi.as_basic_value().into_int_value())
             }
-            Expr::Try {
-                arg, vars, body, ..
-            } => {
-                // TODO(exceptions): without exception support a raise inside
-                // `arg` terminates the program instead of reaching the
-                // handler, so `try` degenerates to a let-binding.
-                if vars.len() != 1 {
-                    return Err("multi-value try is not supported".into());
-                }
-                let v = self.compile_value(f, arg, scope)?;
-                scope.vars.insert(vars[0].clone(), v);
-                self.compile_value(f, body, scope)
-            }
             Expr::Values(_) => Err("multi-value expression outside let/case".into()),
             Expr::Binary(_) => Err("bitstring construction is not supported yet".into()),
             Expr::Map { .. } => Err("maps are not supported yet".into()),
         }
     }
 
-    /// Compile any `apply` (direct local, letrec-bound, or fun value) and
-    /// return the call site so callers can mark tail calls.
+    /// Evaluate sibling expressions left→right; a value is spilled only if
+    /// a *later* sibling's evaluation contains a GC point. Returns fresh
+    /// values valid at the point of return.
+    fn eval_siblings(
+        &self,
+        f: FunctionValue<'ctx>,
+        exprs: &[&Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<Vec<IntValue<'ctx>>> {
+        // gc_after[i]: any expr j > i contains a GC point
+        let mut gc_after = vec![false; exprs.len()];
+        let mut acc = false;
+        for i in (0..exprs.len()).rev() {
+            gc_after[i] = acc;
+            acc = acc || self.expr_gc(&exprs[i]);
+        }
+        enum Held<'ctx> {
+            Val(IntValue<'ctx>),
+            Slot(u64),
+        }
+        let mut held = Vec::with_capacity(exprs.len());
+        for (i, e) in exprs.iter().enumerate() {
+            let v = self.compile_value(f, e, scope)?;
+            if gc_after[i] && self.framed() {
+                held.push(Held::Slot(self.spill(v)?));
+            } else {
+                held.push(Held::Val(v));
+            }
+        }        held.into_iter()
+            .map(|h| match h {
+                Held::Val(v) => Ok(v),
+                Held::Slot(s) => self.reload(s),
+            })
+            .collect()
+    }
+
+    /// Evaluate and root every expression (used when the consumer itself is
+    /// an allocation). Only valid in framed functions.
+    fn eval_all_rooted(
+        &self,
+        f: FunctionValue<'ctx>,
+        exprs: &[&Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<Vec<u64>> {
+        exprs
+            .iter()
+            .map(|e| {
+                let v = self.compile_value(f, e, scope)?;
+                self.spill(v)
+            })
+            .collect()
+    }
+
+    /// Arguments for a call: ctx first, then sibling-rule values.
+    fn eval_args(
+        &self,
+        f: FunctionValue<'ctx>,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<Vec<BasicMetadataValueEnum<'ctx>>> {
+        let vals = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let mut argv: Vec<BasicMetadataValueEnum> = vec![self.ctx_val().into()];
+        argv.extend(vals.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+        Ok(argv)
+    }
+
+    /// Compile any `apply`; `tail` pops the frame just before the call.
     fn compile_apply(
         &self,
         f: FunctionValue<'ctx>,
         target: &ApplyTarget,
         args: &[Expr],
         scope: &mut Scope<'ctx>,
+        tail: bool,
     ) -> CgResult<CallSiteValue<'ctx>> {
         match target {
             ApplyTarget::LocalFun(fname) => {
-                if let Some((lf, closure)) = scope.funs.get(fname).copied() {
-                    let mut argv = self.compile_args(f, args, scope)?;
+                if let Some((lf, cl_slot)) = scope.funs.get(fname).copied() {
+                    let mut argv = self.eval_args(f, args, scope)?;
+                    let closure = self.reload(cl_slot)?;
                     argv.push(closure.into());
+                    if tail {
+                        self.pop_frame()?;
+                    }
                     self.builder.build_call(lf, &argv, "call").map_err(be)
                 } else {
                     let callee = self.local_fn(fname)?;
-                    let argv = self.compile_args(f, args, scope)?;
+                    let argv = self.eval_args(f, args, scope)?;
+                    if tail {
+                        self.pop_frame()?;
+                    }
                     self.builder.build_call(callee, &argv, "call").map_err(be)
                 }
             }
             ApplyTarget::Var(v) => {
-                let fun_val = scope
-                    .vars
-                    .get(v)
-                    .copied()
-                    .ok_or_else(|| format!("unbound variable {}", v))?;
-                let argv = self.compile_args(f, args, scope)?;
-                self.compile_apply_value(f, fun_val, &argv, args.len())
+                let argv = self.eval_args(f, args, scope)?;
+                let fun_val = self.read_var(scope, v)?;
+                self.compile_apply_value(f, fun_val, &argv, args.len(), tail)
             }
         }
     }
 
-    /// Apply a fun value: check tag/kind/arity, then indirect-call the code
-    /// pointer with (args..., closure).
+    /// Apply a fun value: check tag/kind/arity, indirect-call
+    /// `(ctx, args..., closure)`.
     fn compile_apply_value(
         &self,
         f: FunctionValue<'ctx>,
         fun_val: IntValue<'ctx>,
-        argv: &[inkwell::values::BasicMetadataValueEnum<'ctx>],
+        argv: &[BasicMetadataValueEnum<'ctx>],
         nargs: usize,
+        tail: bool,
     ) -> CgResult<CallSiteValue<'ctx>> {
         let bad = self.ctx.append_basic_block(f, "badfun");
         let check_hdr = self.ctx.append_basic_block(f, "fun.hdr");
@@ -628,14 +912,11 @@ impl<'ctx> Cg<'ctx> {
             .build_int_to_ptr(fun_val, self.ptrt, "fun.ptr")
             .map_err(be)?;
         let header = self.load_word(p, 0)?;
-        // kind and arity in one compare: mask bits 0-15
         let masked = self
             .builder
             .build_and(header, self.i64t.const_int(0xffff, false), "hdr.ka")
             .map_err(be)?;
-        let want = self
-            .i64t
-            .const_int(((nargs as u64) << 8) | KIND_FUN, false);
+        let want = self.i64t.const_int(((nargs as u64) << 8) | KIND_FUN, false);
         let hdr_ok = self
             .builder
             .build_int_compare(IntPredicate::EQ, masked, want, "hdr.ok")
@@ -658,26 +939,27 @@ impl<'ctx> Cg<'ctx> {
             .map_err(be)?;
         let mut full_args = argv.to_vec();
         full_args.push(fun_val.into());
+        if tail {
+            self.pop_frame()?;
+        }
         self.builder
-            .build_indirect_call(
-                self.term_fn_type(nargs + 1),
-                code_ptr,
-                &full_args,
-                "apply",
-            )
+            .build_indirect_call(self.term_fn_type(nargs + 1), code_ptr, &full_args, "apply")
             .map_err(be)
     }
 
-    /// `[header | code | captures...]`, boxed (tag 000).
+    /// `[header | code | captures...]`, boxed (tag 000). Allocates first,
+    /// then reads captures from their variable bindings — safe because the
+    /// allocation is the only GC point involved.
     fn make_closure(
         &self,
         code: FunctionValue<'ctx>,
         arity: usize,
-        captures: &[IntValue<'ctx>],
+        capture_names: &[String],
+        scope: &Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
-        let p = self.alloc_words(2 + captures.len() as u64)?;
+        let p = self.alloc_words(2 + capture_names.len() as u64)?;
         let header = self.i64t.const_int(
-            ((captures.len() as u64) << 16) | ((arity as u64) << 8) | KIND_FUN,
+            ((capture_names.len() as u64) << 16) | ((arity as u64) << 8) | KIND_FUN,
             false,
         );
         self.store_word(p, 0, header)?;
@@ -690,15 +972,17 @@ impl<'ctx> Cg<'ctx> {
             )
             .map_err(be)?;
         self.store_word(p, 1, code_int)?;
-        for (i, c) in captures.iter().enumerate() {
-            self.store_word(p, 2 + i as u64, *c)?;
+        for (i, name) in capture_names.iter().enumerate() {
+            let v = self.read_var(scope, name).map_err(|e| {
+                format!("{} (captured by fun)", e)
+            })?;
+            self.store_word(p, 2 + i as u64, v)?;
         }
         self.builder
             .build_ptr_to_int(p, self.i64t, "fun")
             .map_err(be)
     }
 
-    /// Declare (not compile) a lifted fun; returns its index in `lifted`.
     fn declare_lift(&self, hint: &str, arity: usize) -> usize {
         let n = self.lift_counter.get();
         self.lift_counter.set(n + 1);
@@ -725,27 +1009,20 @@ impl<'ctx> Cg<'ctx> {
         defs: &[(FunName, Fun)],
         scope: &Scope<'ctx>,
     ) -> CgResult<Scope<'ctx>> {
-        // union of free vars over the group (excluding each def's params;
-        // letrec fnames are not term variables so don't need exclusion)
         let mut free: BTreeSet<String> = BTreeSet::new();
         for (_, fun) in defs {
             let mut bound: HashSet<String> = fun.params.iter().cloned().collect();
             free_vars(&fun.body, &mut bound, &mut free);
         }
         let free: Vec<String> = free.into_iter().collect();
-        let caps = free
-            .iter()
-            .map(|v| {
-                scope.vars.get(v).copied().ok_or_else(|| {
-                    format!("unbound variable {} captured by letrec", v)
-                })
-            })
-            .collect::<CgResult<Vec<_>>>()?;
 
         let indices: Vec<usize> = defs
             .iter()
             .map(|(fname, fun)| {
-                self.declare_lift(&format!("{}_{}", fname.name, fname.arity), fun.params.len())
+                self.declare_lift(
+                    &format!("{}_{}", fname.name, fname.arity),
+                    fun.params.len(),
+                )
             })
             .collect();
         let sibs: Vec<(FunName, usize)> = defs
@@ -757,7 +1034,8 @@ impl<'ctx> Cg<'ctx> {
         // One closure object shared by the whole group for direct calls;
         // its code pointer (first member) is never used via apply.
         let first = self.lifted.borrow()[indices[0]];
-        let closure = self.make_closure(first, defs[0].1.params.len(), &caps)?;
+        let closure = self.make_closure(first, defs[0].1.params.len(), &free, scope)?;
+        let cl_slot = self.spill(closure)?;
 
         for ((_, fun), idx) in defs.iter().zip(indices.iter()) {
             self.pending.borrow_mut().push(Lift {
@@ -772,18 +1050,14 @@ impl<'ctx> Cg<'ctx> {
         let mut inner = scope.clone();
         for (fname, idx) in &sibs {
             let lf = self.lifted.borrow()[*idx];
-            inner.funs.insert(fname.clone(), (lf, closure));
+            inner.funs.insert(fname.clone(), (lf, cl_slot));
         }
         Ok(inner)
     }
 
     /// A shim adapting a plain top-level function to the closure calling
-    /// convention: `shim(args..., _closure) = tail call target(args...)`.
-    fn fun_shim(
-        &self,
-        module: Option<&str>,
-        fname: &FunName,
-    ) -> CgResult<FunctionValue<'ctx>> {
+    /// convention. Frameless: it holds no live terms across the call.
+    fn fun_shim(&self, module: Option<&str>, fname: &FunName) -> CgResult<FunctionValue<'ctx>> {
         let target_mod = module.unwrap_or(&self.module_name);
         let sym = format!("{}.shim", mangle(target_mod, fname));
         if let Some(existing) = self.module.get_function(&sym) {
@@ -803,9 +1077,9 @@ impl<'ctx> Cg<'ctx> {
         let saved = self.builder.get_insert_block();
         let bb = self.ctx.append_basic_block(shim, "entry");
         self.builder.position_at_end(bb);
-        let argv: Vec<inkwell::values::BasicMetadataValueEnum> = (0..fname.arity)
+        let argv: Vec<BasicMetadataValueEnum> = (0..=fname.arity)
             .map(|i| shim.get_nth_param(i as u32).unwrap().into())
-            .collect();
+            .collect(); // ctx + args, dropping the trailing closure param
         let call = self.builder.build_call(target, &argv, "fwd").map_err(be)?;
         call.set_tail_call(true);
         let v = call_result(call)?;
@@ -844,13 +1118,12 @@ impl<'ctx> Cg<'ctx> {
         match (vars.len(), arg) {
             (1, _) => {
                 let v = self.compile_value(f, arg, scope)?;
-                scope.vars.insert(vars[0].clone(), v);
-                Ok(())
+                self.bind_var(scope, &vars[0], v)
             }
             (_, Expr::Values(es)) if es.len() == vars.len() => {
                 for (var, e) in vars.iter().zip(es) {
                     let v = self.compile_value(f, e, scope)?;
-                    scope.vars.insert(var.clone(), v);
+                    self.bind_var(scope, var, v)?;
                 }
                 Ok(())
             }
@@ -858,27 +1131,33 @@ impl<'ctx> Cg<'ctx> {
         }
     }
 
+    /// Case scrutinees. If any guard contains a GC point, values must be
+    /// re-loadable per clause (later clauses re-match after the guard ran),
+    /// so everything goes to slots; otherwise plain sibling evaluation.
     fn compile_case_arg(
         &self,
         f: FunctionValue<'ctx>,
         arg: &Expr,
+        clauses: &[Clause],
         scope: &mut Scope<'ctx>,
-    ) -> CgResult<Vec<IntValue<'ctx>>> {
-        match arg {
-            Expr::Values(es) => es
-                .iter()
-                .map(|e| self.compile_value(f, e, scope))
-                .collect(),
-            other => Ok(vec![self.compile_value(f, other, scope)?]),
+    ) -> CgResult<CaseVals<'ctx>> {
+        let exprs: Vec<&Expr> = match arg {
+            Expr::Values(es) => es.iter().collect(),
+            other => vec![other],
+        };
+        let any_guard_gc = clauses.iter().any(|c| self.expr_gc(&c.guard));
+        if any_guard_gc && self.framed() {
+            let slots = self.eval_all_rooted(f, &exprs, scope)?;
+            Ok(CaseVals::Slots(slots))
+        } else {
+            Ok(CaseVals::Ssa(self.eval_siblings(f, &exprs, scope)?))
         }
     }
 
-    /// Compile case clauses as a chain of test blocks. In tail mode
-    /// (merge == None) each body returns; otherwise bodies jump to merge.
     fn compile_case(
         &self,
         f: FunctionValue<'ctx>,
-        vals: &[IntValue<'ctx>],
+        vals: &CaseVals<'ctx>,
         clauses: &[Clause],
         scope: &Scope<'ctx>,
         mut merge: Option<(BasicBlock<'ctx>, &mut Vec<(IntValue<'ctx>, BasicBlock<'ctx>)>)>,
@@ -894,18 +1173,24 @@ impl<'ctx> Cg<'ctx> {
             } else {
                 fail_bb
             };
-            if clause.patterns.len() != vals.len() {
+            let vs: Vec<IntValue<'ctx>> = match vals {
+                CaseVals::Ssa(vs) => vs.clone(),
+                CaseVals::Slots(slots) => slots
+                    .iter()
+                    .map(|s| self.reload(*s))
+                    .collect::<CgResult<_>>()?,
+            };
+            if clause.patterns.len() != vs.len() {
                 return Err(format!(
                     "clause has {} patterns but case argument has {} values",
                     clause.patterns.len(),
-                    vals.len()
+                    vs.len()
                 ));
             }
             let mut cscope = scope.clone();
-            for (v, p) in vals.iter().zip(&clause.patterns) {
+            for (v, p) in vs.iter().zip(&clause.patterns) {
                 self.match_pattern(f, *v, p, &mut cscope, next)?;
             }
-            // guard
             if !is_true_atom(&clause.guard) {
                 let g = self.compile_value(f, &clause.guard, &mut cscope)?;
                 let t = self.atom_term("true")?;
@@ -940,8 +1225,8 @@ impl<'ctx> Cg<'ctx> {
         Ok(())
     }
 
-    /// Emit tests for `pat` against `val` in the current block, branching to
-    /// `fail` on mismatch. Bindings go into `scope`.
+    /// Emit tests for `pat` against `val`, branching to `fail` on mismatch.
+    /// No allocation happens inside a pattern, so SSA subterm loads are safe.
     fn match_pattern(
         &self,
         f: FunctionValue<'ctx>,
@@ -951,12 +1236,9 @@ impl<'ctx> Cg<'ctx> {
         fail: BasicBlock<'ctx>,
     ) -> CgResult<()> {
         match pat {
-            Pattern::Var(v) => {
-                scope.vars.insert(v.clone(), val);
-                Ok(())
-            }
+            Pattern::Var(v) => self.bind_var(scope, v, val),
             Pattern::Alias(v, inner) => {
-                scope.vars.insert(v.clone(), val);
+                self.bind_var(scope, v, val)?;
                 self.match_pattern(f, val, inner, scope, fail)
             }
             Pattern::Lit(Literal::Float(_)) => Err("float patterns not supported yet".into()),
@@ -1043,7 +1325,7 @@ impl<'ctx> Cg<'ctx> {
         Ok(())
     }
 
-    // ---- BIFs ----
+    // ---- BIFs (none allocate today; TODO(bignum) changes that) ----
 
     fn compile_bif(
         &self,
@@ -1052,14 +1334,10 @@ impl<'ctx> Cg<'ctx> {
         args: &[Expr],
         scope: &mut Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
-        let argv: Vec<IntValue<'ctx>> = args
-            .iter()
-            .map(|a| self.compile_value(f, a, scope))
-            .collect::<CgResult<_>>()?;
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
 
         match (name, argv.len()) {
             ("+", 2) | ("-", 2) | ("*", 2) | ("div", 2) | ("rem", 2) => {
-                // TODO(bignum): no overflow checks; ints wrap in small range.
                 let a = self.untag_int(argv[0])?;
                 let b = self.untag_int(argv[1])?;
                 let r = match name {
@@ -1083,7 +1361,7 @@ impl<'ctx> Cg<'ctx> {
             ("+", 1) => Ok(argv[0]),
             ("<", 2) | ("=<", 2) | (">", 2) | (">=", 2) | ("==", 2) | ("/=", 2)
             | ("=:=", 2) | ("=/=", 2) => {
-                // Correct for small ints (tagging is monotone) and for exact
+                // Correct for small ints (tagging is monotone) and exact
                 // (in)equality of immediates. TODO: full term ordering.
                 let pred = match name {
                     "<" => IntPredicate::SLT,
@@ -1111,8 +1389,7 @@ impl<'ctx> Cg<'ctx> {
                     .map_err(be)?;
                 self.atom_term("true")
             }
-            // raising BIFs: exceptions are not implemented, so these
-            // terminate via the runtime (TODO(exceptions))
+            // raising BIFs terminate via the runtime (TODO(exceptions))
             ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1) => {
                 self.builder
                     .build_call(self.rt_match_fail(), &[argv[0].into()], "")
@@ -1154,8 +1431,6 @@ impl<'ctx> Cg<'ctx> {
             .ok_or_else(|| format!("undefined local function {}/{}", fname.name, fname.arity))
     }
 
-    /// Get-or-declare the mangled symbol of a function in another module.
-    /// Reachability guarantees a definition exists in some other object.
     fn remote_fn(&self, module: &str, name: &str, arity: usize) -> FunctionValue<'ctx> {
         let sym = mangle(
             module,
@@ -1168,17 +1443,6 @@ impl<'ctx> Cg<'ctx> {
             self.module
                 .add_function(&sym, self.term_fn_type(arity), None)
         })
-    }
-
-    fn compile_args(
-        &self,
-        f: FunctionValue<'ctx>,
-        args: &[Expr],
-        scope: &mut Scope<'ctx>,
-    ) -> CgResult<Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>> {
-        args.iter()
-            .map(|a| Ok(self.compile_value(f, a, scope)?.into()))
-            .collect()
     }
 
     fn tag_of(&self, val: IntValue<'ctx>) -> CgResult<IntValue<'ctx>> {
@@ -1203,12 +1467,15 @@ impl<'ctx> Cg<'ctx> {
             .map_err(be)
     }
 
-    fn alloc_words(&self, n: u64) -> CgResult<inkwell::values::PointerValue<'ctx>> {
+    fn alloc_words(&self, n: u64) -> CgResult<PointerValue<'ctx>> {
         let call = self
             .builder
             .build_call(
                 self.rt_alloc(),
-                &[self.i64t.const_int(n, false).into()],
+                &[
+                    self.ctx_val().into(),
+                    self.i64t.const_int(n, false).into(),
+                ],
                 "alloc",
             )
             .map_err(be)?;
@@ -1217,7 +1484,7 @@ impl<'ctx> Cg<'ctx> {
 
     fn store_word(
         &self,
-        p: inkwell::values::PointerValue<'ctx>,
+        p: PointerValue<'ctx>,
         index: u64,
         v: IntValue<'ctx>,
     ) -> CgResult<()> {
@@ -1235,11 +1502,7 @@ impl<'ctx> Cg<'ctx> {
         Ok(())
     }
 
-    fn load_word(
-        &self,
-        p: inkwell::values::PointerValue<'ctx>,
-        index: u64,
-    ) -> CgResult<IntValue<'ctx>> {
+    fn load_word(&self, p: PointerValue<'ctx>, index: u64) -> CgResult<IntValue<'ctx>> {
         let slot = unsafe {
             self.builder
                 .build_in_bounds_gep(
@@ -1286,14 +1549,190 @@ impl<'ctx> Cg<'ctx> {
     }
 }
 
+enum CaseVals<'ctx> {
+    Ssa(Vec<IntValue<'ctx>>),
+    Slots(Vec<u64>),
+}
+
 fn is_raise(primop: &str) -> bool {
     matches!(primop, "match_fail" | "raise" | "error" | "exit" | "throw")
 }
 
+// ---- GC-effect analysis ----
+
+/// Fixpoint: which reachable functions may trigger a collection.
+fn compute_may_gc(mods: &[Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
+    let defs: HashMap<(&str, &FunName), &Fun> = mods
+        .iter()
+        .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
+        .collect();
+    let mut set: GcSet = GcSet::new();
+    loop {
+        let mut changed = false;
+        for (m, f) in reachable {
+            if set.contains(&(m.clone(), f.clone())) {
+                continue;
+            }
+            let Some(fun) = defs.get(&(m.as_str(), f)) else {
+                continue;
+            };
+            let mut letrec = HashSet::new();
+            if expr_may_gc(&fun.body, m, &set, &mut letrec) {
+                set.insert((m.clone(), f.clone()));
+                changed = true;
+            }
+        }
+        if !changed {
+            return set;
+        }
+    }
+}
+
+/// Does evaluating `e` contain a GC point? Allocation sites are GC points;
+/// calls consult the (possibly still-growing) fixpoint set; letrec-bound
+/// applies and fun-value applies are conservatively GC points.
+fn expr_may_gc(
+    e: &Expr,
+    cur_mod: &str,
+    gc_set: &GcSet,
+    letrec_bound: &mut HashSet<FunName>,
+) -> bool {
+    match e {
+        Expr::Var(_) => false,
+        Expr::Lit(Literal::Float(_)) => true, // boxed
+        Expr::Lit(_) => false,
+        // allocation sites
+        Expr::Tuple(_) | Expr::Cons(..) | Expr::Fun(_) | Expr::FunRef { .. }
+        | Expr::LetRec { .. } | Expr::Binary(_) | Expr::Map { .. } => true,
+        Expr::Apply { target, args } => {
+            let target_gc = match target {
+                ApplyTarget::Var(_) => true,
+                ApplyTarget::LocalFun(f) => {
+                    letrec_bound.contains(f)
+                        || gc_set.contains(&(cur_mod.to_string(), f.clone()))
+                }
+            };
+            target_gc
+                || args
+                    .iter()
+                    .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound))
+        }
+        Expr::Call { module, name, args } => {
+            let callee_gc = module != "erlang"
+                && gc_set.contains(&(
+                    module.clone(),
+                    FunName {
+                        name: name.clone(),
+                        arity: args.len(),
+                    },
+                ));
+            callee_gc
+                || args
+                    .iter()
+                    .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound))
+        }
+        Expr::PrimOp { args, .. } => args
+            .iter()
+            .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound)),
+        Expr::Let { arg, body, .. } => {
+            expr_may_gc(arg, cur_mod, gc_set, letrec_bound)
+                || expr_may_gc(body, cur_mod, gc_set, letrec_bound)
+        }
+        Expr::Do(a, b) => {
+            expr_may_gc(a, cur_mod, gc_set, letrec_bound)
+                || expr_may_gc(b, cur_mod, gc_set, letrec_bound)
+        }
+        Expr::Try {
+            arg, body, handler, ..
+        } => {
+            expr_may_gc(arg, cur_mod, gc_set, letrec_bound)
+                || expr_may_gc(body, cur_mod, gc_set, letrec_bound)
+                || expr_may_gc(handler, cur_mod, gc_set, letrec_bound)
+        }
+        Expr::Case { arg, clauses } => {
+            expr_may_gc(arg, cur_mod, gc_set, letrec_bound)
+                || clauses.iter().any(|c| {
+                    expr_may_gc(&c.guard, cur_mod, gc_set, letrec_bound)
+                        || expr_may_gc(&c.body, cur_mod, gc_set, letrec_bound)
+                })
+        }
+        Expr::Values(items) => items
+            .iter()
+            .any(|i| expr_may_gc(i, cur_mod, gc_set, letrec_bound)),
+    }
+}
+
+/// Count bound variable names and expression nodes for frame sizing. Does
+/// not descend into Fun/LetRec definition bodies (they get their own
+/// frames when lifted).
+fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut usize) {
+    *nodes += 1;
+    match e {
+        Expr::Var(_) | Expr::Lit(_) | Expr::FunRef { .. } | Expr::Fun(_) => {}
+        Expr::Tuple(items) | Expr::Values(items) => {
+            items.iter().for_each(|i| frame_prepass(i, vars, nodes))
+        }
+        Expr::Cons(h, t) => {
+            frame_prepass(h, vars, nodes);
+            frame_prepass(t, vars, nodes);
+        }
+        Expr::Let { vars: vs, arg, body } => {
+            vars.extend(vs.iter().cloned());
+            frame_prepass(arg, vars, nodes);
+            frame_prepass(body, vars, nodes);
+        }
+        Expr::LetRec { body, .. } => frame_prepass(body, vars, nodes),
+        Expr::Apply { args, .. } => args.iter().for_each(|a| frame_prepass(a, vars, nodes)),
+        Expr::Call { args, .. } | Expr::PrimOp { args, .. } => {
+            args.iter().for_each(|a| frame_prepass(a, vars, nodes))
+        }
+        Expr::Case { arg, clauses } => {
+            frame_prepass(arg, vars, nodes);
+            for c in clauses {
+                let mut pvars = Vec::new();
+                c.patterns.iter().for_each(|p| pattern_vars(p, &mut pvars));
+                vars.extend(pvars);
+                frame_prepass(&c.guard, vars, nodes);
+                frame_prepass(&c.body, vars, nodes);
+            }
+        }
+        Expr::Try {
+            arg,
+            vars: vs,
+            body,
+            evars,
+            handler,
+        } => {
+            vars.extend(vs.iter().cloned());
+            vars.extend(evars.iter().cloned());
+            frame_prepass(arg, vars, nodes);
+            frame_prepass(body, vars, nodes);
+            frame_prepass(handler, vars, nodes);
+        }
+        Expr::Binary(segs) => {
+            for s in segs {
+                frame_prepass(&s.value, vars, nodes);
+                s.spec.iter().for_each(|x| frame_prepass(x, vars, nodes));
+            }
+        }
+        Expr::Map { pairs, update } => {
+            for (k, v) in pairs {
+                frame_prepass(k, vars, nodes);
+                frame_prepass(v, vars, nodes);
+            }
+            if let Some(u) = update {
+                frame_prepass(u, vars, nodes);
+            }
+        }
+        Expr::Do(a, b) => {
+            frame_prepass(a, vars, nodes);
+            frame_prepass(b, vars, nodes);
+        }
+    }
+}
+
 // ---- free variable analysis ----
 
-/// Insert into `out` the variables free in `e` given `bound`. `bound` is
-/// restored before returning.
 fn free_vars(e: &Expr, bound: &mut HashSet<String>, out: &mut BTreeSet<String>) {
     match e {
         Expr::Var(v) => {
@@ -1440,10 +1879,6 @@ enum Edge {
     Remote(String, FunName),
 }
 
-/// Functions transitively reachable from `entry_mod:entry` across `apply`
-/// (local), `call` (remote), and fun-reference edges. Calls to `erlang` are
-/// BIFs, resolved at codegen. letrec-bound names are lexically scoped and
-/// excluded.
 fn reachable_funs(
     mods: &[Module],
     entry_mod: &str,
@@ -1523,9 +1958,6 @@ fn reachable_funs(
     Ok(seen)
 }
 
-/// Collect call edges, skipping names bound by enclosing letrecs (they are
-/// lexically scoped lambdas, not module functions). `letrec_bound` is
-/// restored before returning.
 fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut HashSet<FunName>) {
     match e {
         Expr::Var(_) | Expr::Lit(_) => {}
