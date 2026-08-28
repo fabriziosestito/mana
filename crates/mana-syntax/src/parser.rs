@@ -158,7 +158,14 @@ impl Parser {
             Tok::LParen => {
                 self.bump();
                 if self.is_fname_ahead() {
-                    return self.err("fname is not valid in expression position");
+                    // annotated fname used as a value: ( 'f'/1 -| [...] )
+                    let f = self.parse_fname_no_paren()?;
+                    self.skip_annotation()?;
+                    self.expect(Tok::RParen)?;
+                    return Ok(Expr::FunRef {
+                        module: None,
+                        fun: f,
+                    });
                 }
                 let e = self.parse_expr()?;
                 self.skip_annotation()?;
@@ -178,6 +185,14 @@ impl Parser {
                 Ok(Expr::Lit(Literal::Int(c)))
             }
             Tok::Atom(_) => {
+                if self.is_fname_ahead() {
+                    // bare fname as a value: let <F> = 'tr'/1 in ...
+                    let f = self.parse_fname_no_paren()?;
+                    return Ok(Expr::FunRef {
+                        module: None,
+                        fun: f,
+                    });
+                }
                 let a = self.parse_atom()?;
                 Ok(Expr::Lit(Literal::Atom(a)))
             }
@@ -237,6 +252,25 @@ impl Parser {
             }
             Tok::Fun => {
                 self.bump();
+                // `fun 'm':'f'/a` / `fun 'f'/a` — a fun reference
+                if matches!(self.peek(), Tok::Atom(_)) {
+                    let first = self.parse_atom()?;
+                    if self.eat(&Tok::Colon) {
+                        let name = self.parse_atom()?;
+                        self.expect(Tok::Slash)?;
+                        let arity = self.parse_arity()?;
+                        return Ok(Expr::FunRef {
+                            module: Some(first),
+                            fun: FunName { name, arity },
+                        });
+                    }
+                    self.expect(Tok::Slash)?;
+                    let arity = self.parse_arity()?;
+                    return Ok(Expr::FunRef {
+                        module: None,
+                        fun: FunName { name: first, arity },
+                    });
+                }
                 self.expect(Tok::LParen)?;
                 let mut params = Vec::new();
                 if !self.eat(&Tok::RParen) {
@@ -321,6 +355,25 @@ impl Parser {
                     clauses,
                 })
             }
+            Tok::Try => {
+                self.bump();
+                let arg = self.parse_expr()?;
+                self.expect(Tok::Of)?;
+                let vars = self.parse_var_list()?;
+                self.expect(Tok::Arrow)?;
+                let body = self.parse_expr()?;
+                self.expect(Tok::Catch)?;
+                let evars = self.parse_var_list()?;
+                self.expect(Tok::Arrow)?;
+                let handler = self.parse_expr()?;
+                Ok(Expr::Try {
+                    arg: Box::new(arg),
+                    vars,
+                    body: Box::new(body),
+                    evars,
+                    handler: Box::new(handler),
+                })
+            }
             Tok::Do => {
                 self.bump();
                 let first = self.parse_expr()?;
@@ -345,11 +398,13 @@ impl Parser {
     fn parse_fname_no_paren(&mut self) -> PResult<FunName> {
         let name = self.parse_atom()?;
         self.expect(Tok::Slash)?;
+        let arity = self.parse_arity()?;
+        Ok(FunName { name, arity })
+    }
+
+    fn parse_arity(&mut self) -> PResult<usize> {
         match self.bump() {
-            Tok::Int(n) if n >= 0 => Ok(FunName {
-                name,
-                arity: n as usize,
-            }),
+            Tok::Int(n) if n >= 0 => Ok(n as usize),
             other => Err(format!(
                 "line {}: expected arity, found {}",
                 self.line(),

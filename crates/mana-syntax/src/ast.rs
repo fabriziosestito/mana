@@ -46,6 +46,11 @@ pub enum Expr {
     /// `<e1, ..., en>` multi-value expression (only valid in certain positions)
     Values(Vec<Expr>),
     Fun(Box<Fun>),
+    /// A function used as a value: bare `'f'/1` (local) or `fun 'm':'f'/1`.
+    FunRef {
+        module: Option<String>,
+        fun: FunName,
+    },
     /// `let <v1, ..., vn> = arg in body`
     Let {
         vars: Vec<String>,
@@ -82,6 +87,14 @@ pub enum Expr {
     Map {
         pairs: Vec<(Expr, Expr)>,
         update: Option<Box<Expr>>,
+    },
+    /// `try Arg of <vars> -> Body catch <evars> -> Handler`
+    Try {
+        arg: Box<Expr>,
+        vars: Vec<String>,
+        body: Box<Expr>,
+        evars: Vec<String>,
+        handler: Box<Expr>,
     },
     /// `do e1 e2` — sequence
     Do(Box<Expr>, Box<Expr>),
