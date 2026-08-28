@@ -71,7 +71,11 @@ pub const TAG_SMALL: u64 = 0b001;
 pub const TAG_ATOM: u64 = 0b010;
 pub const NIL: u64 = 0b011;
 pub const TAG_CONS: u64 = 0b100;
+/// Identifier class: bit 3 discriminates — pid `id<<4|0110`, ref
+/// `id<<4|1110`. Both immediates: raw-word equality and GC-transparent.
 pub const TAG_PID: u64 = 0b110;
+pub const PID_TAG4: u64 = 0b0110;
+pub const REF_TAG4: u64 = 0b1110;
 pub const TAG_FORWARD: u64 = 0b111;
 
 /// Matches mana-codegen's exception sentinel (tag 0b101).
@@ -190,6 +194,20 @@ struct Process {
     state: Mutex<PState>,
     /// spawn closure (old-space) until first resume
     pending_closure: u64,
+    /// links/monitors/trap flag — mutated cross-thread under this lock
+    lstate: Mutex<LinkState>,
+}
+
+#[derive(Default)]
+struct LinkState {
+    links: Vec<usize>,
+    /// (ref id, watcher pid) — processes monitoring me
+    monitors_on_me: Vec<(u64, usize)>,
+    /// (ref id, target pid) — processes I monitor
+    monitoring: Vec<(u64, usize)>,
+    trap_exit: bool,
+    /// pending unhandled exit signal: reason term (old-space/eternal), 0 = none
+    pending_kill: u64,
 }
 
 /// Home-scheduler pinning makes the interior safe: only the home thread (or
@@ -260,7 +278,63 @@ unsafe fn proc_mut(cell: &ProcessCell) -> &mut Process {
 }
 
 fn make_pid(id: usize) -> u64 {
-    ((id as u64) << 3) | TAG_PID
+    ((id as u64) << 4) | PID_TAG4
+}
+
+fn pid_id(t: u64) -> Option<usize> {
+    (t & 0xF == PID_TAG4).then_some((t >> 4) as usize)
+}
+
+static REF_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+/// Well-known atom terms registered by the generated main (atoms are
+/// compiler statics; the runtime cannot mint them).
+#[derive(Default)]
+struct KnownAtoms {
+    normal: u64,
+    killed: u64,
+    kill: u64,
+    exit_up: u64,   // 'EXIT'
+    down_up: u64,   // 'DOWN'
+    process: u64,
+    noproc: u64,
+    true_a: u64,
+    false_a: u64,
+}
+static KNOWN: std::sync::OnceLock<KnownAtoms> = std::sync::OnceLock::new();
+
+fn known() -> &'static KnownAtoms {
+    KNOWN.get().expect("atom table not registered")
+}
+
+/// Called by the generated main before mana_rt_run.
+#[no_mangle]
+pub extern "C" fn mana_rt_register_atoms(
+    normal: u64,
+    killed: u64,
+    kill: u64,
+    exit_up: u64,
+    down_up: u64,
+    process: u64,
+    noproc: u64,
+    true_a: u64,
+    false_a: u64,
+) {
+    let _ = KNOWN.set(KnownAtoms {
+        normal,
+        killed,
+        kill,
+        exit_up,
+        down_up,
+        process,
+        noproc,
+        true_a,
+        false_a,
+    });
+}
+
+fn make_ref_term() -> u64 {
+    ((REF_COUNTER.fetch_add(1, Ordering::Relaxed) as u64) << 4) | REF_TAG4
 }
 
 fn in_my_nursery(ctx: &ProcCtx, addr: u64) -> bool {
@@ -395,6 +469,7 @@ pub extern "C" fn mana_rt_run(
                 cursor: 0,
                 state: Mutex::new(PState::Runnable),
                 pending_closure: 0,
+                lstate: Mutex::new(LinkState::default()),
             },
         );
         debug_assert_eq!(pid, 0);
@@ -437,6 +512,17 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
             continue;
         };
         let p = unsafe { proc_mut(cell) };
+        // an exit signal arrived while it was suspended: it never resumes
+        {
+            let reason = p.lstate.lock().pending_kill;
+            if reason != 0 {
+                process_death(ctx, pid, reason);
+                if pid == 0 {
+                    return; // root killed: program ends (result 0)
+                }
+                continue;
+            }
+        }
         *p.state.lock() = PState::Running;
         ctx.roots_head = p.saved_roots;
         ctx.exc_class = p.saved_exc_class;
@@ -452,28 +538,44 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
                 p.saved_roots = ctx.roots_head;
                 p.saved_exc_class = ctx.exc_class;
                 p.saved_exc_reason = ctx.exc_reason;
-                let mut st = p.state.lock();
-                if *st == PState::Running {
-                    *st = PState::Runnable;
-                    drop(st);
-                    ctx.run_q.push_back(pid);
+                let killed = p.lstate.lock().pending_kill;
+                if killed != 0 {
+                    process_death(ctx, pid, killed);
+                    if pid == 0 {
+                        return;
+                    }
+                } else {
+                    let mut st = p.state.lock();
+                    if *st == PState::Running {
+                        *st = PState::Runnable;
+                        drop(st);
+                        ctx.run_q.push_back(pid);
+                    }
                 }
             }
             CoroutineResult::Return(v) => {
+                let reason = if v == EXC_SENTINEL {
+                    if pid != 0 {
+                        let mut class = String::new();
+                        let mut reason = String::new();
+                        write_term(ctx.exc_class, &mut class);
+                        write_term(ctx.exc_reason, &mut reason);
+                        eprintln!(
+                            "mana: process <0.{}.0> exited: {} {}",
+                            pid, class, reason
+                        );
+                    }
+                    ctx.exc_reason // eternal/immediate: shared-safe
+                } else {
+                    known().normal
+                };
+                process_death(ctx, pid, reason);
                 if pid == 0 {
                     if let Some(out) = root_result.as_deref_mut() {
                         *out = v;
                     }
                     return;
                 }
-                if v == EXC_SENTINEL {
-                    let mut class = String::new();
-                    let mut reason = String::new();
-                    write_term(ctx.exc_class, &mut class);
-                    write_term(ctx.exc_reason, &mut reason);
-                    eprintln!("mana: process <0.{}.0> exited: {} {}", pid, class, reason);
-                }
-                global.procs.write()[pid] = None;
             }
         }
         ctx.current = usize::MAX;
@@ -602,6 +704,279 @@ fn promote_copy(ctx: &ProcCtx, old: &mut OldSpace, t: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// exit signals, links, monitors
+
+/// Allocate `words` in the shared old space (visible to every process).
+fn alloc_shared(ctx: &mut ProcCtx, words: usize) -> *mut u64 {
+    let g = ctx.global;
+    let mut old = g.old.lock();
+    old.alloc(words, &g.old_used)
+}
+
+/// Build a tuple in shared space; items must be old/eternal/immediate.
+fn shared_tuple(ctx: &mut ProcCtx, items: &[u64]) -> u64 {
+    let p = alloc_shared(ctx, 1 + items.len());
+    unsafe {
+        *p = ((items.len() as u64) << 8) | KIND_TUPLE;
+        for (i, v) in items.iter().enumerate() {
+            *p.add(1 + i) = *v;
+        }
+    }
+    p as u64
+}
+
+/// Push an (already shared-safe) message and wake the target.
+fn push_and_wake(ctx: &mut ProcCtx, id: usize, msg: u64) {
+    let global = ctx.global;
+    let Some(cell) = proc_ref(global, id) else {
+        return;
+    };
+    let p = unsafe { &*cell.0.get() };
+    p.ingress.push(msg);
+    let mut st = p.state.lock();
+    if matches!(*st, PState::Waiting(_)) {
+        *st = PState::Runnable;
+        drop(st);
+        if p.home == ctx.sched_id {
+            ctx.run_q.push_back(id);
+        } else {
+            global.scheds[p.home].inject.push(id);
+            wake_sched(global, p.home);
+        }
+    }
+}
+
+/// Deliver an exit signal to `target`. `forced` = exit(Pid, kill).
+fn exit_signal(ctx: &mut ProcCtx, from_pid: usize, target: usize, reason: u64, forced: bool) {
+    let g = ctx.global;
+    let Some(cell) = proc_ref(g, target) else {
+        return;
+    };
+    let p = unsafe { proc_mut(cell) };
+    let mut ls = p.lstate.lock();
+    if ls.trap_exit && !forced {
+        drop(ls);
+        let msg = shared_tuple(ctx, &[known().exit_up, make_pid(from_pid), reason]);
+        push_and_wake(ctx, target, msg);
+        return;
+    }
+    if reason == known().normal && !forced {
+        return;
+    }
+    ls.pending_kill = reason;
+    drop(ls);
+    // wake it so its home scheduler notices the pending kill
+    let mut st = p.state.lock();
+    if matches!(*st, PState::Waiting(_)) {
+        *st = PState::Runnable;
+        drop(st);
+        if p.home == ctx.sched_id {
+            ctx.run_q.push_back(target);
+        } else {
+            g.scheds[p.home].inject.push(target);
+            wake_sched(g, p.home);
+        }
+    }
+}
+
+/// A process is gone: notify monitors, propagate to links, free the slot.
+fn process_death(ctx: &mut ProcCtx, pid: usize, reason: u64) {
+    let g = ctx.global;
+    let Some(cell) = proc_ref(g, pid) else {
+        return;
+    };
+    let ls = {
+        let p = unsafe { proc_mut(cell) };
+        std::mem::take(&mut *p.lstate.lock())
+    };
+    g.procs.write()[pid] = None;
+    for (ref_id, watcher) in ls.monitors_on_me {
+        let ref_term = (ref_id << 4) | REF_TAG4;
+        let msg = shared_tuple(
+            ctx,
+            &[known().down_up, ref_term, known().process, make_pid(pid), reason],
+        );
+        push_and_wake(ctx, watcher, msg);
+    }
+    for linked in ls.links {
+        if let Some(other) = proc_ref(g, linked) {
+            let o = unsafe { proc_mut(other) };
+            o.lstate.lock().links.retain(|&x| x != pid);
+        }
+        exit_signal(ctx, pid, linked, reason, false);
+    }
+    // drop stale monitoring entries on targets I watched
+    for (ref_id, target) in ls.monitoring {
+        if let Some(t) = proc_ref(g, target) {
+            let t = unsafe { proc_mut(t) };
+            t.lstate.lock().monitors_on_me.retain(|&(r, _)| r != ref_id);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_make_ref(_ctx: *mut ProcCtx) -> u64 {
+    make_ref_term()
+}
+
+/// erlang:link/1 — bidirectional; linking a dead pid delivers noproc.
+#[no_mangle]
+pub extern "C" fn mana_rt_link(ctx: *mut ProcCtx, pid: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some(id) = pid_id(pid) else { return 0 };
+    let me = ctx.current;
+    match proc_ref(ctx.global, id) {
+        Some(cell) => {
+            let p = unsafe { proc_mut(cell) };
+            let mut ls = p.lstate.lock();
+            if !ls.links.contains(&me) {
+                ls.links.push(me);
+            }
+            drop(ls);
+            let mecell = proc_ref(ctx.global, me).unwrap();
+            let m = unsafe { proc_mut(mecell) };
+            let mut mls = m.lstate.lock();
+            if !mls.links.contains(&id) {
+                mls.links.push(id);
+            }
+        }
+        None => {
+            exit_signal(ctx, id, me, known().noproc, false);
+        }
+    }
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_unlink(ctx: *mut ProcCtx, pid: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some(id) = pid_id(pid) else { return 0 };
+    let me = ctx.current;
+    if let Some(cell) = proc_ref(ctx.global, id) {
+        unsafe { proc_mut(cell) }.lstate.lock().links.retain(|&x| x != me);
+    }
+    if let Some(cell) = proc_ref(ctx.global, me) {
+        unsafe { proc_mut(cell) }.lstate.lock().links.retain(|&x| x != id);
+    }
+    1
+}
+
+/// erlang:monitor(process, Pid) — returns the ref; dead target → immediate
+/// noproc DOWN.
+#[no_mangle]
+pub extern "C" fn mana_rt_monitor(ctx: *mut ProcCtx, pid: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let r = make_ref_term();
+    let ref_id = r >> 4;
+    let me = ctx.current;
+    let Some(id) = pid_id(pid) else { return r };
+    match proc_ref(ctx.global, id) {
+        Some(cell) => {
+            unsafe { proc_mut(cell) }
+                .lstate
+                .lock()
+                .monitors_on_me
+                .push((ref_id, me));
+            let mecell = proc_ref(ctx.global, me).unwrap();
+            unsafe { proc_mut(mecell) }
+                .lstate
+                .lock()
+                .monitoring
+                .push((ref_id, id));
+        }
+        None => {
+            let msg = shared_tuple(
+                ctx,
+                &[known().down_up, r, known().process, pid, known().noproc],
+            );
+            push_and_wake(ctx, me, msg);
+        }
+    }
+    r
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_demonitor(ctx: *mut ProcCtx, r: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if r & 0xF != REF_TAG4 {
+        return 0;
+    }
+    let ref_id = r >> 4;
+    let me = ctx.current;
+    let target = {
+        let mecell = proc_ref(ctx.global, me).unwrap();
+        let m = unsafe { proc_mut(mecell) };
+        let mut ls = m.lstate.lock();
+        let t = ls.monitoring.iter().find(|&&(rid, _)| rid == ref_id).map(|&(_, t)| t);
+        ls.monitoring.retain(|&(rid, _)| rid != ref_id);
+        t
+    };
+    if let Some(t) = target {
+        if let Some(cell) = proc_ref(ctx.global, t) {
+            unsafe { proc_mut(cell) }
+                .lstate
+                .lock()
+                .monitors_on_me
+                .retain(|&(rid, _)| rid != ref_id);
+        }
+    }
+    1
+}
+
+/// erlang:exit/2 — kill is untrappable and propagates as killed.
+#[no_mangle]
+pub extern "C" fn mana_rt_exit2(ctx: *mut ProcCtx, pid: u64, reason: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some(id) = pid_id(pid) else { return 0 };
+    let reason = promote_term(ctx, reason);
+    if reason == known().kill {
+        exit_signal(ctx, ctx.current, id, known().killed, true);
+    } else {
+        exit_signal(ctx, ctx.current, id, reason, false);
+    }
+    1
+}
+
+/// process_flag(trap_exit, Bool) — returns the previous value.
+#[no_mangle]
+pub extern "C" fn mana_rt_trap_exit(ctx: *mut ProcCtx, flag: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let cell = proc_ref(ctx.global, ctx.current).unwrap();
+    let p = unsafe { proc_mut(cell) };
+    let mut ls = p.lstate.lock();
+    let prev = ls.trap_exit;
+    ls.trap_exit = flag == known().true_a;
+    if prev {
+        known().true_a
+    } else {
+        known().false_a
+    }
+}
+
+/// spawn_link/1 — link is established before the child first runs.
+#[no_mangle]
+pub extern "C" fn mana_rt_spawn_link(ctx: *mut ProcCtx, closure: u64) -> u64 {
+    let pid = mana_rt_spawn(ctx, closure);
+    if pid == 0 {
+        return 0;
+    }
+    mana_rt_link(ctx, pid);
+    pid
+}
+
+/// spawn_monitor/1 — returns the {Pid, Ref} tuple.
+#[no_mangle]
+pub extern "C" fn mana_rt_spawn_monitor(ctx: *mut ProcCtx, closure: u64) -> u64 {
+    let pid = mana_rt_spawn(ctx, closure);
+    if pid == 0 {
+        return 0;
+    }
+    let ctxr = unsafe { &mut *ctx };
+    let r = mana_rt_monitor(ctx, pid);
+    shared_tuple(ctxr, &[pid, r])
+}
+
+// ---------------------------------------------------------------------------
 // process BIF surface
 
 /// Reduction budget exhausted: reschedule the current process.
@@ -650,6 +1025,7 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
             cursor: 0,
             state: Mutex::new(PState::Runnable),
             pending_closure: closure,
+            lstate: Mutex::new(LinkState::default()),
         },
     );
     if home == ctx.sched_id {
@@ -665,12 +1041,9 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
 /// pass zero-copy. Sends to dead/unknown pids succeed silently.
 #[no_mangle]
 pub extern "C" fn mana_rt_send(ctx: *mut ProcCtx, pid: u64, msg: u64) {
-    if pid & TAG_MASK != TAG_PID {
-        return;
-    }
+    let Some(id) = pid_id(pid) else { return };
     let ctx = unsafe { &mut *ctx };
     let global = ctx.global;
-    let id = (pid >> 3) as usize;
     let Some(cell) = proc_ref(global, id) else {
         return;
     };
@@ -842,6 +1215,10 @@ unsafe fn walk_proc_roots(p: &mut Process, mut f: impl FnMut(*mut u64)) {
         f(&mut p.saved_exc_class as *mut u64);
         f(&mut p.saved_exc_reason as *mut u64);
         f(&mut p.pending_closure as *mut u64);
+        let mut ls = p.lstate.lock();
+        if ls.pending_kill != 0 {
+            f(&mut ls.pending_kill as *mut u64);
+        }
     }
 }
 
@@ -1242,7 +1619,11 @@ fn write_term(t: u64, out: &mut String) {
         },
         _ if t == NIL => out.push_str("[]"),
         TAG_PID => {
-            out.push_str(&format!("<0.{}.0>", t >> 3));
+            if t & 0xF == PID_TAG4 {
+                out.push_str(&format!("<0.{}.0>", t >> 4));
+            } else {
+                out.push_str(&format!("#Ref<0.{}>", t >> 4));
+            }
         }
         TAG_CONS => {
             out.push('[');

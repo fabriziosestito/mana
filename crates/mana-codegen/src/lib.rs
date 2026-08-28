@@ -344,6 +344,27 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         })
     }
 
+    fn rt_register_atoms(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_register_atoms", || {
+            let params: Vec<BasicMetadataTypeEnum> =
+                (0..9).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
+            self.ctx.void_type().fn_type(&params, false)
+        })
+    }
+
+    /// (ctx, term) -> term runtime BIF helper.
+    fn rt_pt_i64(&self, name: &str) -> FunctionValue<'ctx> {
+        self.rt_fn(name, || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        })
+    }
+
     fn rt_run(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_run", || {
             self.i64t.fn_type(
@@ -853,6 +874,19 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_call(self.rt_init(), &[], "ctx")
             .map_err(be)?;
         let ctx = call_result(init)?.into_pointer_value();
+        // the runtime builds exit/monitor messages: hand it the well-known
+        // atom terms (atoms are compiler statics)
+        let names = [
+            "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
+        ];
+        let mut atom_args: Vec<BasicMetadataValueEnum> = Vec::new();
+        for n in names {
+            atom_args.push(self.atom_term(n)?.into());
+        }
+        self.builder
+            .build_call(self.rt_register_atoms(), &atom_args, "")
+            .map_err(be)?;
+
         let target = self.fns.borrow()[entry];
         let entry_ptr = target.as_global_value().as_pointer_value();
         let call = self
@@ -1974,6 +2008,123 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.builder.position_at_end(ok_bb);
                 Ok(pid)
             }
+            ("make_ref", 0) => {
+                let call = self
+                    .builder
+                    .build_call(self.rt_p_i64("mana_rt_make_ref"), &[self.ctx_val().into()], "r")
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("link", 1) => {
+                self.builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_link"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "",
+                    )
+                    .map_err(be)?;
+                self.atom_term("true")
+            }
+            ("unlink", 1) => {
+                self.builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_unlink"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "",
+                    )
+                    .map_err(be)?;
+                self.atom_term("true")
+            }
+            ("monitor", 2) => {
+                // monitor(process, Pid) — first arg assumed 'process'
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_monitor"),
+                        &[self.ctx_val().into(), argv[1].into()],
+                        "mref",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("demonitor", 1) => {
+                self.builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_demonitor"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "",
+                    )
+                    .map_err(be)?;
+                self.atom_term("true")
+            }
+            ("spawn_link", 1) | ("spawn_monitor", 1) => {
+                let fname = if name == "spawn_link" {
+                    "mana_rt_spawn_link"
+                } else {
+                    "mana_rt_spawn_monitor"
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64(fname),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "sp",
+                    )
+                    .map_err(be)?;
+                let r = call_result(call)?.into_int_value();
+                let bad = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, r, self.i64t.const_zero(), "sp.bad")
+                    .map_err(be)?;
+                let bad_bb = self.ctx.append_basic_block(f, "sp.badarg");
+                let ok_bb = self.ctx.append_basic_block(f, "sp.ok");
+                self.builder
+                    .build_conditional_branch(bad, bad_bb, ok_bb)
+                    .map_err(be)?;
+                self.builder.position_at_end(bad_bb);
+                let class = self.atom_term("error")?;
+                let reason = self.atom_term("badarg")?;
+                let ctx = self.ctx_val();
+                self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
+                self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
+                let target = self.unwind_target(f)?;
+                self.builder.build_unconditional_branch(target).map_err(be)?;
+                self.builder.position_at_end(ok_bb);
+                Ok(r)
+            }
+            ("process_flag", 2) => {
+                // only trap_exit is supported; the flag name is ignored
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_trap_exit"),
+                        &[self.ctx_val().into(), argv[1].into()],
+                        "prev",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("exit", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_fn("mana_rt_exit2", || {
+                            self.i64t.fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "",
+                    )
+                    .map_err(be)?;
+                let _ = call;
+                self.atom_term("true")
+            }
             ("!", 2) | ("send", 2) => {
                 self.builder
                     .build_call(
@@ -1983,6 +2134,42 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     )
                     .map_err(be)?;
                 Ok(argv[1])
+            }
+            ("and", 2) | ("or", 2) | ("xor", 2) => {
+                let t = self.atom_term("true")?;
+                let a = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, argv[0], t, "a")
+                    .map_err(be)?;
+                let b = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, argv[1], t, "b")
+                    .map_err(be)?;
+                let r = match name {
+                    "and" => self.builder.build_and(a, b, "and"),
+                    "or" => self.builder.build_or(a, b, "or"),
+                    _ => self.builder.build_xor(a, b, "xor"),
+                }
+                .map_err(be)?;
+                let fa = self.atom_term("false")?;
+                Ok(self
+                    .builder
+                    .build_select(r, t, fa, "bool")
+                    .map_err(be)?
+                    .into_int_value())
+            }
+            ("not", 1) => {
+                let t = self.atom_term("true")?;
+                let fa = self.atom_term("false")?;
+                let a = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, argv[0], t, "a")
+                    .map_err(be)?;
+                Ok(self
+                    .builder
+                    .build_select(a, fa, t, "not")
+                    .map_err(be)?
+                    .into_int_value())
             }
             ("display", 1) => {
                 self.builder
@@ -2407,7 +2594,13 @@ fn expr_may_raise(
             let callee = if module == "erlang" {
                 matches!(
                     (name.as_str(), args.len()),
-                    ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1) | ("spawn", 1)
+                    ("error", 1)
+                        | ("error", 2)
+                        | ("exit", 1)
+                        | ("throw", 1)
+                        | ("spawn", 1)
+                        | ("spawn_link", 1)
+                        | ("spawn_monitor", 1)
                 )
             } else {
                 raise_set.contains(&(
