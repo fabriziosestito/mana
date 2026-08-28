@@ -250,8 +250,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         })
     }
 
-    fn rt_alloc(&self) -> FunctionValue<'ctx> {
-        self.rt_fn("mana_rt_alloc", || {
+    fn rt_alloc_slow(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_alloc_slow", || {
             self.ptrt.fn_type(
                 &[
                     BasicMetadataTypeEnum::PointerType(self.ptrt),
@@ -365,9 +365,26 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let prev = self.load_word(ctx, CTX_ROOTS)?;
         self.store_word(frame, 0, prev)?;
         self.store_word(frame, 1, self.i64t.const_int(cap, false))?;
-        for i in 0..cap {
-            self.store_word(frame, 2 + i, self.nil())?;
-        }
+        // zero-init all slots with one memset — 0 marks an empty slot the
+        // collector skips (cheaper than storing NIL per slot)
+        let slots = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    self.i64t,
+                    frame,
+                    &[self.i64t.const_int(2, false)],
+                    "slots",
+                )
+                .map_err(be)?
+        };
+        self.builder
+            .build_memset(
+                slots,
+                8,
+                self.ctx.i8_type().const_zero(),
+                self.i64t.const_int(cap * 8, false),
+            )
+            .map_err(be)?;
         let frame_int = self
             .builder
             .build_ptr_to_int(frame, self.i64t, "frame.addr")
@@ -1467,19 +1484,62 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)
     }
 
+    /// Inline nursery bump allocation: load top/end from ctx words 0/1,
+    /// bump on the fast path, call `mana_rt_alloc_slow` (collect) on
+    /// overflow. Remains a GC point via the slow path.
     fn alloc_words(&self, n: u64) -> CgResult<PointerValue<'ctx>> {
+        let f = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let ctx = self.ctx_val();
+        let fast = self.ctx.append_basic_block(f, "alloc.fast");
+        let slow = self.ctx.append_basic_block(f, "alloc.slow");
+        let merge = self.ctx.append_basic_block(f, "alloc.done");
+
+        let top = self.load_word(ctx, 0)?;
+        let new_top = self
+            .builder
+            .build_int_add(top, self.i64t.const_int(n * 8, false), "alloc.newtop")
+            .map_err(be)?;
+        let end = self.load_word(ctx, 1)?;
+        let fits = self
+            .builder
+            .build_int_compare(IntPredicate::ULE, new_top, end, "alloc.fits")
+            .map_err(be)?;
+        self.builder
+            .build_conditional_branch(fits, fast, slow)
+            .map_err(be)?;
+
+        self.builder.position_at_end(fast);
+        self.store_word(ctx, 0, new_top)?;
+        self.builder.build_unconditional_branch(merge).map_err(be)?;
+
+        self.builder.position_at_end(slow);
         let call = self
             .builder
             .build_call(
-                self.rt_alloc(),
-                &[
-                    self.ctx_val().into(),
-                    self.i64t.const_int(n, false).into(),
-                ],
-                "alloc",
+                self.rt_alloc_slow(),
+                &[ctx.into(), self.i64t.const_int(n, false).into()],
+                "alloc.rt",
             )
             .map_err(be)?;
-        Ok(call_result(call)?.into_pointer_value())
+        let slow_ptr = call_result(call)?.into_pointer_value();
+        let slow_addr = self
+            .builder
+            .build_ptr_to_int(slow_ptr, self.i64t, "alloc.slowaddr")
+            .map_err(be)?;
+        let slow_bb = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge).map_err(be)?;
+
+        self.builder.position_at_end(merge);
+        let phi = self.builder.build_phi(self.i64t, "alloc.addr").map_err(be)?;
+        phi.add_incoming(&[(&top, fast), (&slow_addr, slow_bb)]);
+        self.builder
+            .build_int_to_ptr(phi.as_basic_value().into_int_value(), self.ptrt, "alloc")
+            .map_err(be)
     }
 
     fn store_word(
