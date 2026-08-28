@@ -336,11 +336,20 @@ impl Parser {
             }
             Tok::Call => {
                 self.bump();
-                let module = self.parse_atom_expr()?;
+                let module = self.parse_call_pos()?;
                 self.expect(Tok::Colon)?;
-                let name = self.parse_atom_expr()?;
+                let name = self.parse_call_pos()?;
                 let args = self.parse_call_args()?;
-                Ok(Expr::Call { module, name, args })
+                match (module, name) {
+                    (Expr::Lit(Literal::Atom(module)), Expr::Lit(Literal::Atom(name))) => {
+                        Ok(Expr::Call { module, name, args })
+                    }
+                    (module, name) => Ok(Expr::CallDyn {
+                        module: Box::new(module),
+                        name: Box::new(name),
+                        args,
+                    }),
+                }
             }
             Tok::Primop => {
                 self.bump();
@@ -438,6 +447,13 @@ impl Parser {
                 other
             )),
         }
+    }
+
+    /// Module/function position of `call`: usually an atom, but erlc emits
+    /// arbitrary expressions for dynamic dispatch. Annotations stripped.
+    fn parse_call_pos(&mut self) -> PResult<Expr> {
+        let e = self.parse_expr()?;
+        Ok(e)
     }
 
     /// An atom, possibly annotated/parenthesized (module/function position of `call`).

@@ -74,6 +74,14 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// `call M:F(args)` where the module and/or function position is a
+    /// computed expression (erlc emits these for dynamic `m.f(...)` calls);
+    /// compiles as erlang:apply/3.
+    CallDyn {
+        module: Box<Expr>,
+        name: Box<Expr>,
+        args: Vec<Expr>,
+    },
     PrimOp {
         name: String,
         args: Vec<Expr>,

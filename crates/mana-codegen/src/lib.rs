@@ -202,6 +202,8 @@ struct Cg<'ctx, 'p> {
     eternal_alloc: Cell<bool>,
     /// unique-name counter for static byte arrays (wide segment constants)
     static_bytes_count: Cell<usize>,
+    /// exported functions compiled in this module → mana_exports entries
+    exports: RefCell<Vec<(FunName, FunctionValue<'ctx>)>>,
     /// innermost enclosing try handler blocks (current function)
     handlers: RefCell<Vec<BasicBlock<'ctx>>>,
     /// lazily created per-function "pop frame; return sentinel" block
@@ -256,6 +258,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             cur_frame: Cell::new(None),
             eternal_alloc: Cell::new(false),
             static_bytes_count: Cell::new(0),
+            exports: RefCell::new(Vec::new()),
             handlers: RefCell::new(Vec::new()),
             propagate_bb: Cell::new(None),
             var_slots: Default::default(),
@@ -352,7 +355,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn rt_register_atoms(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_register_atoms", || {
             let params: Vec<BasicMetadataTypeEnum> =
-                (0..13).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
+                (0..14).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
             self.ctx.void_type().fn_type(&params, false)
         })
     }
@@ -731,6 +734,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.atom_global(&fname.name);
             }
         }
+        let exported: HashSet<&FunName> = ast.exports.iter().collect();
         for (fname, fun) in &ast.definitions {
             if !include.contains(fname) {
                 continue;
@@ -741,6 +745,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 None,
             );
             self.fns.borrow_mut().insert(fname.clone(), f);
+            if exported.contains(fname) && fname.name != "module_info" {
+                self.exports.borrow_mut().push((fname.clone(), f));
+            }
         }
 
         for (fname, fun) in &ast.definitions {
@@ -896,7 +903,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // atom terms (atoms are compiler statics)
         let names = [
             "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
-            "badarg", "error", "badmap", "badkey",
+            "badarg", "error", "badmap", "badkey", "undef",
         ];
         let mut atom_args: Vec<BasicMetadataValueEnum> = Vec::new();
         for n in names {
@@ -1215,6 +1222,34 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .build_select(c, tr, fa, "waited")
                     .map_err(be)?
                     .into_int_value())
+            }
+            Expr::CallDyn { module, name, args } => {
+                let mut children: Vec<&Expr> = vec![module.as_ref(), name.as_ref()];
+                children.extend(args.iter());
+                let rooted = self.eval_all_rooted(f, &children, scope)?;
+                let list = self.build_list_from_rooted(&rooted[2..])?;
+                let m = self.rooted_get(&rooted[0])?;
+                let fa = self.rooted_get(&rooted[1])?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_fn("mana_rt_apply3", || {
+                            self.i64t.fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[self.ctx_val().into(), m.into(), fa.into(), list.into()],
+                        "dyncall",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
             }
             Expr::PrimOp { name, .. } => Err(format!("unsupported primop {}", name)),
             Expr::Case { arg, clauses } => {
@@ -2842,6 +2877,29 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let c = self.builder.build_or(small, isf, "isnum").map_err(be)?;
                 self.bool_term(c)
             }
+            ("apply", 3) | ("apply", 2) => {
+                let helper = if argv.len() == 3 { "mana_rt_apply3" } else { "mana_rt_apply_fun" };
+                let mut cargs: Vec<BasicMetadataValueEnum> = vec![self.ctx_val().into()];
+                cargs.extend(argv.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+                let callee = if argv.len() == 3 {
+                    self.rt_fn(helper, || {
+                        self.i64t.fn_type(
+                            &[
+                                BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                            ],
+                            false,
+                        )
+                    })
+                } else {
+                    self.rt_ptt_i64(helper)
+                };
+                let call = self.builder.build_call(callee, &cargs, "apply").map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("is_port", 1) => self.atom_term("false"),
             ("is_binary", 1) | ("is_bitstring", 1) => {
                 // byte-aligned only: binary <=> bitstring
@@ -3232,6 +3290,58 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 false,
             )
         })
+    }
+
+    /// A proper list from already-rooted child values. Nursery mode: one
+    /// block of headerless cons cells (single GC point). Eternal (raise
+    /// path) mode: per-cell allocs, chained in SSA (no GC there).
+    fn build_list_from_rooted(&self, rooted: &[Rooted<'ctx>]) -> CgResult<IntValue<'ctx>> {
+        if rooted.is_empty() {
+            return Ok(self.nil());
+        }
+        if self.eternal_alloc.get() {
+            let mut tail = self.nil();
+            for r in rooted.iter().rev() {
+                let p = self.alloc_words_kind(2, true)?;
+                let v = self.rooted_get(r)?;
+                self.store_word(p, 0, v)?;
+                self.store_word(p, 1, tail)?;
+                let addr = self
+                    .builder
+                    .build_ptr_to_int(p, self.i64t, "cons.addr")
+                    .map_err(be)?;
+                tail = self
+                    .builder
+                    .build_or(addr, self.i64t.const_int(TAG_CONS, false), "cons")
+                    .map_err(be)?;
+            }
+            return Ok(tail);
+        }
+        let n = rooted.len() as u64;
+        let p = self.alloc_words_kind(2 * n, true)?;
+        let base = self
+            .builder
+            .build_ptr_to_int(p, self.i64t, "list.base")
+            .map_err(be)?;
+        let mut head = self.nil();
+        for (i, r) in rooted.iter().enumerate().rev() {
+            let v = self.rooted_get(r)?;
+            self.store_word(p, 2 * i as u64, v)?;
+            self.store_word(p, 2 * i as u64 + 1, head)?;
+            let addr = self
+                .builder
+                .build_int_add(
+                    base,
+                    self.i64t.const_int(16 * i as u64, false),
+                    "cell.addr",
+                )
+                .map_err(be)?;
+            head = self
+                .builder
+                .build_or(addr, self.i64t.const_int(TAG_CONS, false), "cons")
+                .map_err(be)?;
+        }
+        Ok(head)
     }
 
     /// An internal constant byte array; returns its pointer.
@@ -3940,6 +4050,43 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return;
         }
         let mut used: Vec<PointerValue<'ctx>> = Vec::with_capacity(atoms.len());
+        // export table entries: {mod_atom, fun_atom, arity, code} in the
+        // `mana_exports` section (raw pointers; the runtime tags them)
+        for (fname, code) in self.exports.borrow().iter() {
+            let m = atoms
+                .get(self.module_name.as_str())
+                .expect("module atom exists")
+                .as_pointer_value();
+            let fa = atoms
+                .get(fname.name.as_str())
+                .expect("function atom exists")
+                .as_pointer_value();
+            let init = self.ctx.const_struct(
+                &[
+                    m.into(),
+                    fa.into(),
+                    self.i64t.const_int(fname.arity as u64, false).into(),
+                    code.as_global_value().as_pointer_value().into(),
+                ],
+                false,
+            );
+            let g = self.module.add_global(
+                init.get_type(),
+                None,
+                &format!(
+                    "mana_export.{}.{}.{}",
+                    sanitize(&self.module_name),
+                    sanitize(&fname.name),
+                    fname.arity
+                ),
+            );
+            g.set_initializer(&init);
+            g.set_constant(true);
+            g.set_alignment(8);
+            g.set_section(Some("mana_exports"));
+            g.set_linkage(Linkage::Internal);
+            used.push(g.as_pointer_value());
+        }
         for (name, g) in atoms.iter() {
             let r = self.module.add_global(
                 self.ptrt,
@@ -4329,6 +4476,8 @@ fn expr_may_raise(
                         | ("binary_to_atom", 2)
                         | ("binary_to_existing_atom", 1)
                         | ("binary_to_existing_atom", 2)
+                        | ("apply", 2)
+                        | ("apply", 3)
                 )
             } else {
                 raise_set.contains(&(
@@ -4344,6 +4493,7 @@ fn expr_may_raise(
                     .iter()
                     .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound))
         }
+        Expr::CallDyn { .. } => true,
         Expr::PrimOp { name, .. } if is_raise(name) => true,
         Expr::PrimOp { args, .. } => args
             .iter()
@@ -4388,9 +4538,10 @@ fn expr_may_gc(
         Expr::Var(_) => false,
         Expr::Lit(Literal::Float(_)) => true, // boxed
         Expr::Lit(_) => false,
-        // allocation sites
+        // allocation sites (CallDyn builds its args list + callee unknown)
         Expr::Tuple(_) | Expr::Cons(..) | Expr::Fun(_) | Expr::FunRef { .. }
-        | Expr::LetRec { .. } | Expr::Binary(_) | Expr::Map { .. } => true,
+        | Expr::LetRec { .. } | Expr::Binary(_) | Expr::Map { .. }
+        | Expr::CallDyn { .. } => true,
         Expr::Apply { target, args } => {
             let target_gc = match target {
                 ApplyTarget::Var(_) => true,
@@ -4429,6 +4580,8 @@ fn expr_may_gc(
                         | ("integer_to_binary", 1)
                         | ("atom_to_binary", 1)
                         | ("atom_to_binary", 2)
+                        | ("apply", 2)
+                        | ("apply", 3)
                 )
             {
                 return true;
@@ -4547,6 +4700,12 @@ fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut usize) {
             *nodes += args.len();
             args.iter().for_each(|a| frame_prepass(a, vars, nodes))
         }
+        Expr::CallDyn { module, name, args } => {
+            *nodes += args.len() + 2;
+            frame_prepass(module, vars, nodes);
+            frame_prepass(name, vars, nodes);
+            args.iter().for_each(|a| frame_prepass(a, vars, nodes));
+        }
         Expr::Call { args, .. } | Expr::PrimOp { args, .. } => {
             *nodes += args.len();
             args.iter().for_each(|a| frame_prepass(a, vars, nodes))
@@ -4661,6 +4820,11 @@ fn free_vars(e: &Expr, bound: &mut HashSet<String>, out: &mut BTreeSet<String>) 
                     out.insert(v.clone());
                 }
             }
+            args.iter().for_each(|a| free_vars(a, bound, out));
+        }
+        Expr::CallDyn { module, name, args } => {
+            free_vars(module, bound, out);
+            free_vars(name, bound, out);
             args.iter().for_each(|a| free_vars(a, bound, out));
         }
         Expr::Call { args, .. } | Expr::PrimOp { args, .. } => {
@@ -4793,6 +4957,34 @@ fn reachable_funs(
 
     let mut seen: HashSet<(String, FunName)> = HashSet::new();
     let mut work = vec![(entry_mod.to_string(), entry.clone())];
+    // dynamic dispatch (erlang:apply/3, which erlc also emits for computed
+    // M:F(...) calls) can reach any exported function of any compiled
+    // module — seed them all when apply appears anywhere reachable code
+    // could live. module_info stays out (codegen skips it).
+    let uses_apply = mods.iter().any(|m| {
+        m.definitions.iter().any(|(_, fun)| {
+            let mut edges = Vec::new();
+            let mut lb = HashSet::new();
+            collect_edges(&fun.body, &mut edges, &mut lb);
+            edges.iter().any(|e| {
+                matches!(e, Edge::Remote(m, f) if m == "erlang" && f.name == "apply" && f.arity == 3)
+            })
+        })
+    });
+    if uses_apply {
+        for m in mods {
+            for ex in &m.exports {
+                // reflection exports need get_module_info; not dynamically
+                // dispatchable in the closed world — TODO(reflection)
+                if ex.name == "module_info" || ex.name == "__info__" {
+                    continue;
+                }
+                if defs.contains_key(&(m.name.as_str(), ex)) {
+                    work.push((m.name.clone(), ex.clone()));
+                }
+            }
+        }
+    }
     while let Some((module, fname)) = work.pop() {
         if !seen.insert((module.clone(), fname.clone())) {
             continue;
@@ -4884,6 +5076,16 @@ fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut HashSet<FunNa
                     arity: args.len(),
                 },
             ));
+            args.iter()
+                .for_each(|a| collect_edges(a, out, letrec_bound));
+        }
+        Expr::CallDyn { module, name, args } => {
+            out.push(Edge::Remote(
+                "erlang".into(),
+                FunName { name: "apply".into(), arity: 3 },
+            ));
+            collect_edges(module, out, letrec_bound);
+            collect_edges(name, out, letrec_bound);
             args.iter()
                 .for_each(|a| collect_edges(a, out, letrec_bound));
         }

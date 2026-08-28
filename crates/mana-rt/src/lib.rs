@@ -310,6 +310,7 @@ struct KnownAtoms {
     error_a: u64,
     badmap: u64,
     badkey: u64,
+    undef: u64,
 }
 static KNOWN: std::sync::OnceLock<KnownAtoms> = std::sync::OnceLock::new();
 
@@ -333,6 +334,7 @@ pub extern "C" fn mana_rt_register_atoms(
     error_a: u64,
     badmap: u64,
     badkey: u64,
+    undef: u64,
 ) {
     let _ = KNOWN.set(KnownAtoms {
         normal,
@@ -348,6 +350,7 @@ pub extern "C" fn mana_rt_register_atoms(
         error_a,
         badmap,
         badkey,
+        undef,
     });
 }
 
@@ -2790,6 +2793,133 @@ fn atom_table() -> &'static std::collections::HashMap<&'static [u8], u64> {
         }
         map
     })
+}
+
+// Closed-world export table: codegen plants one 4-word entry per exported
+// function in the `mana_exports` ELF section: raw pointers to the module
+// and function atom structs, the arity, and the code pointer. Atoms are
+// program-wide deduped, so lookup is by tagged-word identity.
+extern "C" {
+    static __start_mana_exports: u64;
+    static __stop_mana_exports: u64;
+}
+
+fn export_table() -> &'static std::collections::HashMap<(u64, u64, u64), usize> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<(u64, u64, u64), usize>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        unsafe {
+            let start = &raw const __start_mana_exports;
+            let stop = &raw const __stop_mana_exports;
+            let n = (stop as usize - start as usize) / 32;
+            for i in 0..n {
+                let e = start.add(4 * i);
+                let (m, f, a, code) = (*e, *e.add(1), *e.add(2), *e.add(3));
+                if m != 0 && f != 0 {
+                    map.insert((m | TAG_ATOM, f | TAG_ATOM, a), code as usize);
+                }
+            }
+        }
+        map
+    })
+}
+
+/// Call `code` (a compiled function of `n` params) with unpacked args.
+/// Closures take the fun term as a trailing parameter (`fun_term != 0`).
+unsafe fn call_dynamic(
+    ctx: *mut ProcCtx,
+    code: usize,
+    argv: &[u64],
+    fun_term: u64,
+) -> Option<u64> {
+    type C = *mut ProcCtx;
+    let a = argv;
+    let r = match (a.len(), fun_term != 0) {
+        (0, false) => std::mem::transmute::<usize, extern "C" fn(C) -> u64>(code)(ctx),
+        (1, false) => std::mem::transmute::<usize, extern "C" fn(C, u64) -> u64>(code)(ctx, a[0]),
+        (2, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64) -> u64>(code)(ctx, a[0], a[1]),
+        (3, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2]),
+        (4, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3]),
+        (5, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4]),
+        (6, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        (7, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6]),
+        (8, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]),
+        (0, true) => std::mem::transmute::<usize, extern "C" fn(C, u64) -> u64>(code)(ctx, fun_term),
+        (1, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64) -> u64>(code)(ctx, a[0], fun_term),
+        (2, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], fun_term),
+        (3, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], fun_term),
+        (4, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], fun_term),
+        (5, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], fun_term),
+        (6, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], fun_term),
+        (7, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], fun_term),
+        (8, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], fun_term),
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// Unpack a proper list of at most 8 elements. Err(()) = improper/too long.
+fn unpack_args(list: u64) -> Result<([u64; 8], usize), ()> {
+    let mut v = [0u64; 8];
+    let mut n = 0;
+    let mut cur = list;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS || n == 8 {
+            return Err(());
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        unsafe {
+            v[n] = *p;
+            cur = *p.add(1);
+        }
+        n += 1;
+    }
+    Ok((v, n))
+}
+
+fn raise_undef(ctx: &mut ProcCtx) -> u64 {
+    ctx.exc_class = atom_error();
+    ctx.exc_reason = known().undef;
+    EXC_SENTINEL
+}
+
+/// erlang:apply/3 — closed world: only exported functions of compiled
+/// modules are callable; anything else is undef (like BEAM without the
+/// module loaded). Arities above 8 are TODO(apply-arity).
+#[no_mangle]
+pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if m & TAG_MASK != TAG_ATOM || f & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let Ok((argv, n)) = unpack_args(args) else {
+        return raise_badarg(ctx);
+    };
+    let Some(&code) = export_table().get(&(m, f, n as u64)) else {
+        return raise_undef(ctx);
+    };
+    unsafe { call_dynamic(ctx, code, &argv[..n], 0).unwrap_or_else(|| raise_undef(ctx)) }
+}
+
+/// erlang:apply/2 — call a fun value with a runtime argument list.
+#[no_mangle]
+pub extern "C" fn mana_rt_apply_fun(ctx: *mut ProcCtx, fun: u64, args: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Ok((argv, n)) = unpack_args(args) else {
+        return raise_badarg(ctx);
+    };
+    if fun & TAG_MASK != TAG_BOXED || fun == 0 {
+        return raise_badarg(ctx);
+    }
+    let header = unsafe { *(fun as *const u64) };
+    if header & 0xff != KIND_FUN || (header >> 8) & 0xff != n as u64 {
+        // wrong kind or arity — bare badarg (badarity tuples carry
+        // stacktrace-shaped payloads we don't build; TODO(stacktraces))
+        return raise_badarg(ctx);
+    }
+    let code = unsafe { *(fun as *const u64).add(1) } as usize;
+    unsafe { call_dynamic(ctx, code, &argv[..n], fun).unwrap_or_else(|| raise_badarg(ctx)) }
 }
 
 /// erlang:binary_to_atom/1,2 — closed world: only atoms that exist in the
