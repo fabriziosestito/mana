@@ -311,6 +311,10 @@ struct KnownAtoms {
     badmap: u64,
     badkey: u64,
     undef: u64,
+    ok: u64,
+    module: u64,
+    nofile: u64,
+    value: u64,
 }
 static KNOWN: std::sync::OnceLock<KnownAtoms> = std::sync::OnceLock::new();
 
@@ -335,6 +339,10 @@ pub extern "C" fn mana_rt_register_atoms(
     badmap: u64,
     badkey: u64,
     undef: u64,
+    ok: u64,
+    module: u64,
+    nofile: u64,
+    value: u64,
 ) {
     let _ = KNOWN.set(KnownAtoms {
         normal,
@@ -351,6 +359,10 @@ pub extern "C" fn mana_rt_register_atoms(
         badmap,
         badkey,
         undef,
+        ok,
+        module,
+        nofile,
+        value,
     });
 }
 
@@ -1828,6 +1840,17 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
     }
 }
 
+/// A stubbed (unsupported-construct) function was actually called.
+#[no_mangle]
+pub extern "C" fn mana_rt_unsupported(msg: *const u8, len: u64) -> ! {
+    let m = unsafe { std::slice::from_raw_parts(msg, len as usize) };
+    eprintln!(
+        "mana: reached an unsupported construct: {}",
+        String::from_utf8_lossy(m)
+    );
+    std::process::exit(1)
+}
+
 /// Set exc and return the sentinel — the raising-BIF convention: codegen
 /// treats these helpers exactly like may-raise calls.
 fn raise_badarg(ctx: &mut ProcCtx) -> u64 {
@@ -2111,9 +2134,12 @@ fn raise_map_err(ctx: &mut ProcCtx, tag_is_badmap: bool, culprit: u64) -> u64 {
 
 /// badmap/badkey atoms: registered alongside the rest.
 fn atom_by_name(name: &str) -> u64 {
+    let k = known();
     match name {
-        "badmap" => known().badmap,
-        _ => known().badkey,
+        "badmap" => k.badmap,
+        "badkey" => k.badkey,
+        "value" => k.value,
+        other => panic!("atom_by_name: '{}' is not registered", other),
     }
 }
 
@@ -2494,6 +2520,11 @@ pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u
     if off + nbytes > len {
         return EXC_SENTINEL;
     }
+    if nbytes > 8 {
+        // dynamic sizes beyond 64 bits would need bignums — fail the match
+        // (TODO(bignum): BEAM would succeed)
+        return EXC_SENTINEL;
+    }
     let mut v: u64 = 0;
     unsafe {
         if flags & 1 != 0 {
@@ -2519,6 +2550,64 @@ pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u
         std::process::abort();
     }
     ((sv << 3) as u64) | TAG_SMALL
+}
+
+/// Pattern extraction of a utf8 segment: decode one code point at `off`.
+/// Returns -1 for fail, else (width_bytes << 32) | code_point.
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_read_utf8(bin: u64, off: u64) -> i64 {
+    let Some((p, len)) = bin_parts(bin) else {
+        return -1;
+    };
+    let off = off as usize;
+    if off >= len {
+        return -1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(p.add(off), len - off) };
+    let width = match bytes[0] {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => return -1,
+    };
+    if bytes.len() < width {
+        return -1;
+    }
+    match std::str::from_utf8(&bytes[..width]) {
+        Ok(s) => {
+            let cp = s.chars().next().unwrap() as u32;
+            ((width as i64) << 32) | cp as i64
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Construction: utf8 width of a code point term (0 = invalid → badarg).
+#[no_mangle]
+pub extern "C" fn mana_rt_utf8_width(cp: u64) -> u64 {
+    if cp & TAG_MASK != TAG_SMALL {
+        return 0;
+    }
+    u32::try_from(cp as i64 >> 3)
+        .ok()
+        .and_then(char::from_u32)
+        .map(|c| c.len_utf8() as u64)
+        .unwrap_or(0)
+}
+
+/// Construction writer: utf8-encode a code point; returns bytes written
+/// (the width was already validated by mana_rt_utf8_width).
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_write_utf8(bin: u64, off: u64, cp: u64) -> u64 {
+    let c = char::from_u32((cp as i64 >> 3) as u32).unwrap();
+    let mut buf = [0u8; 4];
+    let s = c.encode_utf8(&mut buf);
+    let (p, _) = bin_parts(bin).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), (p as *mut u8).add(off as usize), s.len());
+    }
+    s.len() as u64
 }
 
 /// Pattern extraction of a binary segment: `len < 0` means the whole rest.
@@ -2603,17 +2692,31 @@ pub extern "C" fn mana_rt_bin_write_int(
     0
 }
 
-/// Construction writer: splice a whole binary. Non-allocating; the total
-/// size was computed from byte_size beforehand, so src is a valid binary.
+/// Construction writer: splice a binary. `len < 0` copies all of it; a
+/// non-negative len copies the first len bytes (badarg if src is shorter,
+/// like BEAM's fixed-size binary segments). Non-allocating.
 #[no_mangle]
-pub extern "C" fn mana_rt_bin_write_bin(ctx: *mut ProcCtx, bin: u64, off: u64, src: u64) -> u64 {
+pub extern "C" fn mana_rt_bin_write_bin(
+    ctx: *mut ProcCtx,
+    bin: u64,
+    off: u64,
+    src: u64,
+    len: i64,
+) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let Some((sp, sn)) = bin_parts(src) else {
         return raise_badarg(ctx);
     };
+    let n = if len < 0 {
+        sn
+    } else if (len as usize) <= sn {
+        len as usize
+    } else {
+        return raise_badarg(ctx);
+    };
     let (p, _) = bin_parts(bin).unwrap();
     unsafe {
-        std::ptr::copy_nonoverlapping(sp, (p as *mut u8).add(off as usize), sn);
+        std::ptr::copy_nonoverlapping(sp, (p as *mut u8).add(off as usize), n);
     }
     0
 }
@@ -2648,6 +2751,36 @@ pub extern "C" fn mana_rt_binary_part(ctx: *mut ProcCtx, bin: u64, pos: u64, len
         return raise_badarg(ctx);
     }
     v
+}
+
+/// erlang:split_binary/2 → {Prefix, Suffix}.
+#[no_mangle]
+pub extern "C" fn mana_rt_split_binary(ctx: *mut ProcCtx, bin: u64, pos: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, total)) = bin_parts(bin) else {
+        return raise_badarg(ctx);
+    };
+    if pos & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let at = pos as i64 >> 3;
+    if at < 0 || at as usize > total {
+        return raise_badarg(ctx);
+    }
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 3, bin, 0, 0];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    fr[3] = mana_rt_bin_slice(ctx, fr[2], 0, at);
+    fr[4] = mana_rt_bin_slice(ctx, fr[2], at as u64, -1);
+    let t = alloc_nursery(ctx, 3);
+    unsafe {
+        *t = (2 << 8) | KIND_TUPLE;
+        *t.add(1) = fr[3];
+        *t.add(2) = fr[4];
+    }
+    ctx.roots_head = saved;
+    t as u64
 }
 
 /// erlang:binary_to_list/1.
@@ -2742,15 +2875,113 @@ pub extern "C" fn mana_rt_iolist_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
     }
 }
 
-/// erlang:integer_to_binary/1.
+/// Integer digits in a base (2..=36, uppercase — BEAM's format).
+fn int_digits(v: i64, base: u32) -> String {
+    if v == 0 {
+        return "0".into();
+    }
+    let neg = v < 0;
+    let mut x = v.unsigned_abs();
+    let mut out = Vec::new();
+    while x > 0 {
+        let d = (x % base as u64) as u32;
+        out.push(char::from_digit(d, base).unwrap().to_ascii_uppercase() as u8);
+        x /= base as u64;
+    }
+    if neg {
+        out.push(b'-');
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+
+/// erlang:integer_to_binary/1,2 (base as a term; small 10 for /1).
 #[no_mangle]
-pub extern "C" fn mana_rt_integer_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
+pub extern "C" fn mana_rt_integer_to_binary(ctx: *mut ProcCtx, t: u64, base: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    if t & TAG_MASK != TAG_SMALL {
+    if t & TAG_MASK != TAG_SMALL || base & TAG_MASK != TAG_SMALL {
         return raise_badarg(ctx);
     }
-    let s = (t as i64 >> 3).to_string();
+    let b = base as i64 >> 3;
+    if !(2..=36).contains(&b) {
+        return raise_badarg(ctx);
+    }
+    let s = int_digits(t as i64 >> 3, b as u32);
     bytes_to_new_bin(ctx, s.as_bytes())
+}
+
+/// erlang:integer_to_list/1,2.
+#[no_mangle]
+pub extern "C" fn mana_rt_integer_to_list(ctx: *mut ProcCtx, t: u64, base: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if t & TAG_MASK != TAG_SMALL || base & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let b = base as i64 >> 3;
+    if !(2..=36).contains(&b) {
+        return raise_badarg(ctx);
+    }
+    let s = int_digits(t as i64 >> 3, b as u32);
+    bytes_to_charlist(ctx, s.as_bytes())
+}
+
+/// Parse decimal/base digits (with optional sign) — badarg on any junk.
+fn parse_int_bytes(bytes: &[u8], base: u32) -> Option<i64> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    let v = i64::from_str_radix(s, base).ok()?;
+    // small ints are 61 bits
+    if v >> 60 != 0 && v >> 60 != -1 {
+        return None; // TODO(bignum)
+    }
+    Some(v)
+}
+
+/// erlang:binary_to_integer/1,2.
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_to_integer(ctx: *mut ProcCtx, bin: u64, base: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if bin_parts(bin).is_none() || base & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let b = base as i64 >> 3;
+    if !(2..=36).contains(&b) {
+        return raise_badarg(ctx);
+    }
+    match parse_int_bytes(bin_bytes(bin), b as u32) {
+        Some(v) => ((v << 3) as u64) | TAG_SMALL,
+        None => raise_badarg(ctx),
+    }
+}
+
+/// erlang:list_to_integer/1,2.
+#[no_mangle]
+pub extern "C" fn mana_rt_list_to_integer(ctx: *mut ProcCtx, l: u64, base: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if base & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let b = base as i64 >> 3;
+    if !(2..=36).contains(&b) {
+        return raise_badarg(ctx);
+    }
+    let mut bytes = Vec::new();
+    let mut cur = l;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if h & TAG_MASK != TAG_SMALL {
+            return raise_badarg(ctx);
+        }
+        bytes.push((h as i64 >> 3) as u8);
+        cur = unsafe { *p.add(1) };
+    }
+    match parse_int_bytes(&bytes, b as u32) {
+        Some(v) => ((v << 3) as u64) | TAG_SMALL,
+        None => raise_badarg(ctx),
+    }
 }
 
 /// erlang:atom_to_binary/1,2 (utf8 == latin1 for our ascii atom names).
@@ -2920,6 +3151,988 @@ pub extern "C" fn mana_rt_apply_fun(ctx: *mut ProcCtx, fun: u64, args: u64) -> u
     }
     let code = unsafe { *(fun as *const u64).add(1) } as usize;
     unsafe { call_dynamic(ctx, code, &argv[..n], fun).unwrap_or_else(|| raise_badarg(ctx)) }
+}
+
+// ---------------------------------------------------------------------------
+// io (native cut: we never compile OTP's io.erl / group-leader protocol)
+
+/// io:put_chars/1 — write iodata (chardata restricted to bytes; unicode
+/// code points beyond latin-1 are TODO(unicode)) to stdout. Returns ok.
+#[no_mangle]
+pub extern "C" fn mana_rt_io_put_chars(ctx: *mut ProcCtx, data: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut out = Vec::new();
+    if iolist_flatten(data, &mut out).is_err() {
+        return raise_badarg(ctx);
+    }
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    if lock.write_all(&out).and_then(|_| lock.flush()).is_err() {
+        return raise_badarg(ctx);
+    }
+    known().ok
+}
+
+/// Flatten chardata: like an iolist, but integers are Unicode code points
+/// (utf8-encoded), not bytes. Binaries splice raw (assumed utf8).
+fn chardata_flatten(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
+    if let Some((p, n)) = bin_parts(t) {
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(p, n) });
+        return Ok(());
+    }
+    let mut cur = t;
+    loop {
+        if cur == NIL {
+            return Ok(());
+        }
+        if cur & TAG_MASK != TAG_CONS {
+            if bin_parts(cur).is_some() {
+                return chardata_flatten(cur, out);
+            }
+            return Err(());
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if h & TAG_MASK == TAG_SMALL {
+            let cp = h as i64 >> 3;
+            let c = u32::try_from(cp).ok().and_then(char::from_u32).ok_or(())?;
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        } else {
+            chardata_flatten(h, out)?;
+        }
+        cur = unsafe { *p.add(1) };
+    }
+}
+
+/// unicode:characters_to_binary/1 (utf8 in, utf8 out).
+#[no_mangle]
+pub extern "C" fn mana_rt_unicode_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut out = Vec::new();
+    match chardata_flatten(t, &mut out) {
+        Ok(()) => bytes_to_new_bin(ctx, &out),
+        Err(()) => raise_badarg(ctx),
+    }
+}
+
+/// unicode:characters_to_list/1 — code point list from utf8 chardata.
+#[no_mangle]
+pub extern "C" fn mana_rt_unicode_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut bytes = Vec::new();
+    if chardata_flatten(t, &mut bytes).is_err() {
+        return raise_badarg(ctx);
+    }
+    let Ok(s) = std::str::from_utf8(&bytes) else {
+        return raise_badarg(ctx);
+    };
+    let cps: Vec<u64> = s.chars().map(|c| ((c as u64) << 3) | TAG_SMALL).collect();
+    // build the list back-to-front; the code points are immediates so only
+    // the partial list needs rooting
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for &cp in cps.iter().rev() {
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = cp;
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[2]
+}
+
+/// The minimal format engine (~s ~ts ~p ~w ~n ~~); unknown directives
+/// print their raw text. Shared by io:format and io_lib:format.
+fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
+    let mut fbytes = Vec::new();
+    chardata_flatten(fmt, &mut fbytes)?;
+    let mut argv = Vec::new();
+    let mut cur = args;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return Err(());
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        unsafe {
+            argv.push(*p);
+            cur = *p.add(1);
+        }
+    }
+    let mut out = Vec::new();
+    let mut ai = 0;
+    let mut i = 0;
+    while i < fbytes.len() {
+        let b = fbytes[i];
+        if b != b'~' || i + 1 >= fbytes.len() {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        // skip modifiers like ~ts
+        let mut j = i + 1;
+        while j < fbytes.len() && fbytes[j] == b't' {
+            j += 1;
+        }
+        match fbytes.get(j) {
+            Some(b'n') => out.push(b'\n'),
+            Some(b'~') => out.push(b'~'),
+            Some(b's') => {
+                let a = argv.get(ai).copied().unwrap_or(NIL);
+                ai += 1;
+                chardata_flatten(a, &mut out)?;
+            }
+            Some(b'p') | Some(b'w') => {
+                let a = argv.get(ai).copied().unwrap_or(NIL);
+                ai += 1;
+                let mut s = String::new();
+                write_term(a, &mut s);
+                out.extend_from_slice(s.as_bytes());
+            }
+            Some(&other) => {
+                out.push(b'~');
+                out.push(other);
+            }
+            None => out.push(b'~'),
+        }
+        i = j + 1;
+    }
+    Ok(out)
+}
+
+/// io:format/2.
+#[no_mangle]
+pub extern "C" fn mana_rt_io_format(ctx: *mut ProcCtx, fmt: u64, args: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Ok(out) = format_engine(fmt, args) else {
+        return raise_badarg(ctx);
+    };
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    if lock.write_all(&out).and_then(|_| lock.flush()).is_err() {
+        return raise_badarg(ctx);
+    }
+    known().ok
+}
+
+/// Byte vec → charlist (nursery); bytes already copied off-heap.
+fn bytes_to_charlist(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for &b in bytes.iter().rev() {
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = ((b as u64) << 3) | TAG_SMALL;
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[2]
+}
+
+/// io_lib:format/2 — the formatted charlist instead of printing.
+#[no_mangle]
+pub extern "C" fn mana_rt_io_lib_format(ctx: *mut ProcCtx, fmt: u64, args: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Ok(out) = format_engine(fmt, args) else {
+        return raise_badarg(ctx);
+    };
+    bytes_to_charlist(ctx, &out)
+}
+
+/// io_lib:write/1 (and write/2 with depth ignored) — display text of a term.
+#[no_mangle]
+pub extern "C" fn mana_rt_io_lib_write(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut s = String::new();
+    write_term(t, &mut s);
+    bytes_to_charlist(ctx, s.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// persistent_term (native cut)
+
+/// Deep copy a term into self-contained eternal storage: every pointer in
+/// the copy targets another eternal block, so the GC never needs to see it.
+/// persistent_term values are immortal by design (puts are rare).
+fn eternal_deep_copy(t: u64) -> u64 {
+    match t & TAG_MASK {
+        TAG_CONS => {
+            let p = (t & !TAG_MASK) as *const u64;
+            let (h, tl) = unsafe { (*p, *p.add(1)) };
+            let np = alloc_space(2);
+            unsafe {
+                *np = eternal_deep_copy(h);
+                *np.add(1) = eternal_deep_copy(tl);
+            }
+            np as u64 | TAG_CONS
+        }
+        TAG_BOXED if t != 0 => {
+            let p = t as *const u64;
+            let header = unsafe { *p };
+            let words = 1 + payload_words(header);
+            let np = alloc_space(words);
+            unsafe {
+                *np = header;
+                match header & 0xff {
+                    KIND_FLOAT | KIND_BIN => {
+                        std::ptr::copy_nonoverlapping(p.add(1), np.add(1), words - 1);
+                    }
+                    KIND_FUN => {
+                        *np.add(1) = *p.add(1); // code ptr
+                        for i in 2..words {
+                            *np.add(i) = eternal_deep_copy(*p.add(i));
+                        }
+                    }
+                    _ => {
+                        for i in 1..words {
+                            *np.add(i) = eternal_deep_copy(*p.add(i));
+                        }
+                    }
+                }
+            }
+            np as u64
+        }
+        _ => t, // immediates and atoms (static) pass through
+    }
+}
+
+static PERSISTENT_TERMS: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// persistent_term:put/2 — keys compared exactly (we require immediate or
+/// atom keys, which covers real usage; compound keys are TODO).
+#[no_mangle]
+pub extern "C" fn mana_rt_pt_put(_ctx: *mut ProcCtx, key: u64, val: u64) -> u64 {
+    let key = eternal_deep_copy(key);
+    let val = eternal_deep_copy(val);
+    let mut guard = PERSISTENT_TERMS.lock().unwrap();
+    let map = guard.get_or_insert_with(Default::default);
+    // exact-compare lookup for compound keys
+    let existing = map.keys().copied().find(|&k| mana_rt_eq_exact(k, key) == 1);
+    match existing {
+        Some(k) => {
+            map.insert(k, val);
+        }
+        None => {
+            map.insert(key, val);
+        }
+    }
+    known().ok
+}
+
+/// persistent_term:get/1,2 — sentinel-free: get/1 raises badarg on miss
+/// (BEAM's behavior), get/2 returns the default.
+#[no_mangle]
+pub extern "C" fn mana_rt_pt_get(ctx: *mut ProcCtx, key: u64, default: u64, has_default: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let guard = PERSISTENT_TERMS.lock().unwrap();
+    let found = guard
+        .as_ref()
+        .and_then(|m| m.keys().copied().find(|&k| mana_rt_eq_exact(k, key) == 1).map(|k| m[&k]));
+    match found {
+        Some(v) => v,
+        None if has_default != 0 => default,
+        None => raise_badarg(ctx),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// binary module C BIFs (all of binary.erl is nif stubs)
+
+/// Any atom compiled into the program, by name. The closed-world table is
+/// complete, so a miss means the runtime tried to mint a new atom.
+fn find_atom(name: &str) -> Option<u64> {
+    atom_table().get(name.as_bytes()).copied()
+}
+
+/// Patterns: a binary or a non-empty list of binaries (compile_pattern is
+/// the identity in our world). Byte vectors returned for searching.
+fn pattern_bins(pat: u64) -> Result<Vec<&'static [u8]>, ()> {
+    if bin_parts(pat).is_some() {
+        return Ok(vec![bin_bytes(pat)]);
+    }
+    let mut out = Vec::new();
+    let mut cur = pat;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return Err(());
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if bin_parts(h).is_none() {
+            return Err(());
+        }
+        out.push(bin_bytes(h));
+        cur = unsafe { *p.add(1) };
+    }
+    if out.is_empty() || out.iter().any(|b| b.is_empty()) {
+        return Err(());
+    }
+    Ok(out)
+}
+
+/// Leftmost match at or after `from`; longest pattern wins ties.
+fn bin_search(hay: &[u8], pats: &[&[u8]], from: usize) -> Option<(usize, usize)> {
+    for i in from..hay.len() {
+        let mut best = 0usize;
+        for p in pats {
+            if p.len() > best && hay[i..].starts_with(p) {
+                best = p.len();
+            }
+        }
+        if best > 0 {
+            return Some((i, best));
+        }
+    }
+    None
+}
+
+/// binary:split/2,3. opts term: nil or list of global/trim/trim_all.
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_split(ctx: *mut ProcCtx, bin: u64, pat: u64, opts: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if bin_parts(bin).is_none() {
+        return raise_badarg(ctx);
+    }
+    let Ok(pats) = pattern_bins(pat) else {
+        return raise_badarg(ctx);
+    };
+    let (mut global, mut trim, mut trim_all) = (false, false, false);
+    let mut cur = opts;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let opt = unsafe { *p };
+        match atom_bytes(opt) {
+            b"global" => global = true,
+            b"trim" => trim = true,
+            b"trim_all" => trim_all = true,
+            _ => return raise_badarg(ctx),
+        }
+        cur = unsafe { *p.add(1) };
+    }
+    // copy out — allocation below can move the source binary
+    let hay: Vec<u8> = bin_bytes(bin).to_vec();
+    let pats: Vec<Vec<u8>> = pats.iter().map(|p| p.to_vec()).collect();
+    let pref: Vec<&[u8]> = pats.iter().map(|p| p.as_slice()).collect();
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut start = 0usize;
+    loop {
+        match bin_search(&hay, &pref, start) {
+            Some((at, len)) => {
+                parts.push(hay[start..at].to_vec());
+                start = at + len;
+                if !global {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    parts.push(hay[start..].to_vec());
+    if trim_all {
+        parts.retain(|p| !p.is_empty());
+    } else if trim {
+        while parts.last().is_some_and(|p| p.is_empty()) {
+            parts.pop();
+        }
+    }
+    // build the result list back-to-front, rooting the partial list and
+    // the fresh binary across each cell allocation
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, NIL, 0];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for bytes in parts.iter().rev() {
+        fr[3] = bytes_to_new_bin(ctx, bytes);
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = fr[3];
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+        fr[3] = 0;
+    }
+    ctx.roots_head = saved;
+    fr[2]
+}
+
+/// binary:match/2,3 (mode 0: {S,L}|nomatch) and matches (mode 1: list).
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_match(ctx: *mut ProcCtx, bin: u64, pat: u64, mode: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if bin_parts(bin).is_none() {
+        return raise_badarg(ctx);
+    }
+    let Ok(pats) = pattern_bins(pat) else {
+        return raise_badarg(ctx);
+    };
+    let hay: Vec<u8> = bin_bytes(bin).to_vec();
+    let pats: Vec<Vec<u8>> = pats.iter().map(|p| p.to_vec()).collect();
+    let pref: Vec<&[u8]> = pats.iter().map(|p| p.as_slice()).collect();
+    fn mk_pair(ctx: &mut ProcCtx, at: usize, len: usize) -> u64 {
+        let t = alloc_nursery(ctx, 3);
+        unsafe {
+            *t = (2 << 8) | KIND_TUPLE;
+            *t.add(1) = ((at as u64) << 3) | TAG_SMALL;
+            *t.add(2) = ((len as u64) << 3) | TAG_SMALL;
+        }
+        t as u64
+    }
+    if mode == 0 {
+        return match bin_search(&hay, &pref, 0) {
+            Some((at, len)) => mk_pair(ctx, at, len),
+            None => find_atom("nomatch").expect("nomatch atom compiled in"),
+        };
+    }
+    let mut hits = Vec::new();
+    let mut start = 0usize;
+    while let Some((at, len)) = bin_search(&hay, &pref, start) {
+        hits.push((at, len));
+        start = at + len;
+    }
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, NIL, 0];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for &(at, len) in hits.iter().rev() {
+        fr[3] = mk_pair(ctx, at, len);
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = fr[3];
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+        fr[3] = 0;
+    }
+    ctx.roots_head = saved;
+    fr[2]
+}
+
+/// binary:copy/2 (copy/1 passes n = 1).
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_copy(ctx: *mut ProcCtx, bin: u64, n: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if bin_parts(bin).is_none() || n & TAG_MASK != TAG_SMALL || (n as i64 >> 3) < 0 {
+        return raise_badarg(ctx);
+    }
+    let count = (n as i64 >> 3) as usize;
+    let bytes: Vec<u8> = bin_bytes(bin).repeat(count);
+    bytes_to_new_bin(ctx, &bytes)
+}
+
+/// binary:at/2 (pos is a term); `last` != 0 → last byte (binary:last/1),
+/// ignoring pos.
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_at(ctx: *mut ProcCtx, bin: u64, pos: u64, last: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((p, len)) = bin_parts(bin) else {
+        return raise_badarg(ctx);
+    };
+    if len == 0 {
+        return raise_badarg(ctx);
+    }
+    let i = if last != 0 {
+        len - 1
+    } else {
+        if pos & TAG_MASK != TAG_SMALL || (pos as i64 >> 3) < 0 {
+            return raise_badarg(ctx);
+        }
+        (pos as i64 >> 3) as usize
+    };
+    if i >= len {
+        return raise_badarg(ctx);
+    }
+    let b = unsafe { *p.add(i) };
+    ((b as u64) << 3) | TAG_SMALL
+}
+
+/// binary:encode_unsigned/1,2 (little != 0 → little-endian).
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_encode_unsigned(ctx: *mut ProcCtx, n: u64, little: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if n & TAG_MASK != TAG_SMALL || (n as i64) < 0 {
+        return raise_badarg(ctx);
+    }
+    let v = (n as i64 >> 3) as u64;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut x = v;
+    loop {
+        bytes.push((x & 0xff) as u8);
+        x >>= 8;
+        if x == 0 {
+            break;
+        }
+    }
+    if little == 0 {
+        bytes.reverse();
+    }
+    bytes_to_new_bin(ctx, &bytes)
+}
+
+/// binary:decode_unsigned/1,2.
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_decode_unsigned(ctx: *mut ProcCtx, bin: u64, little: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if bin_parts(bin).is_none() {
+        return raise_badarg(ctx);
+    }
+    let bytes = bin_bytes(bin);
+    if bytes.len() > 7 {
+        eprintln!("mana: TODO(bignum): decode_unsigned over 56 bits");
+        std::process::exit(1);
+    }
+    let mut v: u64 = 0;
+    if little != 0 {
+        for &b in bytes.iter().rev() {
+            v = (v << 8) | b as u64;
+        }
+    } else {
+        for &b in bytes {
+            v = (v << 8) | b as u64;
+        }
+    }
+    (v << 3) | TAG_SMALL
+}
+
+/// binary:longest_common_prefix/1 (suffix != 0 → suffix variant).
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_lcp(ctx: *mut ProcCtx, list: u64, suffix: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if list & TAG_MASK != TAG_CONS {
+        return raise_badarg(ctx);
+    }
+    let Ok(bins) = pattern_bins(list) else {
+        return raise_badarg(ctx);
+    };
+    let mut common = usize::MAX;
+    let first = bins[0];
+    for b in &bins {
+        let mut n = 0;
+        let max = first.len().min(b.len());
+        while n < max {
+            let (x, y) = if suffix != 0 {
+                (first[first.len() - 1 - n], b[b.len() - 1 - n])
+            } else {
+                (first[n], b[n])
+            };
+            if x != y {
+                break;
+            }
+            n += 1;
+        }
+        common = common.min(n);
+    }
+    ((common as u64) << 3) | TAG_SMALL
+}
+
+// ---------------------------------------------------------------------------
+// lists C BIFs (nif_error stubs in lists.erl; native here, definitions
+// overridden at codegen so local and remote callers agree)
+
+/// lists:reverse/2.
+#[no_mangle]
+pub extern "C" fn mana_rt_lists_reverse(ctx: *mut ProcCtx, l: u64, acc0: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, l, acc0];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    while fr[2] != NIL {
+        if fr[2] & TAG_MASK != TAG_CONS {
+            ctx.roots_head = saved;
+            return raise_badarg(ctx);
+        }
+        let cell = alloc_nursery(ctx, 2);
+        let p = (fr[2] & !TAG_MASK) as *const u64;
+        unsafe {
+            *cell = *p;
+            *cell.add(1) = fr[3];
+            fr[2] = *p.add(1);
+        }
+        fr[3] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[3]
+}
+
+/// lists:member/2 (=:= comparison). Non-allocating.
+#[no_mangle]
+pub extern "C" fn mana_rt_lists_member(ctx: *mut ProcCtx, x: u64, l: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut cur = l;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        unsafe {
+            if mana_rt_eq_exact(*p, x) == 1 {
+                return known().true_a;
+            }
+            cur = *p.add(1);
+        }
+    }
+    known().false_a
+}
+
+/// lists:keyfind/3 (== comparison, like BEAM's CMP). `mode`: 0 = keyfind
+/// (tuple | false), 1 = keymember (bool), 2 = keysearch ({value, T} | false).
+#[no_mangle]
+pub extern "C" fn mana_rt_lists_keyfind(
+    ctx: *mut ProcCtx,
+    key: u64,
+    n: u64,
+    l: u64,
+    mode: u64,
+) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if n & TAG_MASK != TAG_SMALL || (n as i64 >> 3) < 1 {
+        return raise_badarg(ctx);
+    }
+    let idx = (n as i64 >> 3) as u64;
+    let mut cur = l;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if h & TAG_MASK == TAG_BOXED && h != 0 {
+            let hp = h as *const u64;
+            let header = unsafe { *hp };
+            if header & 0xff == KIND_TUPLE && header >> 8 >= idx {
+                let el = unsafe { *hp.add(idx as usize) };
+                if mana_rt_compare(el, key) == 0 {
+                    return match mode {
+                        1 => known().true_a,
+                        2 => {
+                            // {value, Tuple}: h may be young — root it
+                            let saved = ctx.roots_head;
+                            let mut fr = [0u64, 1, h];
+                            fr[0] = saved;
+                            ctx.roots_head = fr.as_ptr() as u64;
+                            let t = alloc_nursery(ctx, 3);
+                            ctx.roots_head = saved;
+                            unsafe {
+                                *t = (2 << 8) | KIND_TUPLE;
+                                *t.add(1) = atom_by_name("value");
+                                *t.add(2) = fr[2];
+                            }
+                            t as u64
+                        }
+                        _ => h,
+                    };
+                }
+            }
+        }
+        cur = unsafe { *p.add(1) };
+    }
+    known().false_a
+}
+
+/// maps:keys/1 and maps:values/1 (`vals != 0`). Key order = canonical.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_keys(ctx: *mut ProcCtx, m: u64, vals: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, n)) = map_parts(m) else {
+        return raise_map_err(ctx, true, m);
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, m, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for i in (0..n).rev() {
+        let cell = alloc_nursery(ctx, 2);
+        let (p, _) = map_parts(fr[2]).unwrap();
+        let item = unsafe {
+            if vals != 0 {
+                *p.add(1 + n + i)
+            } else {
+                *p.add(1 + i)
+            }
+        };
+        unsafe {
+            *cell = item;
+            *cell.add(1) = fr[3];
+        }
+        fr[3] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[3]
+}
+
+/// maps:fold/3 — calls back into compiled code (the fun), so the map, fun,
+/// and accumulator are rooted and reloaded around every callback.
+#[no_mangle]
+pub extern "C" fn mana_rt_maps_fold(ctx: *mut ProcCtx, fun: u64, acc0: u64, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, n)) = map_parts(m) else {
+        return raise_map_err(ctx, true, m);
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 3, fun, acc0, m];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for i in 0..n {
+        let (p, _) = map_parts(fr[4]).unwrap();
+        let (k, v) = unsafe { (*p.add(1 + i), *p.add(1 + n + i)) };
+        // args list for apply_fun: build 3 cells rooted via fr (k/v read
+        // fresh from the rooted map, acc in fr[3])
+        let c3 = alloc_nursery(ctx, 2);
+        unsafe {
+            *c3 = fr[3];
+            *c3.add(1) = NIL;
+        }
+        // re-read k/v: the alloc above may have moved the map
+        let (p, _) = map_parts(fr[4]).unwrap();
+        let v2 = unsafe { *p.add(1 + n + i) };
+        let c2 = alloc_nursery(ctx, 2);
+        unsafe {
+            *c2 = v2;
+            *c2.add(1) = c3 as u64 | TAG_CONS;
+        }
+        let (p, _) = map_parts(fr[4]).unwrap();
+        let k2 = unsafe { *p.add(1 + i) };
+        let c1 = alloc_nursery(ctx, 2);
+        unsafe {
+            *c1 = k2;
+            *c1.add(1) = c2 as u64 | TAG_CONS;
+        }
+        let _ = (k, v);
+        let args = c1 as u64 | TAG_CONS;
+        let r = mana_rt_apply_fun(ctx, fr[2], args);
+        if r == EXC_SENTINEL {
+            ctx.roots_head = saved;
+            return EXC_SENTINEL;
+        }
+        fr[3] = r;
+    }
+    ctx.roots_head = saved;
+    fr[3]
+}
+
+// ---------------------------------------------------------------------------
+// ets + application env (native cuts): one global store of eternal deep
+// copies. Enough for elixir_config-style tables — TODO(ets): match specs,
+// ordered tables, delete_all, GC of replaced values.
+
+type KvStore = std::sync::Mutex<Option<Vec<(u64, u64, u64)>>>; // (tab, key, tuple)
+static ETS_STORE: KvStore = std::sync::Mutex::new(None);
+
+fn kv_find(rows: &[(u64, u64, u64)], tab: u64, key: u64) -> Option<usize> {
+    rows.iter()
+        .position(|&(t, k, _)| t == tab && mana_rt_eq_exact(k, key) == 1)
+}
+
+/// ets:insert/2 with a tuple or list of tuples (keypos 1); insert_new when
+/// `new != 0`.
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_insert(ctx: *mut ProcCtx, tab: u64, obj: u64, new: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let known = known();
+    let mut objs = Vec::new();
+    if obj & TAG_MASK == TAG_CONS || obj == NIL {
+        let mut cur = obj;
+        while cur != NIL {
+            if cur & TAG_MASK != TAG_CONS {
+                return raise_badarg(ctx);
+            }
+            let p = (cur & !TAG_MASK) as *const u64;
+            unsafe {
+                objs.push(*p);
+                cur = *p.add(1);
+            }
+        }
+    } else {
+        objs.push(obj);
+    }
+    let mut guard = ETS_STORE.lock().unwrap();
+    let rows = guard.get_or_insert_with(Vec::new);
+    for o in objs {
+        let ok = o & TAG_MASK == TAG_BOXED
+            && o != 0
+            && unsafe { *(o as *const u64) } & 0xff == KIND_TUPLE
+            && unsafe { *(o as *const u64) } >> 8 >= 1;
+        if !ok {
+            return raise_badarg(ctx);
+        }
+        let key = unsafe { *(o as *const u64).add(1) };
+        match kv_find(rows, tab, key) {
+            Some(i) => {
+                if new != 0 {
+                    return known.false_a;
+                }
+                rows[i].2 = eternal_deep_copy(o);
+            }
+            None => {
+                let copy = eternal_deep_copy(o);
+                let ckey = unsafe { *(copy as *const u64).add(1) };
+                rows.push((tab, ckey, copy));
+            }
+        }
+    }
+    known.true_a
+}
+
+/// ets:lookup/2 → list of stored tuples (eternal — safe to share).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_lookup(ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let guard = ETS_STORE.lock().unwrap();
+    let found = guard
+        .as_ref()
+        .and_then(|rows| kv_find(rows, tab, key).map(|i| rows[i].2));
+    drop(guard);
+    match found {
+        Some(tuple) => {
+            let cell = alloc_nursery(ctx, 2);
+            unsafe {
+                *cell = tuple;
+                *cell.add(1) = NIL;
+            }
+            cell as u64 | TAG_CONS
+        }
+        None => NIL,
+    }
+}
+
+/// ets:delete/2 (by key).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_delete(_ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
+    let mut guard = ETS_STORE.lock().unwrap();
+    if let Some(rows) = guard.as_mut() {
+        if let Some(i) = kv_find(rows, tab, key) {
+            rows.remove(i);
+        }
+    }
+    known().true_a
+}
+
+/// application env — same store under a reserved table tag (0b111 is never
+/// a valid term word for a table name).
+const APP_ENV_TAB: u64 = 0b111;
+
+#[no_mangle]
+pub extern "C" fn mana_rt_app_set_env(ctx: *mut ProcCtx, app: u64, key: u64, val: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 3, app, key, val];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let kp = alloc_nursery(ctx, 3);
+    unsafe {
+        *kp = (2 << 8) | KIND_TUPLE;
+        *kp.add(1) = fr[2];
+        *kp.add(2) = fr[3];
+    }
+    fr[2] = kp as u64; // reuse slot: composite {App, Key} key
+    let op = alloc_nursery(ctx, 3);
+    unsafe {
+        *op = (2 << 8) | KIND_TUPLE;
+        *op.add(1) = fr[2];
+        *op.add(2) = fr[4];
+    }
+    ctx.roots_head = saved;
+    mana_rt_ets_insert(ctx, APP_ENV_TAB, op as u64, 0)
+}
+
+/// get_env: `miss` is returned on absence (codegen passes 'undefined' or
+/// the default); `wrap_ok != 0` wraps hits as {ok, V}.
+#[no_mangle]
+pub extern "C" fn mana_rt_app_get_env(
+    ctx: *mut ProcCtx,
+    app: u64,
+    key: u64,
+    miss: u64,
+    wrap_ok: u64,
+) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let guard = ETS_STORE.lock().unwrap();
+    let found = guard.as_ref().and_then(|rows| {
+        rows.iter()
+            .find(|&&(t, k, _)| {
+                t == APP_ENV_TAB && {
+                    let p = k as *const u64;
+                    unsafe {
+                        mana_rt_eq_exact(*p.add(1), app) == 1
+                            && mana_rt_eq_exact(*p.add(2), key) == 1
+                    }
+                }
+            })
+            .map(|&(_, _, tuple)| unsafe { *(tuple as *const u64).add(2) })
+    });
+    drop(guard);
+    match found {
+        Some(v) if wrap_ok != 0 => {
+            // v is eternal — no rooting needed around this alloc
+            let p = alloc_nursery(ctx, 3);
+            unsafe {
+                *p = (2 << 8) | KIND_TUPLE;
+                *p.add(1) = known().ok;
+                *p.add(2) = v;
+            }
+            p as u64
+        }
+        Some(v) => v,
+        None => miss,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// code (native cut: static binary — "loaded" means compiled in)
+
+fn module_is_compiled(m: u64) -> bool {
+    export_table().keys().any(|&(em, _, _)| em == m)
+}
+
+/// code:ensure_loaded/1 → {module, M} | {error, nofile}. Eternal tuples —
+/// tiny, bounded by call sites.
+#[no_mangle]
+pub extern "C" fn mana_rt_code_ensure_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if m & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let (tag, val) = if module_is_compiled(m) {
+        (known().module, m)
+    } else {
+        (atom_error(), known().nofile)
+    };
+    let p = alloc_space(3);
+    ctx.global.eternal.lock().push((p as usize, false));
+    unsafe {
+        *p = (2 << 8) | KIND_TUPLE;
+        *p.add(1) = tag;
+        *p.add(2) = val;
+    }
+    p as u64
+}
+
+/// erlang:function_exported/3 (module_loaded/1 shares the table).
+#[no_mangle]
+pub extern "C" fn mana_rt_function_exported(_ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -> u64 {
+    if a & TAG_MASK != TAG_SMALL {
+        return known().false_a;
+    }
+    let arity = (a as i64 >> 3) as u64;
+    if export_table().contains_key(&(m, f, arity)) {
+        known().true_a
+    } else {
+        known().false_a
+    }
 }
 
 /// erlang:binary_to_atom/1,2 — closed world: only atoms that exist in the

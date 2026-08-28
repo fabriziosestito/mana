@@ -21,6 +21,33 @@ impl Parser {
         &self.toks[self.pos.min(self.toks.len() - 1)].0
     }
 
+    /// Lookahead: is the upcoming `( ... )` a map PAIR wrapper — i.e. does
+    /// it contain a top-level `:=`/`=>` before it closes? (Distinguishes
+    /// `( k := v -| ann )` from an annotation-wrapped key `( k -| ann ) := v`.)
+    fn pair_wrap_ahead(&self) -> bool {
+        if *self.peek() != Tok::LParen {
+            return false;
+        }
+        let mut depth = 0usize;
+        for (t, _) in &self.toks[self.pos..] {
+            match t {
+                Tok::LParen | Tok::LBrace | Tok::LBracket | Tok::MapOpen | Tok::BinOpen => {
+                    depth += 1
+                }
+                Tok::RParen | Tok::RBrace | Tok::RBracket | Tok::MapClose | Tok::BinClose => {
+                    if depth <= 1 {
+                        return false; // wrapper closed without a pair assoc
+                    }
+                    depth -= 1;
+                }
+                Tok::Assoc | Tok::ExactAssoc if depth == 1 => return true,
+                Tok::Eof => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn line(&self) -> usize {
         self.toks[self.pos.min(self.toks.len() - 1)].1
     }
@@ -232,6 +259,11 @@ impl Parser {
                 let mut update = None;
                 if !self.eat(&Tok::MapClose) {
                     loop {
+                        // pairs may be annotation-wrapped: `( k := v -| [...] )`
+                        let wrapped = self.pair_wrap_ahead();
+                        if wrapped {
+                            self.expect(Tok::LParen)?;
+                        }
                         let key = self.parse_expr()?;
                         let assoc = if self.eat(&Tok::Assoc) {
                             MapAssoc::Assoc
@@ -240,6 +272,10 @@ impl Parser {
                             MapAssoc::Exact
                         };
                         let val = self.parse_expr()?;
+                        if wrapped {
+                            self.skip_annotation()?;
+                            self.expect(Tok::RParen)?;
+                        }
                         pairs.push((key, assoc, val));
                         if !self.eat(&Tok::Comma) {
                             break;
@@ -282,8 +318,11 @@ impl Parser {
                 let mut params = Vec::new();
                 if !self.eat(&Tok::RParen) {
                     loop {
-                        match self.bump() {
-                            Tok::Var(v) => params.push(v),
+                        // parameters may be annotation-wrapped:
+                        // `fun (( _0 -| ['compiler_generated'] )) -> ...`
+                        let wrapped = self.eat(&Tok::LParen);
+                        let v = match self.bump() {
+                            Tok::Var(v) => v,
                             other => {
                                 return Err(format!(
                                     "line {}: expected parameter, found {}",
@@ -291,7 +330,12 @@ impl Parser {
                                     other
                                 ))
                             }
+                        };
+                        if wrapped {
+                            self.skip_annotation()?;
+                            self.expect(Tok::RParen)?;
                         }
+                        params.push(v);
                         if !self.eat(&Tok::Comma) {
                             break;
                         }
@@ -350,6 +394,55 @@ impl Parser {
                         args,
                     }),
                 }
+            }
+            Tok::Catch => {
+                // old-style `catch E`: value on success; thrown value for
+                // throw; {'EXIT', Reason} for exit; {'EXIT', {Reason, []}}
+                // for error (stacktrace omitted — TODO(stacktraces)). erlc
+                // usually lowers catch to try itself; unicode.erl keeps it.
+                self.bump();
+                let arg = self.parse_expr()?;
+                let exit_a = || Expr::Lit(Literal::Atom("EXIT".into()));
+                let handler = Expr::Case {
+                    arg: Box::new(Expr::Var("_CatchClass".into())),
+                    clauses: vec![
+                        Clause {
+                            patterns: vec![Pattern::Lit(Literal::Atom("throw".into()))],
+                            guard: Expr::Lit(Literal::Atom("true".into())),
+                            body: Expr::Var("_CatchReason".into()),
+                        },
+                        Clause {
+                            patterns: vec![Pattern::Lit(Literal::Atom("exit".into()))],
+                            guard: Expr::Lit(Literal::Atom("true".into())),
+                            body: Expr::Tuple(vec![
+                                exit_a(),
+                                Expr::Var("_CatchReason".into()),
+                            ]),
+                        },
+                        Clause {
+                            patterns: vec![Pattern::Var("_CatchOther".into())],
+                            guard: Expr::Lit(Literal::Atom("true".into())),
+                            body: Expr::Tuple(vec![
+                                exit_a(),
+                                Expr::Tuple(vec![
+                                    Expr::Var("_CatchReason".into()),
+                                    Expr::Lit(Literal::Nil),
+                                ]),
+                            ]),
+                        },
+                    ],
+                };
+                Ok(Expr::Try {
+                    arg: Box::new(arg),
+                    vars: vec!["_CatchVal".into()],
+                    body: Box::new(Expr::Var("_CatchVal".into())),
+                    evars: vec![
+                        "_CatchClass".into(),
+                        "_CatchReason".into(),
+                        "_CatchStk".into(),
+                    ],
+                    handler: Box::new(handler),
+                })
             }
             Tok::Primop => {
                 self.bump();
@@ -613,22 +706,38 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> PResult<Pattern> {
-        match self.peek().clone() {
-            Tok::LParen => {
-                self.bump();
-                let p = self.parse_pattern()?;
-                self.skip_annotation()?;
-                self.expect(Tok::RParen)?;
-                Ok(p)
+        let first = self.parse_pattern_primary()?;
+        // aliases `P1 = P2` can follow any pattern (erlc parenthesizes and
+        // annotates either side); one side must be a variable
+        if self.eat(&Tok::Eq) {
+            let second = self.parse_pattern()?;
+            match (first, second) {
+                (Pattern::Var(v), p) | (p, Pattern::Var(v)) => {
+                    Ok(Pattern::Alias(v, Box::new(p)))
+                }
+                _ => Err(format!(
+                    "line {}: alias pattern without a variable side",
+                    self.line()
+                )),
             }
+        } else {
+            Ok(first)
+        }
+    }
+
+    fn parse_pattern_primary(&mut self) -> PResult<Pattern> {
+        match self.peek().clone() {
             Tok::Var(v) => {
                 self.bump();
-                if self.eat(&Tok::Eq) {
-                    let p = self.parse_pattern()?;
-                    Ok(Pattern::Alias(v, Box::new(p)))
-                } else {
-                    Ok(Pattern::Var(v))
-                }
+                Ok(Pattern::Var(v))
+            }
+            // `( pat -| ann )` — aliases inside handled by parse_pattern
+            Tok::LParen => {
+                self.bump();
+                let pat = self.parse_pattern()?;
+                self.skip_annotation()?;
+                self.expect(Tok::RParen)?;
+                Ok(pat)
             }
             Tok::Int(n) => {
                 self.bump();
@@ -694,11 +803,19 @@ impl Parser {
                 let mut pairs = Vec::new();
                 if !self.eat(&Tok::MapClose) {
                     loop {
+                        let wrapped = self.pair_wrap_ahead();
+                        if wrapped {
+                            self.expect(Tok::LParen)?;
+                        }
                         let key = self.parse_expr()?;
                         if !self.eat(&Tok::ExactAssoc) {
                             self.expect(Tok::Assoc)?;
                         }
                         let val = self.parse_pattern()?;
+                        if wrapped {
+                            self.skip_annotation()?;
+                            self.expect(Tok::RParen)?;
+                        }
                         pairs.push((key, val));
                         if !self.eat(&Tok::Comma) {
                             break;

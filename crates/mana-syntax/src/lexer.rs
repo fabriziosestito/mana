@@ -230,7 +230,8 @@ impl<'a> Lexer<'a> {
     fn lex_name(&mut self) -> String {
         let start = self.pos;
         while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b'@' {
+            // '?' and '!' appear in Elixir-generated variable names
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'@' || c == b'?' || c == b'!' {
                 self.bump();
             } else {
                 break;
@@ -270,9 +271,13 @@ impl<'a> Lexer<'a> {
         let text = String::from_utf8_lossy(&self.src[start..self.pos]);
         match text.parse::<i64>() {
             Ok(v) => Ok(Tok::Int(if negative { -v } else { v })),
-            // wide constant bitstring segments; only meaningful there
-            Err(_) if !negative => Ok(Tok::BigInt(text.into_owned())),
-            Err(e) => Err(format!("line {}: bad integer '{}': {}", self.line, text, e)),
+            // wide constants (bitstring segments, compiler tables); the
+            // sign survives in the digit string for downstream rejection
+            Err(_) => Ok(Tok::BigInt(if negative {
+                format!("-{}", text)
+            } else {
+                text.into_owned()
+            })),
         }
     }
 

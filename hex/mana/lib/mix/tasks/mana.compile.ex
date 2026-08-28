@@ -55,11 +55,139 @@ defmodule Mix.Tasks.Mana.Compile do
 
     manac = Mana.compiler_path(bin: opts[:bin])
     app = Path.join(out, "app")
-    args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ cores
+    # warm start: previously chased stdlib cores (unreached ones are free —
+    # manac only compiles what the entry needs)
+    cached = Path.wildcard(Path.join([out, "core-cache", "*.core"]))
+    compile_loop(manac, mod, fun, arity, app, cached ++ cores, out, MapSet.new(), 400)
+  end
 
-    case System.cmd(manac, args, stderr_to_stdout: true, into: IO.stream(:stdio, :line)) do
-      {_, 0} -> :ok
-      {_, status} -> Mix.raise("manac failed (exit #{status})")
+  # Reachability-driven stdlib compilation: run manac; when it reports a
+  # missing module that we can locate on the code path (Elixir stdlib, OTP
+  # stdlib/kernel, deps — anything loadable), dump its Core Erlang into the
+  # cache and retry. Only modules the entry actually reaches get pulled in.
+  defp compile_loop(manac, mod, fun, arity, app, cores, out, tried, fuel) do
+    args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ cores
+    {output, status} = System.cmd(manac, args, stderr_to_stdout: true)
+
+    if System.get_env("MANA_DEBUG_LOOP") do
+      chars = Enum.count(cores, &String.contains?(&1, "Chars.Integer"))
+      IO.puts("mana-loop: status=#{status} cores=#{length(cores)} chars_int=#{chars} fuel=#{fuel}")
+    end
+
+    cond do
+      status == 0 ->
+        # even a successful build may name dynamic-dispatch candidates
+        # (consolidated protocol impls) it could not see; pull the ones a
+        # beam exists for and rebuild
+        candidates =
+          Regex.scan(~r/dynamic module candidate '([^']+)'/, output)
+          |> Enum.map(fn [_, m] -> m end)
+          |> Enum.uniq()
+          |> Enum.reject(&MapSet.member?(tried, &1))
+
+        pulled =
+          for m <- candidates,
+              {:ok, core} <- [locate_and_dump(m, out)] do
+            Mix.shell().info("mana: pulling in #{m} (dynamic)")
+            core
+          end
+
+        if pulled == [] or fuel == 0 do
+          IO.write(output)
+          :ok
+        else
+          compile_loop(
+            manac,
+            mod,
+            fun,
+            arity,
+            app,
+            pulled ++ cores,
+            out,
+            Enum.reduce(candidates, tried, &MapSet.put(&2, &1)),
+            fuel - 1
+          )
+        end
+
+      fuel == 0 ->
+        IO.write(output)
+        Mix.raise("manac failed (exit #{status}); dependency chase gave up")
+
+      (missing = missing_modules(output)) != [] ->
+        if Enum.any?(missing, &MapSet.member?(tried, &1)) do
+          IO.write(output)
+          Mix.raise("manac failed (exit #{status}): module loop in #{inspect(missing)}")
+        end
+
+        pulled =
+          for m <- missing do
+            case locate_and_dump(m, out) do
+              {:ok, core} ->
+                Mix.shell().info("mana: pulling in #{m}")
+                core
+
+              :error ->
+                IO.write(output)
+                Mix.raise("manac failed (exit #{status}): cannot locate module '#{m}'")
+            end
+          end
+
+        compile_loop(
+          manac,
+          mod,
+          fun,
+          arity,
+          app,
+          pulled ++ cores,
+          out,
+          Enum.reduce(missing, tried, &MapSet.put(&2, &1)),
+          fuel - 1
+        )
+
+      true ->
+        IO.write(output)
+        Mix.raise("manac failed (exit #{status})")
+    end
+  end
+
+  defp missing_modules(output) do
+    Regex.scan(~r/module '([^']+)' \(required by [^)]+\) is not among the compiled/, output)
+    |> Enum.map(fn [_, m] -> m end)
+    |> Enum.uniq()
+  end
+
+  defp locate_and_dump(module, out) do
+    do_locate_and_dump(module, out)
+  catch
+    :build_tool -> :error
+  end
+
+  defp do_locate_and_dump(module, out) do
+    cache = Path.join(out, "core-cache")
+    File.mkdir_p!(cache)
+    core = Path.join(cache, module <> ".core")
+
+    case :code.which(String.to_atom(module)) do
+      beam_path when is_list(beam_path) ->
+        beam = List.to_string(beam_path)
+
+        # build-tool applications never belong in a runtime binary; their
+        # protocol impls (Collectable.Mix.Shell, ...) stay unimplemented
+        if beam =~ ~r{/(mix|ex_unit|iex|eex)(-[\d.]+)?/ebin/} do
+          throw(:build_tool)
+        end
+
+        fresh? =
+          case {File.stat(core, time: :posix), File.stat(beam, time: :posix)} do
+            {{:ok, %{mtime: c}}, {:ok, %{mtime: b}}} -> c >= b
+            _ -> false
+          end
+
+        unless fresh?, do: Mana.CoreDump.dump!(beam, core)
+        {:ok, core}
+
+      _ ->
+        :error
     end
   end
 

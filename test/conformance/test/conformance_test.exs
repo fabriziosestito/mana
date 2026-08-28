@@ -8,7 +8,8 @@ defmodule ConformanceTest do
 
   use ExUnit.Case, async: false
 
-  @moduletag timeout: 120_000
+  # stdlib programs chase and compile ~200 beams on a cold cache
+  @moduletag timeout: 900_000
 
   # Discover Conf.* modules at compile time; lib/ is compiled before tests.
   programs =

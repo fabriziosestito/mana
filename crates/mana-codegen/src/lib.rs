@@ -355,7 +355,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn rt_register_atoms(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_register_atoms", || {
             let params: Vec<BasicMetadataTypeEnum> =
-                (0..14).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
+                (0..17).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
             self.ctx.void_type().fn_type(&params, false)
         })
     }
@@ -754,7 +754,30 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             if !include.contains(fname) {
                 continue;
             }
-            self.compile_fn(fname, fun)?;
+            if self.emit_native_override(fname)? {
+                continue;
+            }
+            if let Err(e) = self.compile_fn(fname, fun) {
+                // Function-granular poisoning: stdlib modules contain
+                // corners we don't compile yet (sub-byte bitstrings, ...).
+                // The function becomes a stub that reports and exits if a
+                // program ever actually reaches it. Lifts it had already
+                // queued get stubbed too (they were declared).
+                eprintln!(
+                    "manac: warning: {}:{}/{} stubbed (unsupported: {})",
+                    self.module_name, fname.name, fname.arity, e
+                );
+                let msg =
+                    format!("{}:{}/{}: {}", self.module_name, fname.name, fname.arity, e);
+                let fv = self.fns.borrow()[fname];
+                self.emit_unsupported_stub(fv, &msg)?;
+                loop {
+                    let next = self.pending.borrow_mut().pop();
+                    let Some(l) = next else { break };
+                    let lf = self.lifted.borrow()[l.f_index];
+                    self.emit_unsupported_stub(lf, &msg)?;
+                }
+            }
             self.drain_lifts()?;
         }
 
@@ -762,6 +785,123 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Some(e) => self.emit_main(e),
             None => Ok(()),
         }
+    }
+
+    /// Wipe a half-compiled function and replace its body with a loud
+    /// runtime failure (print + exit). Aborting rather than raising keeps
+    /// the may-raise analysis consistent (callers may not check).
+    fn emit_unsupported_stub(&self, f: FunctionValue<'ctx>, msg: &str) -> CgResult<()> {
+        // Never delete half-built blocks: erasing a block that another
+        // block still branches to corrupts the module (LLVM erase does not
+        // fix up uses — this manifested as glibc heap corruption). Instead,
+        // terminate every unterminated block and prepend a fresh entry;
+        // the old body becomes unreachable garbage that O2 removes.
+        for bb in f.get_basic_blocks() {
+            if bb.get_terminator().is_none() {
+                self.builder.position_at_end(bb);
+                self.builder.build_unreachable().map_err(be)?;
+            }
+        }
+        let entry = match f.get_first_basic_block() {
+            Some(first) => self
+                .ctx
+                .prepend_basic_block(first, "stub.entry"),
+            None => self.ctx.append_basic_block(f, "entry"),
+        };
+        self.builder.position_at_end(entry);
+        let ptr = self.static_bytes(msg.as_bytes())?;
+        let callee = self.rt_fn("mana_rt_unsupported", || {
+            self.ctx.void_type().fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        });
+        self.builder
+            .build_call(
+                callee,
+                &[
+                    ptr.into(),
+                    self.i64t.const_int(msg.len() as u64, false).into(),
+                ],
+                "",
+            )
+            .map_err(be)?;
+        self.builder.build_unreachable().map_err(be)?;
+        Ok(())
+    }
+
+    /// Functions BEAM implements in C (nif_error stubs in lists.erl and
+    /// binary.erl) get native bodies; true if this definition was handled.
+    /// Plans: (helper, drop_trailing_args, extra_const_args); helper ""
+    /// means the identity function (compile_pattern).
+    fn emit_native_override(&self, fname: &FunName) -> CgResult<bool> {
+        const NIL_C: u64 = 0b011;
+        const SMALL0: u64 = 0b001;
+        const SMALL1: u64 = (1 << 3) | 0b001;
+        let plan: (&str, usize, &[u64]) =
+            match (self.module_name.as_str(), fname.name.as_str(), fname.arity) {
+                ("lists", "reverse", 2) => ("mana_rt_lists_reverse", 0, &[]),
+                ("lists", "member", 2) => ("mana_rt_lists_member", 0, &[]),
+                ("lists", "keyfind", 3) => ("mana_rt_lists_keyfind", 0, &[0]),
+                ("lists", "keymember", 3) => ("mana_rt_lists_keyfind", 0, &[1]),
+                ("lists", "keysearch", 3) => ("mana_rt_lists_keyfind", 0, &[2]),
+                ("binary", "split", 2) => ("mana_rt_binary_split", 0, &[NIL_C]),
+                ("binary", "split", 3) => ("mana_rt_binary_split", 0, &[]),
+                ("binary", "match", 2) => ("mana_rt_binary_match", 0, &[0]),
+                ("binary", "match", 3) => ("mana_rt_binary_match", 1, &[0]),
+                ("binary", "matches", 2) => ("mana_rt_binary_match", 0, &[1]),
+                ("binary", "matches", 3) => ("mana_rt_binary_match", 1, &[1]),
+                ("binary", "part", 3) => ("mana_rt_binary_part", 0, &[]),
+                ("binary", "copy", 1) => ("mana_rt_binary_copy", 0, &[SMALL1]),
+                ("binary", "copy", 2) => ("mana_rt_binary_copy", 0, &[]),
+                ("binary", "at", 2) => ("mana_rt_binary_at", 0, &[0]),
+                ("binary", "first", 1) => ("mana_rt_binary_at", 0, &[SMALL0, 0]),
+                ("binary", "last", 1) => ("mana_rt_binary_at", 0, &[SMALL0, 1]),
+                ("binary", "encode_unsigned", 1) => ("mana_rt_binary_encode_unsigned", 0, &[0]),
+                ("binary", "decode_unsigned", 1) => ("mana_rt_binary_decode_unsigned", 0, &[0]),
+                ("binary", "longest_common_prefix", 1) => ("mana_rt_binary_lcp", 0, &[0]),
+                ("binary", "longest_common_suffix", 1) => ("mana_rt_binary_lcp", 0, &[1]),
+                ("binary", "list_to_bin", 1) => ("mana_rt_list_to_binary", 0, &[]),
+                ("binary", "referenced_byte_size", 1) => ("mana_rt_byte_size", 0, &[]),
+                ("binary", "compile_pattern", 1) => ("", 0, &[]),
+                _ => return Ok(false),
+            };
+        let f = self.fns.borrow()[fname];
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        self.cur_ctx
+            .set(Some(f.get_nth_param(0).unwrap().into_pointer_value()));
+        self.handlers.borrow_mut().clear();
+        self.propagate_bb.set(None);
+        self.cur_frame.set(None); // frameless: single forwarding call
+        if plan.0.is_empty() {
+            // identity (compile_pattern: patterns are plain binaries here)
+            let v = f.get_nth_param(1).unwrap().into_int_value();
+            self.builder.build_return(Some(&v)).map_err(be)?;
+            return Ok(true);
+        }
+        let mut cargs: Vec<BasicMetadataValueEnum> = vec![self.ctx_val().into()];
+        for i in 0..fname.arity - plan.1 {
+            cargs.push(f.get_nth_param(1 + i as u32).unwrap().into_int_value().into());
+        }
+        for &c in plan.2 {
+            cargs.push(self.i64t.const_int(c, false).into());
+        }
+        let nparams = cargs.len() - 1;
+        let callee = self.rt_fn(plan.0, || {
+            let mut ps: Vec<BasicMetadataTypeEnum> =
+                vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
+            ps.extend((0..nparams).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
+            self.i64t.fn_type(&ps, false)
+        });
+        let call = self.builder.build_call(callee, &cargs, "natbif").map_err(be)?;
+        // raising convention: the sentinel propagates through our return
+        let v = call_result(call)?;
+        self.builder.build_return(Some(&v)).map_err(be)?;
+        Ok(true)
     }
 
     fn compile_fn(&self, fname: &FunName, fun: &Fun) -> CgResult<()> {
@@ -829,6 +969,21 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let next = self.pending.borrow_mut().pop();
             let Some(l) = next else { break };
             let f = self.lifted.borrow()[l.f_index];
+            if let Err(e) = self.compile_lift(f, &l) {
+                // function-granular poisoning, same as named functions
+                eprintln!(
+                    "manac: warning: {} lifted fun stubbed (unsupported: {})",
+                    self.module_name, e
+                );
+                let msg = format!("{}: anonymous fun: {}", self.module_name, e);
+                self.emit_unsupported_stub(f, &msg)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_lift(&self, f: FunctionValue<'ctx>, l: &Lift) -> CgResult<()> {
+        {
             let entry = self.ctx.append_basic_block(f, "entry");
             self.builder.position_at_end(entry);
             self.cur_ctx
@@ -903,7 +1058,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // atom terms (atoms are compiler statics)
         let names = [
             "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
-            "badarg", "error", "badmap", "badkey", "undef",
+            "badarg", "error", "badmap", "badkey", "undef", "ok", "module", "nofile",
         ];
         let mut atom_args: Vec<BasicMetadataValueEnum> = Vec::new();
         for n in names {
@@ -1001,7 +1156,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.builder.build_return(Some(&v)).map_err(be)?;
                 Ok(())
             }
-            Expr::Call { module, name, args } if module != "erlang" => {
+            Expr::Call { module, name, args } if !is_bif_module(module) => {
                 let callee = self.remote_fn(module, name, args.len());
                 let argv = self.eval_args(f, args, scope)?;
                 self.pop_frame()?;
@@ -1251,6 +1406,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            // stacktraces are not built — TODO(stacktraces); the raw
+            // stacktrace argument was evaluated as part of the try lowering
+            Expr::PrimOp { name, .. } if name == "build_stacktrace" => Ok(self.nil()),
             Expr::PrimOp { name, .. } => Err(format!("unsupported primop {}", name)),
             Expr::Case { arg, clauses } => {
                 let vals = self.compile_case_arg(f, arg, clauses, scope)?;
@@ -1701,6 +1859,51 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .add_function(&sym, self.term_fn_type(fname.arity + 1), None);
         shim.set_linkage(Linkage::LinkOnceODR);
 
+        // BIF-module targets have no symbol to forward to: give the shim a
+        // real (mini-compiled) body that invokes the BIF
+        if module.is_some() && is_bif_module(target_mod) {
+            let params: Vec<String> = (0..fname.arity).map(|i| format!("_bifshim{}", i)).collect();
+            let body = Expr::Call {
+                module: target_mod.to_string(),
+                name: fname.name.clone(),
+                args: params.iter().map(|p| Expr::Var(p.clone())).collect(),
+            };
+            let saved_bb = self.builder.get_insert_block();
+            let saved_ctx = self.cur_ctx.get();
+            let saved_handlers = std::mem::take(&mut *self.handlers.borrow_mut());
+            let saved_prop = self.propagate_bb.get();
+            let saved_frame = self.cur_frame.get();
+            let saved_slots = self.var_slots.borrow().clone();
+            let saved_next = self.next_slot.get();
+            let saved_cap = self.slot_cap.get();
+
+            let entry = self.ctx.append_basic_block(shim, "entry");
+            self.builder.position_at_end(entry);
+            self.cur_ctx
+                .set(Some(shim.get_nth_param(0).unwrap().into_pointer_value()));
+            self.propagate_bb.set(None);
+            self.setup_frame(&body, &params, &[])?;
+            let mut scope = Scope::default();
+            for (i, p) in params.iter().enumerate() {
+                let v = shim.get_nth_param(1 + i as u32).unwrap().into_int_value();
+                self.bind_var(&mut scope, p, v)?;
+            }
+            let r = self.compile_tail(shim, &body, &mut scope);
+
+            *self.handlers.borrow_mut() = saved_handlers;
+            self.propagate_bb.set(saved_prop);
+            self.cur_ctx.set(saved_ctx);
+            self.cur_frame.set(saved_frame);
+            *self.var_slots.borrow_mut() = saved_slots;
+            self.next_slot.set(saved_next);
+            self.slot_cap.set(saved_cap);
+            if let Some(bb) = saved_bb {
+                self.builder.position_at_end(bb);
+            }
+            r?;
+            return Ok(shim);
+        }
+
         let target = if module.is_none() || module == Some(self.module_name.as_str()) {
             self.local_fn(fname)?
         } else {
@@ -2065,6 +2268,23 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Pattern::Lit(Literal::Float(_)) => Err("float patterns not supported yet".into()),
             Pattern::Binary(segs) => self.match_binary(f, val, segs, scope, fail),
             Pattern::Map(pairs) => {
+                // a map pattern — even the empty `~{}~`, which requires no
+                // keys — only ever matches maps
+                let is_map = self.kind_test(f, val, |s, header| {
+                    let k = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xff, false), "k")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(KIND_MAP, false),
+                            "k.m",
+                        )
+                        .map_err(be)
+                })?;
+                self.branch_test(f, is_map, fail)?;
                 let slot = self.pattern_subject_slot(pat, val)?;
                 for (k, sub) in pairs {
                     let subject = match slot {
@@ -2197,9 +2417,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(Some(self.spill(val)?))
     }
 
-    /// Match a bitstring pattern: per-segment extraction with a running
-    /// (constant) byte offset. Binary-type segments allocate sub-binaries;
-    /// the subject is kept in a frame slot across those (see match_pattern).
+    /// Match a bitstring pattern. The byte offset is a runtime value once
+    /// any segment has a dynamic size (or is utf8). Binary-type segments
+    /// allocate sub-binaries; the subject is kept in a frame slot across
+    /// those (see match_pattern). Constant-size integer literals compare
+    /// against static byte arrays.
     fn match_binary(
         &self,
         f: FunctionValue<'ctx>,
@@ -2212,9 +2434,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .iter()
             .map(|s| parse_seg_spec(&s.spec))
             .collect::<Result<Vec<_>, _>>()?;
-        if specs.iter().any(|s| matches!(s.kind, SegKind::Utf8)) {
-            return Err("TODO(utf8): utf8 segments in patterns".into());
-        }
         let slot = if specs.iter().any(|s| s.kind.allocates()) {
             if !self.framed() {
                 return Err("internal: allocating binary pattern in frameless function".into());
@@ -2223,17 +2442,20 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         } else {
             None
         };
-        // fast preflight: is-binary + length (exact when there is no rest)
+        let all_const = !specs.iter().any(|s| s.kind.dynamic());
+        let rest = specs
+            .iter()
+            .any(|s| matches!(s.kind, SegKind::Bin { size: SegSize::All }));
         let const_total: u64 = specs
             .iter()
             .map(|s| match s.kind {
-                SegKind::Int { nbytes } | SegKind::BinFixed { nbytes } => nbytes,
+                SegKind::Int { size: SegSize::Bytes(n) }
+                | SegKind::Bin { size: SegSize::Bytes(n) } => n,
                 _ => 0,
             })
             .sum();
-        let rest = specs
-            .iter()
-            .any(|s| matches!(s.kind, SegKind::BinAll));
+        // preflight: is-binary + (for all-const patterns) the length check;
+        // dynamic patterns re-check bounds per segment
         let call = self
             .builder
             .build_call(
@@ -2250,7 +2472,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 &[
                     val.into(),
                     self.i64t.const_int(const_total, false).into(),
-                    self.i64t.const_int(rest as u64, false).into(),
+                    self.i64t
+                        .const_int((rest || !all_const) as u64, false)
+                        .into(),
                 ],
                 "blen",
             )
@@ -2261,68 +2485,73 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_int_compare(IntPredicate::NE, ok, self.i64t.const_zero(), "blen.ok")
             .map_err(be)?;
         self.branch_test(f, ok, fail)?;
-        let mut off: u64 = 0;
+
+        let mut off: IntValue<'ctx> = self.i64t.const_zero();
         for (spec, seg) in specs.iter().zip(segs) {
             let subject = match slot {
                 Some(s) => self.reload(s)?,
                 None => val,
             };
-            // constant integer sub-patterns (incl. erlc's wide folded string
-            // literals) compare against a static byte array in one call
-            if let SegKind::Int { nbytes } = spec.kind {
-                let lit_bytes = match seg.value.as_ref() {
-                    Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_))) => {
-                        seg_const_bytes(&Expr::Lit(l.clone()), nbytes, spec.little)?
-                    }
-                    _ => None,
-                };
-                if let Some(bytes) = lit_bytes {
-                    let ptr = self.static_bytes(&bytes)?;
-                    let call = self
-                        .builder
-                        .build_call(
-                            self.rt_fn("mana_rt_bin_match_bytes", || {
-                                self.i64t.fn_type(
+            match &spec.kind {
+                SegKind::Int { size } => {
+                    let nbytes = self.seg_bytes(f, size, scope, Some(fail))?;
+                    // constant integer sub-patterns with constant sizes
+                    // compare as bytes (covers erlc's wide folded literals)
+                    if let (SegSize::Bytes(n), Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_)))) =
+                        (size, seg.value.as_ref())
+                    {
+                        if let Some(bytes) =
+                            seg_const_bytes(&Expr::Lit(l.clone()), *n, spec.little)?
+                        {
+                            let ptr = self.static_bytes(&bytes)?;
+                            let call = self
+                                .builder
+                                .build_call(
+                                    self.rt_fn("mana_rt_bin_match_bytes", || {
+                                        self.i64t.fn_type(
+                                            &[
+                                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                                BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                            ],
+                                            false,
+                                        )
+                                    }),
                                     &[
-                                        BasicMetadataTypeEnum::IntType(self.i64t),
-                                        BasicMetadataTypeEnum::IntType(self.i64t),
-                                        BasicMetadataTypeEnum::PointerType(self.ptrt),
-                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        subject.into(),
+                                        off.into(),
+                                        ptr.into(),
+                                        self.i64t.const_int(bytes.len() as u64, false).into(),
                                     ],
-                                    false,
+                                    "bmb",
                                 )
-                            }),
-                            &[
-                                subject.into(),
-                                self.i64t.const_int(off, false).into(),
-                                ptr.into(),
-                                self.i64t.const_int(bytes.len() as u64, false).into(),
-                            ],
-                            "bmb",
-                        )
-                        .map_err(be)?;
-                    let ok = call_result(call)?.into_int_value();
-                    let ok = self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::NE,
-                            ok,
-                            self.i64t.const_zero(),
-                            "bmb.ok",
-                        )
-                        .map_err(be)?;
-                    self.branch_test(f, ok, fail)?;
-                    off += nbytes;
-                    continue;
-                }
-                if nbytes > 8 {
-                    return Err(
-                        "TODO(bignum): binding integer segments over 64 bits".into()
-                    );
-                }
-            }
-            match spec.kind {
-                SegKind::Int { nbytes } => {
+                                .map_err(be)?;
+                            let ok = call_result(call)?.into_int_value();
+                            let ok = self
+                                .builder
+                                .build_int_compare(
+                                    IntPredicate::NE,
+                                    ok,
+                                    self.i64t.const_zero(),
+                                    "bmb.ok",
+                                )
+                                .map_err(be)?;
+                            self.branch_test(f, ok, fail)?;
+                            off = self
+                                .builder
+                                .build_int_add(
+                                    off,
+                                    self.i64t.const_int(bytes.len() as u64, false),
+                                    "boff",
+                                )
+                                .map_err(be)?;
+                            continue;
+                        }
+                    }
+                    if matches!(size, SegSize::Bytes(n) if *n > 8) {
+                        return Err("TODO(bignum): binding integer segments over 64 bits".into());
+                    }
                     let flags = (spec.little as u64) | ((spec.signed as u64) << 1);
                     let call = self
                         .builder
@@ -2340,22 +2569,28 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             }),
                             &[
                                 subject.into(),
-                                self.i64t.const_int(off, false).into(),
-                                self.i64t.const_int(nbytes, false).into(),
+                                off.into(),
+                                nbytes.into(),
                                 self.i64t.const_int(flags, false).into(),
                             ],
                             "bri",
                         )
                         .map_err(be)?;
                     let v = call_result(call)?.into_int_value();
-                    // bounds were prechecked; no sentinel test needed
+                    if !all_const {
+                        let ok = self
+                            .builder
+                            .build_int_compare(IntPredicate::NE, v, self.sentinel(), "bri.ok")
+                            .map_err(be)?;
+                        self.branch_test(f, ok, fail)?;
+                    }
                     self.match_pattern(f, v, &seg.value, scope, fail)?;
-                    off += nbytes;
+                    off = self.builder.build_int_add(off, nbytes, "boff").map_err(be)?;
                 }
-                SegKind::BinAll | SegKind::BinFixed { .. } => {
-                    let (len, adv): (i64, u64) = match spec.kind {
-                        SegKind::BinFixed { nbytes } => (nbytes as i64, nbytes),
-                        _ => (-1, 0),
+                SegKind::Bin { size } => {
+                    let len: IntValue<'ctx> = match size {
+                        SegSize::All => self.i64t.const_int(u64::MAX, false), // -1
+                        _ => self.seg_bytes(f, size, scope, Some(fail))?,
                     };
                     let call = self
                         .builder
@@ -2374,21 +2609,158 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             &[
                                 self.ctx_val().into(),
                                 subject.into(),
-                                self.i64t.const_int(off, false).into(),
-                                self.i64t.const_int(len as u64, false).into(),
+                                off.into(),
+                                len.into(),
                             ],
                             "brs",
                         )
                         .map_err(be)?;
                     let v = call_result(call)?.into_int_value();
+                    let ok = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, v, self.sentinel(), "brs.ok")
+                        .map_err(be)?;
+                    self.branch_test(f, ok, fail)?;
                     self.match_pattern(f, v, &seg.value, scope, fail)?;
-                    off += adv;
+                    if !matches!(size, SegSize::All) {
+                        off = self.builder.build_int_add(off, len, "boff").map_err(be)?;
+                    }
                 }
-                SegKind::Utf8 => unreachable!(),
+                SegKind::Utf8 => {
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_tt_i64("mana_rt_bin_read_utf8"),
+                            &[subject.into(), off.into()],
+                            "bru",
+                        )
+                        .map_err(be)?;
+                    let raw = call_result(call)?.into_int_value();
+                    let ok = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::SGE,
+                            raw,
+                            self.i64t.const_zero(),
+                            "bru.ok",
+                        )
+                        .map_err(be)?;
+                    self.branch_test(f, ok, fail)?;
+                    let cp = self
+                        .builder
+                        .build_and(raw, self.i64t.const_int(0xffff_ffff, false), "bru.cp")
+                        .map_err(be)?;
+                    let cpt = self.retag_int(cp)?;
+                    self.match_pattern(f, cpt, &seg.value, scope, fail)?;
+                    let width = self
+                        .builder
+                        .build_right_shift(raw, self.i64t.const_int(32, false), false, "bru.w")
+                        .map_err(be)?;
+                    off = self.builder.build_int_add(off, width, "boff").map_err(be)?;
+                }
             }
+        }
+        // no rest segment: the pattern must consume the binary exactly
+        if !rest && !all_const {
+            let subject = match slot {
+                Some(s) => self.reload(s)?,
+                None => val,
+            };
+            let call = self
+                .builder
+                .build_call(
+                    self.rt_fn("mana_rt_bin_len_check", || {
+                        self.i64t.fn_type(
+                            &[
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                            ],
+                            false,
+                        )
+                    }),
+                    &[subject.into(), off.into(), self.i64t.const_zero().into()],
+                    "blen.end",
+                )
+                .map_err(be)?;
+            let ok = call_result(call)?.into_int_value();
+            let ok = self
+                .builder
+                .build_int_compare(IntPredicate::NE, ok, self.i64t.const_zero(), "blen.end.ok")
+                .map_err(be)?;
+            self.branch_test(f, ok, fail)?;
         }
         Ok(())
     }
+
+    /// The byte count of a segment as a runtime value. Dynamic sizes verify
+    /// smallness/alignment: in patterns (`fail` set) a bad size is a match
+    /// failure; in construction it raises badarg.
+    fn seg_bytes(
+        &self,
+        f: FunctionValue<'ctx>,
+        size: &SegSize,
+        scope: &mut Scope<'ctx>,
+        fail: Option<BasicBlock<'ctx>>,
+    ) -> CgResult<IntValue<'ctx>> {
+        match size {
+            SegSize::Bytes(n) => Ok(self.i64t.const_int(*n, false)),
+            SegSize::All => Err("internal: seg_bytes on rest segment".into()),
+            SegSize::Dyn { size, unit } => {
+                let v = self.compile_value(f, size, scope)?;
+                // small int?
+                let tag = self.tag_of(v)?;
+                let is_int = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        self.i64t.const_int(TAG_SMALL, false),
+                        "sz.int",
+                    )
+                    .map_err(be)?;
+                match fail {
+                    Some(fail) => self.branch_test(f, is_int, fail)?,
+                    None => self.guard_badarg(f, is_int)?,
+                }
+                let raw = self
+                    .builder
+                    .build_right_shift(v, self.i64t.const_int(3, false), true, "sz.raw")
+                    .map_err(be)?;
+                let bits = self
+                    .builder
+                    .build_int_mul(raw, self.i64t.const_int(*unit as u64, false), "sz.bits")
+                    .map_err(be)?;
+                // bits >= 0 and byte-aligned
+                let low = self
+                    .builder
+                    .build_and(bits, self.i64t.const_int(7, false), "sz.low")
+                    .map_err(be)?;
+                let aligned = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, low, self.i64t.const_zero(), "sz.al")
+                    .map_err(be)?;
+                let nonneg = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGE,
+                        bits,
+                        self.i64t.const_zero(),
+                        "sz.nn",
+                    )
+                    .map_err(be)?;
+                let ok = self.builder.build_and(aligned, nonneg, "sz.ok").map_err(be)?;
+                match fail {
+                    Some(fail) => self.branch_test(f, ok, fail)?,
+                    None => self.guard_badarg(f, ok)?,
+                }
+                self.builder
+                    .build_right_shift(bits, self.i64t.const_int(3, false), false, "sz.bytes")
+                    .map_err(be)
+            }
+        }
+    }
+
 
     fn branch_test(
         &self,
@@ -2417,6 +2789,62 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if module == "maps" {
             return self.compile_maps_bif(f, name, args, scope);
         }
+        if module == "io" {
+            return self.compile_io_bif(f, name, args, scope);
+        }
+        if module == "unicode" {
+            return self.compile_unicode_bif(f, name, args, scope);
+        }
+        if module == "persistent_term" {
+            return self.compile_pt_bif(f, name, args, scope);
+        }
+        if module == "code" {
+            return self.compile_code_bif(f, name, args, scope);
+        }
+        if module == "io_lib" {
+            return self.compile_io_lib_bif(f, name, args, scope);
+        }
+        if module == "ets" {
+            return self.compile_ets_bif(f, name, args, scope);
+        }
+        if module == "application" {
+            return self.compile_application_bif(f, name, args, scope);
+        }
+        if matches!(
+            module,
+            "erts_internal" | "elixir_erl" | "erl_eval" | "beam_lib"
+        ) {
+            // BEAM/compiler guts: nothing is implemented; the caller gets
+            // stubbed (function-granular poisoning), failing loudly only if
+            // a program actually reaches it
+            return Err(format!("unsupported BIF {}:{}/{}", module, name, args.len()));
+        }
+        if module == "file" {
+            // file system access is not wired up yet: every call answers
+            // {error, enotsup} — TODO(file). Args still evaluated.
+            self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+            let p = self.alloc_words(3)?;
+            let header = self.i64t.const_int((2 << 8) | KIND_TUPLE, false);
+            self.store_word(p, 0, header)?;
+            let e = self.atom_term("error")?;
+            self.store_word(p, 1, e)?;
+            let reason = self.atom_term("enotsup")?;
+            self.store_word(p, 2, reason)?;
+            return self
+                .builder
+                .build_ptr_to_int(p, self.i64t, "fileerr")
+                .map_err(be);
+        }
+        if module == "logger" {
+            // logging is disabled in mana binaries: allow/2 says no (which
+            // prunes every emit path), everything else is an ok no-op —
+            // TODO(logger): a real stderr handler. Args still evaluated.
+            self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+            return match name {
+                "allow" => self.atom_term("false"),
+                _ => self.atom_term("ok"),
+            };
+        }
         // raising BIFs: reason terms use the eternal allocator so raise
         // paths don't create GC points
         if matches!(
@@ -2426,10 +2854,33 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.compile_raise(f, name, args, scope)?;
             return Ok(self.i64t.get_undef());
         }
+        if name == "error" && args.len() == 3 {
+            // error/3: the error_info options only affect stacktrace
+            // decoration — TODO(stacktraces)
+            self.compile_raise(f, "error", &args[..1], scope)?;
+            return Ok(self.i64t.get_undef());
+        }
+        if name == "nif_error" {
+            // a nif stub without a native override: raise like error/1
+            self.compile_raise(f, "error", &args[..1], scope)?;
+            return Ok(self.i64t.get_undef());
+        }
 
         let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
 
         match (name, argv.len()) {
+            ("raise", 3) => {
+                // re-raise with a dynamic class; the stacktrace argument is
+                // dropped — TODO(stacktraces)
+                let ctx = self.ctx_val();
+                self.mem_store(ctx, CTX_EXC_CLASS, argv[0], MemKind::Ctx)?;
+                self.mem_store(ctx, CTX_EXC_REASON, argv[1], MemKind::Ctx)?;
+                let target = self.unwind_target(f)?;
+                self.builder.build_unconditional_branch(target).map_err(be)?;
+                let dead = self.ctx.append_basic_block(f, "raise3.dead");
+                self.builder.position_at_end(dead);
+                Ok(self.i64t.get_undef())
+            }
             ("+", 2) | ("-", 2) | ("*", 2) | ("div", 2) | ("rem", 2) => {
                 let a = self.untag_int(argv[0])?;
                 let b = self.untag_int(argv[1])?;
@@ -2900,6 +3351,33 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("function_exported", 3) => {
+                let callee = self.rt_fn("mana_rt_function_exported", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "fexp",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
             ("is_port", 1) => self.atom_term("false"),
             ("is_binary", 1) | ("is_bitstring", 1) => {
                 // byte-aligned only: binary <=> bitstring
@@ -2980,10 +3458,71 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("binary_to_integer", 1)
+            | ("binary_to_integer", 2)
+            | ("list_to_integer", 1)
+            | ("list_to_integer", 2) => {
+                let helper = if name == "binary_to_integer" {
+                    "mana_rt_binary_to_integer"
+                } else {
+                    "mana_rt_list_to_integer"
+                };
+                let base = if argv.len() == 2 {
+                    argv[1]
+                } else {
+                    self.i64t.const_int((10 << 3) | 1, false)
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64(helper),
+                        &[self.ctx_val().into(), argv[0].into(), base.into()],
+                        "x2i",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("integer_to_binary", 1)
+            | ("integer_to_binary", 2)
+            | ("integer_to_list", 1)
+            | ("integer_to_list", 2) => {
+                let helper = if name == "integer_to_binary" {
+                    "mana_rt_integer_to_binary"
+                } else {
+                    "mana_rt_integer_to_list"
+                };
+                let base = if argv.len() == 2 {
+                    argv[1]
+                } else {
+                    self.i64t.const_int((10 << 3) | 1, false)
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64(helper),
+                        &[self.ctx_val().into(), argv[0].into(), base.into()],
+                        "i2x",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("split_binary", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_split_binary"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "splb",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("binary_to_list", 1)
             | ("list_to_binary", 1)
             | ("iolist_to_binary", 1)
-            | ("integer_to_binary", 1)
             | ("atom_to_binary", 1)
             | ("atom_to_binary", 2)
             | ("binary_to_atom", 1)
@@ -2996,7 +3535,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     "binary_to_list" => "mana_rt_binary_to_list",
                     "list_to_binary" => "mana_rt_list_to_binary",
                     "iolist_to_binary" => "mana_rt_iolist_to_binary",
-                    "integer_to_binary" => "mana_rt_integer_to_binary",
                     "atom_to_binary" => "mana_rt_atom_to_binary",
                     _ => "mana_rt_binary_to_atom",
                 };
@@ -3358,9 +3896,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(g.as_pointer_value())
     }
 
-    /// Bitstring construction: evaluate all segment values (rooted), compute
-    /// the total byte size (consts + byte_size of spliced binaries), allocate
-    /// once, then fill with non-allocating writers.
+    /// Bitstring construction: evaluate all segment values and dynamic
+    /// sizes (rooted), compute the total byte size, allocate once, then
+    /// fill with non-allocating writers. Constant segments (integer
+    /// literals incl. erlc's wide folded strings, constant utf8) become
+    /// static byte arrays written with one memcpy.
     fn compile_binary_construct(
         &self,
         f: FunctionValue<'ctx>,
@@ -3371,12 +3911,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .iter()
             .map(|s| parse_seg_spec(&s.spec))
             .collect::<Result<Vec<_>, _>>()?;
-        // segments whose bytes are known at compile time (integer literals —
-        // including erlc's wide folded string constants — and utf8 code
-        // points) become static byte arrays written with one memcpy
+        // compile-time-known segment bytes
         let mut const_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(specs.len());
         for (spec, seg) in specs.iter().zip(segs) {
-            const_bytes.push(match spec.kind {
+            const_bytes.push(match &spec.kind {
                 SegKind::Utf8 => match seg.value.as_ref() {
                     Expr::Lit(Literal::Int(cp)) => {
                         let c = char::from_u32(*cp as u32)
@@ -3384,88 +3922,120 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         let mut buf = [0u8; 4];
                         Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
                     }
-                    _ => return Err("TODO(utf8): dynamic utf8 bitstring segments".into()),
+                    _ => None,
                 },
-                SegKind::Int { nbytes } => {
-                    let cb = seg_const_bytes(seg.value.as_ref(), nbytes, spec.little)?;
-                    if cb.is_none() && nbytes > 8 {
-                        return Err(
-                            "TODO(bignum): dynamic integer segments over 64 bits".into()
-                        );
-                    }
-                    cb
+                SegKind::Int { size: SegSize::Bytes(n) } => {
+                    seg_const_bytes(seg.value.as_ref(), *n, spec.little)?
                 }
-                SegKind::BinFixed { .. } => {
-                    return Err(
-                        "TODO(bitstring): fixed-size binary segments in construction".into(),
-                    )
+                SegKind::Int { size: SegSize::Dyn { .. } } => None,
+                SegKind::Int { size: SegSize::All } => {
+                    return Err("bitstring: integer segment with size 'all'".into())
                 }
-                SegKind::BinAll => None,
+                SegKind::Bin { .. } => None,
             });
         }
-        // constant segments are not evaluated (their exprs may be Big
-        // literals, which have no term representation)
+        // evaluate values (skipping const segments) and dynamic sizes, all
+        // rooted — sizes are small ints but their exprs may allocate
         let nil_expr = Expr::Lit(Literal::Nil);
-        let values: Vec<&Expr> = segs
-            .iter()
-            .zip(&const_bytes)
-            .map(|(s, cb)| if cb.is_some() { &nil_expr } else { s.value.as_ref() })
-            .collect();
-        let rooted = self.eval_all_rooted(f, &values, scope)?;
-        // total size: const part + dynamic byte_size() per spliced binary
+        let mut children: Vec<&Expr> = Vec::new();
+        for ((spec, seg), cb) in specs.iter().zip(segs).zip(&const_bytes) {
+            children.push(if cb.is_some() { &nil_expr } else { seg.value.as_ref() });
+            match &spec.kind {
+                SegKind::Int { size: SegSize::Dyn { size, .. } }
+                | SegKind::Bin { size: SegSize::Dyn { size, .. } } if cb.is_none() => {
+                    children.push(size)
+                }
+                _ => children.push(&nil_expr),
+            }
+        }
+        let rooted = self.eval_all_rooted(f, &children, scope)?;
+        let value_of = |i: usize| &rooted[2 * i];
+        // total byte size
         let mut const_total: u64 = 0;
         for (i, spec) in specs.iter().enumerate() {
             match (&const_bytes[i], &spec.kind) {
                 (Some(bytes), _) => const_total += bytes.len() as u64,
-                (None, SegKind::Int { nbytes }) => const_total += nbytes,
+                (None, SegKind::Int { size: SegSize::Bytes(n) }) => const_total += n,
                 _ => {}
             }
         }
         let mut total = self.i64t.const_int(const_total, false);
-        let mut splice_sizes: Vec<Option<IntValue<'ctx>>> = vec![None; specs.len()];
+        let mut dyn_sizes: Vec<Option<IntValue<'ctx>>> = vec![None; specs.len()];
         for (i, spec) in specs.iter().enumerate() {
-            if matches!(spec.kind, SegKind::BinAll) {
-                let v = self.rooted_get(&rooted[i])?;
-                let call = self
-                    .builder
-                    .build_call(
-                        self.rt_pt_i64("mana_rt_byte_size"),
-                        &[self.ctx_val().into(), v.into()],
-                        "bsz",
+            if const_bytes[i].is_some() {
+                continue;
+            }
+            let add = match &spec.kind {
+                SegKind::Bin { size: SegSize::All } => {
+                    let v = self.rooted_get(value_of(i))?;
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_pt_i64("mana_rt_byte_size"),
+                            &[self.ctx_val().into(), v.into()],
+                            "bsz",
+                        )
+                        .map_err(be)?;
+                    let szt = call_result(call)?.into_int_value();
+                    let szt = self.check_exc(f, szt)?;
+                    Some(
+                        self.builder
+                            .build_right_shift(szt, self.i64t.const_int(3, false), true, "bsz.raw")
+                            .map_err(be)?,
                     )
-                    .map_err(be)?;
-                let szt = call_result(call)?.into_int_value();
-                let szt = self.check_exc(f, szt)?;
-                let raw = self
-                    .builder
-                    .build_right_shift(szt, self.i64t.const_int(3, false), true, "bsz.raw")
-                    .map_err(be)?;
-                splice_sizes[i] = Some(raw);
-                total = self.builder.build_int_add(total, raw, "btot").map_err(be)?;
+                }
+                SegKind::Bin { size: sz @ SegSize::Dyn { .. } }
+                | SegKind::Int { size: sz @ SegSize::Dyn { .. } } => {
+                    // the size expr was pre-evaluated; re-wrap as a literal
+                    // read from its slot
+                    let szv = self.rooted_get(&rooted[2 * i + 1])?;
+                    Some(self.seg_bytes_from_value(f, szv, sz)?)
+                }
+                SegKind::Utf8 => {
+                    let v = self.rooted_get(value_of(i))?;
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_fn("mana_rt_utf8_width", || {
+                                self.i64t.fn_type(
+                                    &[BasicMetadataTypeEnum::IntType(self.i64t)],
+                                    false,
+                                )
+                            }),
+                            &[v.into()],
+                            "u8w",
+                        )
+                        .map_err(be)?;
+                    let w = call_result(call)?.into_int_value();
+                    let ok = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, w, self.i64t.const_zero(), "u8w.ok")
+                        .map_err(be)?;
+                    self.guard_badarg(f, ok)?;
+                    Some(w)
+                }
+                _ => None,
+            };
+            if let Some(a) = add {
+                dyn_sizes[i] = Some(a);
+                total = self.builder.build_int_add(total, a, "btot").map_err(be)?;
             }
         }
-        // single GC point: values are rooted, sizes are raw ints
-        let alloc_fn = if self.eternal_alloc.get() {
-            self.rt_fn("mana_rt_bin_alloc_eternal", || {
-                self.i64t.fn_type(
-                    &[
-                        BasicMetadataTypeEnum::PointerType(self.ptrt),
-                        BasicMetadataTypeEnum::IntType(self.i64t),
-                    ],
-                    false,
-                )
-            })
+        // single GC point: values rooted, sizes are raw ints in SSA
+        let alloc_name = if self.eternal_alloc.get() {
+            "mana_rt_bin_alloc_eternal"
         } else {
-            self.rt_fn("mana_rt_bin_alloc", || {
-                self.i64t.fn_type(
-                    &[
-                        BasicMetadataTypeEnum::PointerType(self.ptrt),
-                        BasicMetadataTypeEnum::IntType(self.i64t),
-                    ],
-                    false,
-                )
-            })
+            "mana_rt_bin_alloc"
         };
+        let alloc_fn = self.rt_fn(alloc_name, || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        });
         let call = self
             .builder
             .build_call(alloc_fn, &[self.ctx_val().into(), total.into()], "bin")
@@ -3500,17 +4070,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 off = self
                     .builder
-                    .build_int_add(
-                        off,
-                        self.i64t.const_int(bytes.len() as u64, false),
-                        "boff",
-                    )
+                    .build_int_add(off, self.i64t.const_int(bytes.len() as u64, false), "boff")
                     .map_err(be)?;
                 continue;
             }
+            let v = self.rooted_get(value_of(i))?;
             match &spec.kind {
-                SegKind::Int { nbytes } => {
-                    let v = self.rooted_get(&rooted[i])?;
+                SegKind::Int { size } => {
+                    let nbytes = match size {
+                        SegSize::Bytes(n) => self.i64t.const_int(*n, false),
+                        _ => dyn_sizes[i].unwrap(),
+                    };
                     let call = self
                         .builder
                         .build_call(
@@ -3532,7 +4102,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                 bin.into(),
                                 off.into(),
                                 v.into(),
-                                self.i64t.const_int(*nbytes, false).into(),
+                                nbytes.into(),
                                 self.i64t.const_int(spec.little as u64, false).into(),
                             ],
                             "bwi",
@@ -3540,14 +4110,23 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         .map_err(be)?;
                     let r = call_result(call)?.into_int_value();
                     self.check_exc(f, r)?;
-                    off = self
-                        .builder
-                        .build_int_add(off, self.i64t.const_int(*nbytes, false), "boff")
-                        .map_err(be)?;
+                    off = self.builder.build_int_add(off, nbytes, "boff").map_err(be)?;
                 }
-                SegKind::Utf8 => unreachable!("const_bytes covers utf8"),
-                SegKind::BinAll => {
-                    let v = self.rooted_get(&rooted[i])?;
+                SegKind::Bin { size } => {
+                    let (adv, len_arg) = match size {
+                        SegSize::All => (
+                            dyn_sizes[i].unwrap(),
+                            self.i64t.const_int(u64::MAX, false), // -1: whole
+                        ),
+                        SegSize::Bytes(n) => {
+                            let c = self.i64t.const_int(*n, false);
+                            (c, c)
+                        }
+                        SegSize::Dyn { .. } => {
+                            let d = dyn_sizes[i].unwrap();
+                            (d, d)
+                        }
+                    };
                     let call = self
                         .builder
                         .build_call(
@@ -3558,25 +4137,531 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                         BasicMetadataTypeEnum::IntType(self.i64t),
                                         BasicMetadataTypeEnum::IntType(self.i64t),
                                         BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
                                     ],
                                     false,
                                 )
                             }),
-                            &[self.ctx_val().into(), bin.into(), off.into(), v.into()],
+                            &[
+                                self.ctx_val().into(),
+                                bin.into(),
+                                off.into(),
+                                v.into(),
+                                len_arg.into(),
+                            ],
                             "bwb",
                         )
                         .map_err(be)?;
                     let r = call_result(call)?.into_int_value();
                     self.check_exc(f, r)?;
-                    off = self
-                        .builder
-                        .build_int_add(off, splice_sizes[i].unwrap(), "boff")
-                        .map_err(be)?;
+                    off = self.builder.build_int_add(off, adv, "boff").map_err(be)?;
                 }
-                SegKind::BinFixed { .. } => unreachable!(),
+                SegKind::Utf8 => {
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_fn("mana_rt_bin_write_utf8", || {
+                                self.i64t.fn_type(
+                                    &[
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                    ],
+                                    false,
+                                )
+                            }),
+                            &[bin.into(), off.into(), v.into()],
+                            "bwu",
+                        )
+                        .map_err(be)?;
+                    let w = call_result(call)?.into_int_value();
+                    off = self.builder.build_int_add(off, w, "boff").map_err(be)?;
+                }
             }
         }
         Ok(bin)
+    }
+
+    /// seg_bytes for a pre-evaluated size term (construction path).
+    fn seg_bytes_from_value(
+        &self,
+        f: FunctionValue<'ctx>,
+        szv: IntValue<'ctx>,
+        size: &SegSize,
+    ) -> CgResult<IntValue<'ctx>> {
+        let SegSize::Dyn { unit, .. } = size else {
+            return Err("internal: seg_bytes_from_value on const size".into());
+        };
+        let tag = self.tag_of(szv)?;
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.i64t.const_int(TAG_SMALL, false),
+                "sz.int",
+            )
+            .map_err(be)?;
+        self.guard_badarg(f, is_int)?;
+        let raw = self
+            .builder
+            .build_right_shift(szv, self.i64t.const_int(3, false), true, "sz.raw")
+            .map_err(be)?;
+        let bits = self
+            .builder
+            .build_int_mul(raw, self.i64t.const_int(*unit as u64, false), "sz.bits")
+            .map_err(be)?;
+        let low = self
+            .builder
+            .build_and(bits, self.i64t.const_int(7, false), "sz.low")
+            .map_err(be)?;
+        let aligned = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, low, self.i64t.const_zero(), "sz.al")
+            .map_err(be)?;
+        let nonneg = self
+            .builder
+            .build_int_compare(IntPredicate::SGE, bits, self.i64t.const_zero(), "sz.nn")
+            .map_err(be)?;
+        let ok = self.builder.build_and(aligned, nonneg, "sz.ok").map_err(be)?;
+        self.guard_badarg(f, ok)?;
+        self.builder
+            .build_right_shift(bits, self.i64t.const_int(3, false), false, "sz.bytes")
+            .map_err(be)
+    }
+
+
+    /// A small constant binary term (e.g. io:nl's newline).
+    fn compile_binary_const_term(
+        &self,
+        f: FunctionValue<'ctx>,
+        bytes: &[u8],
+        _scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let alloc_fn = self.rt_fn("mana_rt_bin_alloc", || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        });
+        let call = self
+            .builder
+            .build_call(
+                alloc_fn,
+                &[
+                    self.ctx_val().into(),
+                    self.i64t.const_int(bytes.len() as u64, false).into(),
+                ],
+                "cbin",
+            )
+            .map_err(be)?;
+        let bin = call_result(call)?.into_int_value();
+        let ptr = self.static_bytes(bytes)?;
+        self.builder
+            .build_call(
+                self.rt_fn("mana_rt_bin_write_bytes", || {
+                    self.ctx.void_type().fn_type(
+                        &[
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                }),
+                &[
+                    bin.into(),
+                    self.i64t.const_zero().into(),
+                    ptr.into(),
+                    self.i64t.const_int(bytes.len() as u64, false).into(),
+                ],
+                "",
+            )
+            .map_err(be)?;
+        let _ = f;
+        Ok(bin)
+    }
+
+    /// io_lib cut: format engine in the runtime, charlists out.
+    fn compile_io_lib_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let call = match (name, argv.len()) {
+            ("format", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_io_lib_format"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ilf",
+                )
+                .map_err(be)?,
+            ("write", 1) | ("write", 2) => self
+                .builder
+                .build_call(
+                    self.rt_pt_i64("mana_rt_io_lib_write"),
+                    &[self.ctx_val().into(), argv[0].into()],
+                    "ilw",
+                )
+                .map_err(be)?,
+            _ => return Err(format!("unsupported BIF io_lib:{}/{}", name, argv.len())),
+        };
+        let v = call_result(call)?.into_int_value();
+        self.check_exc(f, v)
+    }
+
+    /// ets cut: the global KV store (keypos 1 only, no match specs).
+    fn compile_ets_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let quad = |helper: &str| {
+            self.rt_fn(helper, || {
+                self.i64t.fn_type(
+                    &[
+                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                    ],
+                    false,
+                )
+            })
+        };
+        let call = match (name, argv.len()) {
+            // tables are identified by their name term; options ignored
+            ("new", 2) => return Ok(argv[0]),
+            ("insert", 2) | ("insert_new", 2) => self
+                .builder
+                .build_call(
+                    quad("mana_rt_ets_insert"),
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(),
+                        argv[1].into(),
+                        self.i64t
+                            .const_int((name == "insert_new") as u64, false)
+                            .into(),
+                    ],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("lookup", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_lookup"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("delete", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_delete"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            // whole-table delete: treat as ok (closed world: tables die
+            // with the process) — TODO(ets)
+            ("delete", 1) => return self.atom_term("true"),
+            _ => return Err(format!("unsupported BIF ets:{}/{}", name, argv.len())),
+        };
+        let v = call_result(call)?.into_int_value();
+        self.check_exc(f, v)
+    }
+
+    /// application cut: env store; no applications actually start.
+    fn compile_application_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let get_env = || {
+            self.rt_fn("mana_rt_app_get_env", || {
+                self.i64t.fn_type(
+                    &[
+                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                    ],
+                    false,
+                )
+            })
+        };
+        match (name, argv.len()) {
+            ("get_env", 2) => {
+                let undef = self.atom_term("undefined")?;
+                let call = self
+                    .builder
+                    .build_call(
+                        get_env(),
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            undef.into(),
+                            self.i64t.const_int(1, false).into(),
+                        ],
+                        "appenv",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("get_env", 3) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        get_env(),
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                            self.i64t.const_zero().into(),
+                        ],
+                        "appenv",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("set_env", 3) => {
+                let callee = self.rt_fn("mana_rt_app_set_env", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "appenv",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("get_key", 2) | ("get_application", 0) | ("get_application", 1) => {
+                self.atom_term("undefined")
+            }
+            _ => Err(format!(
+                "unsupported BIF application:{}/{}",
+                name,
+                argv.len()
+            )),
+        }
+    }
+
+    /// code module cut: "loaded" = compiled into this binary.
+    fn compile_code_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        match (name, argv.len()) {
+            ("ensure_loaded", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_code_ensure_loaded"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "cel",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            _ => Err(format!("unsupported BIF code:{}/{}", name, argv.len())),
+        }
+    }
+
+    /// persistent_term cut: a global table of eternal deep copies.
+    fn compile_pt_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let quad = || {
+            self.rt_fn("mana_rt_pt_get", || {
+                self.i64t.fn_type(
+                    &[
+                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                    ],
+                    false,
+                )
+            })
+        };
+        let call = match (name, argv.len()) {
+            ("put", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_pt_put"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ptput",
+                )
+                .map_err(be)?,
+            ("get", 1) => self
+                .builder
+                .build_call(
+                    quad(),
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(),
+                        self.i64t.const_zero().into(),
+                        self.i64t.const_zero().into(),
+                    ],
+                    "ptget",
+                )
+                .map_err(be)?,
+            ("get", 2) => self
+                .builder
+                .build_call(
+                    quad(),
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(),
+                        argv[1].into(),
+                        self.i64t.const_int(1, false).into(),
+                    ],
+                    "ptget",
+                )
+                .map_err(be)?,
+            _ => {
+                return Err(format!(
+                    "unsupported BIF persistent_term:{}/{}",
+                    name,
+                    argv.len()
+                ))
+            }
+        };
+        let v = call_result(call)?.into_int_value();
+        self.check_exc(f, v)
+    }
+
+    /// unicode module cut: chardata conversion in the runtime (utf8 only —
+    /// the encoding arguments are evaluated and ignored).
+    fn compile_unicode_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let helper = match (name, argv.len()) {
+            ("characters_to_binary", 1..=3) => "mana_rt_unicode_to_binary",
+            ("characters_to_list", 1 | 2) => "mana_rt_unicode_to_list",
+            _ => return Err(format!("unsupported BIF unicode:{}/{}", name, argv.len())),
+        };
+        let call = self
+            .builder
+            .build_call(
+                self.rt_pt_i64(helper),
+                &[self.ctx_val().into(), argv[0].into()],
+                "uconv",
+            )
+            .map_err(be)?;
+        let v = call_result(call)?.into_int_value();
+        self.check_exc(f, v)
+    }
+
+    /// The native io cut: stdout only, bypassing OTP's group-leader
+    /// io-protocol entirely (io.erl is never compiled).
+    fn compile_io_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        match (name, argv.len()) {
+            // devices other than stdout are not supported; the device arg
+            // (standard_io etc.) is evaluated and ignored
+            ("put_chars", 1) | ("put_chars", 2) => {
+                let data = *argv.last().unwrap();
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_io_put_chars"),
+                        &[self.ctx_val().into(), data.into()],
+                        "ioput",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("format", 2) | ("format", 3) => {
+                // format/3's device arg (first) is ignored like put_chars/2's
+                let (fmt, fargs) = if argv.len() == 3 {
+                    (argv[1], argv[2])
+                } else {
+                    (argv[0], argv[1])
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_io_format"),
+                        &[self.ctx_val().into(), fmt.into(), fargs.into()],
+                        "iofmt",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("nl", 0) => {
+                let nl = self.compile_binary_const_term(f, b"\n", scope)?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_io_put_chars"),
+                        &[self.ctx_val().into(), nl.into()],
+                        "ionl",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            _ => Err(format!("unsupported BIF io:{}/{}", name, argv.len())),
+        }
     }
 
     fn compile_maps_bif(
@@ -3753,6 +4838,63 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("size", 1) => self.map_size_of(f, argv[0]),
+            ("keys", 1) | ("values", 1) => {
+                let callee = self.rt_fn("mana_rt_map_keys", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            self.i64t
+                                .const_int((name == "values") as u64, false)
+                                .into(),
+                        ],
+                        "mkeys",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("fold", 3) => {
+                // fold(Fun, Acc, Map)
+                let callee = self.rt_fn("mana_rt_maps_fold", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "mfold",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             _ => Err(format!("unsupported BIF maps:{}/{}", name, argv.len())),
         }
     }
@@ -4156,17 +5298,30 @@ struct SegSpec {
 }
 
 enum SegKind {
-    Int { nbytes: u64 },
-    /// `Rest/binary` — size 'all'
-    BinAll,
-    /// fixed-size binary extraction/splice
-    BinFixed { nbytes: u64 },
+    Int { size: SegSize },
+    Bin { size: SegSize },
     Utf8,
+}
+
+/// Size in BYTES: constant, 'all' (binary rest), or computed at runtime
+/// (`expr * unit` bits; the byte-alignment check happens at runtime).
+enum SegSize {
+    Bytes(u64),
+    All,
+    Dyn { size: Expr, unit: i64 },
 }
 
 impl SegKind {
     fn allocates(&self) -> bool {
-        matches!(self, SegKind::BinAll | SegKind::BinFixed { .. })
+        matches!(self, SegKind::Bin { .. })
+    }
+    fn dynamic(&self) -> bool {
+        matches!(
+            self,
+            SegKind::Utf8
+                | SegKind::Int { size: SegSize::Dyn { .. } }
+                | SegKind::Bin { size: SegSize::Dyn { .. } | SegSize::All }
+        )
     }
 }
 
@@ -4191,35 +5346,41 @@ fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {
     };
     let unit = match &spec[1] {
         Expr::Lit(Literal::Int(u)) => *u,
+        // utf8/utf16/utf32 segments carry 'undefined' size and unit
+        _ if ty == "utf8" => 0,
         _ => return Err("bitstring segment unit is not a constant".into()),
     };
     let mut flags = Vec::new();
     atom_list(&spec[3], &mut flags);
     let little = flags.iter().any(|f| f == "little" || f == "native");
     let signed = flags.iter().any(|f| f == "signed");
+    let const_bytes_of = |sz: i64| -> Result<u64, String> {
+        let bits = sz * unit;
+        if bits % 8 != 0 || bits < 0 {
+            return Err(format!(
+                "TODO(bitstring): only byte-aligned segments are supported (got {} bits)",
+                bits
+            ));
+        }
+        Ok((bits / 8) as u64)
+    };
     let kind = match (ty, &spec[0]) {
         ("utf8", _) => SegKind::Utf8,
-        ("integer", Expr::Lit(Literal::Int(sz))) => {
-            let bits = sz * unit;
-            if bits % 8 != 0 || bits <= 0 {
-                return Err(format!(
-                    "TODO(bitstring): only byte-aligned integer segments are supported (got {} bits)",
-                    bits
-                ));
-            }
-            SegKind::Int { nbytes: (bits / 8) as u64 }
+        ("integer", Expr::Lit(Literal::Int(sz))) => SegKind::Int {
+            size: SegSize::Bytes(const_bytes_of(*sz)?),
+        },
+        ("binary", Expr::Lit(Literal::Atom(a))) if a == "all" => {
+            SegKind::Bin { size: SegSize::All }
         }
-        ("binary", Expr::Lit(Literal::Atom(a))) if a == "all" => SegKind::BinAll,
-        ("binary", Expr::Lit(Literal::Int(sz))) => {
-            let bits = sz * unit;
-            if bits % 8 != 0 || bits < 0 {
-                return Err("TODO(bitstring): sub-byte binary segment size".into());
-            }
-            SegKind::BinFixed { nbytes: (bits / 8) as u64 }
-        }
-        ("integer", _) | ("binary", _) => {
-            return Err("dynamic bitstring segment sizes are not supported yet".into())
-        }
+        ("binary", Expr::Lit(Literal::Int(sz))) => SegKind::Bin {
+            size: SegSize::Bytes(const_bytes_of(*sz)?),
+        },
+        ("integer", e) => SegKind::Int {
+            size: SegSize::Dyn { size: e.clone(), unit },
+        },
+        ("binary", e) => SegKind::Bin {
+            size: SegSize::Dyn { size: e.clone(), unit },
+        },
         ("float", _) => return Err("TODO: float bitstring segments".into()),
         (other, _) => return Err(format!("unsupported bitstring segment type '{}'", other)),
     };
@@ -4311,7 +5472,12 @@ fn pattern_spill_sites(p: &Pattern) -> usize {
 
 /// Modules implemented natively (never compiled from beams).
 fn is_bif_module(m: &str) -> bool {
-    matches!(m, "erlang" | "maps")
+    matches!(
+        m,
+        "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
+            | "logger" | "ets" | "application" | "file" | "erts_internal"
+            | "elixir_erl" | "erl_eval" | "beam_lib"
+    )
 }
 
 fn is_raise(primop: &str) -> bool {
@@ -4432,20 +5598,20 @@ fn expr_may_raise(
                     .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound))
         }
         Expr::Call { module, name, args } => {
-            if module == "maps" {
-                return matches!(
-                    name.as_str(),
-                    "get" | "put" | "is_key" | "remove" | "merge" | "from_list"
-                        | "to_list" | "size"
-                ) || args
-                    .iter()
-                    .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound));
+            if matches!(
+                module.as_str(),
+                "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
+                    | "logger" | "ets" | "application" | "file" | "erts_internal"
+                    | "elixir_erl" | "erl_eval" | "beam_lib"
+            ) {
+                return true;
             }
             let callee = if module == "erlang" {
                 matches!(
                     (name.as_str(), args.len()),
                     ("error", 1)
                         | ("error", 2)
+                        | ("error", 3)
                         | ("exit", 1)
                         | ("throw", 1)
                         | ("spawn", 1)
@@ -4466,10 +5632,18 @@ fn expr_may_raise(
                         | ("byte_size", 1)
                         | ("bit_size", 1)
                         | ("binary_part", 3)
+                        | ("split_binary", 2)
                         | ("binary_to_list", 1)
                         | ("list_to_binary", 1)
                         | ("iolist_to_binary", 1)
                         | ("integer_to_binary", 1)
+                        | ("integer_to_binary", 2)
+                        | ("integer_to_list", 1)
+                        | ("integer_to_list", 2)
+                        | ("binary_to_integer", 1)
+                        | ("binary_to_integer", 2)
+                        | ("list_to_integer", 1)
+                        | ("list_to_integer", 2)
                         | ("atom_to_binary", 1)
                         | ("atom_to_binary", 2)
                         | ("binary_to_atom", 1)
@@ -4478,6 +5652,9 @@ fn expr_may_raise(
                         | ("binary_to_existing_atom", 2)
                         | ("apply", 2)
                         | ("apply", 3)
+                        | ("raise", 3)
+                        | ("nif_error", 1)
+                        | ("nif_error", 2)
                 )
             } else {
                 raise_set.contains(&(
@@ -4559,7 +5736,7 @@ fn expr_may_gc(
             if module == "erlang"
                 && matches!(
                     (name.as_str(), args.len()),
-                    ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1)
+                    ("error", 1) | ("error", 2) | ("error", 3) | ("exit", 1) | ("throw", 1)
                 )
             {
                 return args
@@ -4574,6 +5751,7 @@ fn expr_may_gc(
                         | ("++", 2)
                         | ("--", 2)
                         | ("binary_part", 3)
+                        | ("split_binary", 2)
                         | ("binary_to_list", 1)
                         | ("list_to_binary", 1)
                         | ("iolist_to_binary", 1)
@@ -4582,6 +5760,9 @@ fn expr_may_gc(
                         | ("atom_to_binary", 2)
                         | ("apply", 2)
                         | ("apply", 3)
+                        | ("raise", 3)
+                        | ("nif_error", 1)
+                        | ("nif_error", 2)
                 )
             {
                 return true;
@@ -4590,8 +5771,13 @@ fn expr_may_gc(
                 && matches!(
                     name.as_str(),
                     "put" | "remove" | "merge" | "from_list" | "to_list" | "find"
+                        | "fold" | "keys" | "values"
                 )
             {
+                return true;
+            }
+            // io:nl allocates its newline binary; unicode conversions allocate
+            if module == "io" || module == "unicode" {
                 return true;
             }
             let callee_gc = module != "erlang"
@@ -4957,39 +6143,85 @@ fn reachable_funs(
 
     let mut seen: HashSet<(String, FunName)> = HashSet::new();
     let mut work = vec![(entry_mod.to_string(), entry.clone())];
-    // dynamic dispatch (erlang:apply/3, which erlc also emits for computed
-    // M:F(...) calls) can reach any exported function of any compiled
-    // module — seed them all when apply appears anywhere reachable code
-    // could live. module_info stays out (codegen skips it).
-    let uses_apply = mods.iter().any(|m| {
-        m.definitions.iter().any(|(_, fun)| {
-            let mut edges = Vec::new();
-            let mut lb = HashSet::new();
-            collect_edges(&fun.body, &mut edges, &mut lb);
-            edges.iter().any(|e| {
-                matches!(e, Edge::Remote(m, f) if m == "erlang" && f.name == "apply" && f.arity == 3)
-            })
-        })
-    });
-    if uses_apply {
-        for m in mods {
-            for ex in &m.exports {
-                // reflection exports need get_module_info; not dynamically
-                // dispatchable in the closed world — TODO(reflection)
-                if ex.name == "module_info" || ex.name == "__info__" {
-                    continue;
-                }
-                if defs.contains_key(&(m.name.as_str(), ex)) {
-                    work.push((m.name.clone(), ex.clone()));
-                }
-            }
-        }
-    }
+    // Dynamic dispatch (erlang:apply/3, incl. erlc's computed M:F(...)
+    // calls) can only name a module through an atom. A compiled module
+    // whose name atom appears as a literal anywhere in reachable code
+    // (protocol impl_for tables, dispatch lists, pick-a-module functions)
+    // gets its exports seeded as roots; modules that are merely statically
+    // required (Kernel etc.) keep full pruning. Reflection exports
+    // (module_info, __info__) stay out — TODO(reflection).
+    let module_names: HashSet<&str> = mods.iter().map(|m| m.name.as_str()).collect();
+    // Dynamic-dispatch seeding: a module is a candidate target when its
+    // name atom appears in reachable code (protocol impl tables, dispatch
+    // lists). Which of its exports are roots depends on how dispatch names
+    // functions: literal name positions (`impl.to_string(x)`) seed just
+    // that name/arity; a dynamic name position anywhere (apply with a
+    // computed function) falls back to seeding every export of candidate
+    // modules. Elixir modules only — Erlang infra mentions each other's
+    // atoms constantly ({global, Name} etc.) and would drag in the whole
+    // OTP kernel; behaviour callback dispatch needs a finer rule —
+    // TODO(behaviour-seeding).
+    let mut mentioned: BTreeSet<String> = BTreeSet::new();
+    let mut missing_dyn: BTreeSet<String> = BTreeSet::new();
+    let mut missing_modules: std::collections::BTreeMap<String, (String, FunName)> =
+        Default::default();
+    // atoms mentioned by modules that contain a dynamic function-name
+    // position: those get FULL export seeding (the dispatch could name
+    // anything); everything else seeds only literally-named pairs
+    let mut mentioned_dyn: BTreeSet<String> = BTreeSet::new();
+    let mut dyn_pairs: HashSet<(String, usize)> = HashSet::new();
+    let mut dyn_modules: HashSet<String> = HashSet::new();
+    let mut module_atoms: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut seeded: HashSet<(String, FunName)> = HashSet::new();
     while let Some((module, fname)) = work.pop() {
         if !seen.insert((module.clone(), fname.clone())) {
             continue;
         }
         let fun = defs[&(module.as_str(), &fname)];
+        let mut atoms = BTreeSet::new();
+        collect_atoms(&fun.body, &mut atoms);
+        for a in atoms {
+            if a.starts_with("Elixir.") {
+                if module_names.contains(a.as_str()) {
+                    mentioned.insert(a.clone());
+                    module_atoms.entry(module.clone()).or_default().insert(a);
+                } else {
+                    // possibly a dispatch target whose beam was never pulled
+                    // (consolidated protocol impls); the driver decides
+                    // whether a beam exists for it
+                    missing_dyn.insert(a);
+                }
+            }
+        }
+        let mut fun_dyn = false;
+        collect_dyn_names(&fun.body, &mut dyn_pairs, &mut fun_dyn);
+        if fun_dyn && dyn_modules.insert(module.clone()) {
+            if let Some(atoms) = module_atoms.get(&module) {
+                mentioned_dyn.extend(atoms.iter().cloned());
+            }
+        }
+        if dyn_modules.contains(&module) {
+            if let Some(atoms) = module_atoms.get(&module) {
+                mentioned_dyn.extend(atoms.iter().cloned());
+            }
+        }
+        for a in &mentioned {
+            let full = mentioned_dyn.contains(a);
+            let m = mods.iter().find(|m| &m.name == a).unwrap();
+            for ex in &m.exports {
+                if ex.name == "module_info" || ex.name == "__info__" {
+                    continue;
+                }
+                if !(full || dyn_pairs.contains(&(ex.name.clone(), ex.arity))) {
+                    continue;
+                }
+                if defs.contains_key(&(m.name.as_str(), ex))
+                    && seeded.insert((m.name.clone(), ex.clone()))
+                {
+                    work.push((m.name.clone(), ex.clone()));
+                }
+            }
+        }
         let mut edges = Vec::new();
         let mut letrec_bound = HashSet::new();
         collect_edges(&fun.body, &mut edges, &mut letrec_bound);
@@ -5012,15 +6244,199 @@ fn reachable_funs(
                     tmod, module, fname.name, fname.arity, parse_err
                 ));
             } else {
-                return Err(format!(
-                    "module '{}' (required by {}:{}/{}) is not among the compiled \
-                     modules — the Erlang/Elixir standard library is not yet supported",
-                    tmod, module, fname.name, fname.arity
-                ));
+                // keep walking so ONE run reports every missing module —
+                // the driver batch-pulls them instead of one per rebuild
+                missing_modules
+                    .entry(tmod)
+                    .or_insert_with(|| (module.clone(), fname.clone()));
             }
         }
     }
+    if !missing_modules.is_empty() {
+        for (m, (rm, rf)) in &missing_modules {
+            eprintln!(
+                "manac: module '{}' (required by {}:{}/{}) is not among the compiled modules",
+                m, rm, rf.name, rf.arity
+            );
+        }
+        let (m, (rm, rf)) = missing_modules.iter().next().unwrap();
+        return Err(format!(
+            "module '{}' (required by {}:{}/{}) is not among the compiled \
+             modules — the Erlang/Elixir standard library is not yet supported",
+            m, rm, rf.name, rf.arity
+        ));
+    }
+    for m in &missing_dyn {
+        eprintln!("manac: note: dynamic module candidate '{}' is not compiled", m);
+    }
+    if std::env::var("MANA_DEBUG_SEED").is_ok() {
+        eprintln!(
+            "manac: seed debug: mentioned={} pairs={} seeded={} to_string1={} chars_int_seeded={}",
+            mentioned.len(),
+            dyn_pairs.len(),
+            seeded.len(),
+            dyn_pairs.contains(&("to_string".to_string(), 1)),
+            seeded
+                .iter()
+                .any(|(m, _)| m == "Elixir.String.Chars.Integer"),
+        );
+    }
     Ok(seen)
+}
+
+/// Literal function names in dynamic-call name positions (with arity), and
+/// whether any name position is a computed expression.
+fn collect_dyn_names(e: &Expr, pairs: &mut HashSet<(String, usize)>, dyn_any: &mut bool) {
+    match e {
+        Expr::CallDyn { module: _, name, args } => {
+            match name.as_ref() {
+                Expr::Lit(Literal::Atom(a)) => {
+                    pairs.insert((a.clone(), args.len()));
+                }
+                _ => *dyn_any = true,
+            }
+            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any));
+        }
+        Expr::Call { module, name, args } => {
+            // a surviving erlang:apply/3 call has fully dynamic M and F
+            if module == "erlang" && name == "apply" && args.len() == 3 {
+                *dyn_any = true;
+            }
+            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any));
+        }
+        Expr::Lit(_) | Expr::Var(_) | Expr::FunRef { .. } => {}
+        Expr::Tuple(items) | Expr::Values(items) => {
+            items.iter().for_each(|i| collect_dyn_names(i, pairs, dyn_any))
+        }
+        Expr::Cons(h, t) => {
+            collect_dyn_names(h, pairs, dyn_any);
+            collect_dyn_names(t, pairs, dyn_any);
+        }
+        Expr::Fun(f) => collect_dyn_names(&f.body, pairs, dyn_any),
+        Expr::Let { arg, body, .. } => {
+            collect_dyn_names(arg, pairs, dyn_any);
+            collect_dyn_names(body, pairs, dyn_any);
+        }
+        Expr::LetRec { defs, body } => {
+            defs.iter()
+                .for_each(|(_, f)| collect_dyn_names(&f.body, pairs, dyn_any));
+            collect_dyn_names(body, pairs, dyn_any);
+        }
+        Expr::Apply { args, .. } | Expr::PrimOp { args, .. } => {
+            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any))
+        }
+        Expr::Case { arg, clauses } => {
+            collect_dyn_names(arg, pairs, dyn_any);
+            for c in clauses {
+                collect_dyn_names(&c.guard, pairs, dyn_any);
+                collect_dyn_names(&c.body, pairs, dyn_any);
+            }
+        }
+        Expr::Try { arg, body, handler, .. } => {
+            collect_dyn_names(arg, pairs, dyn_any);
+            collect_dyn_names(body, pairs, dyn_any);
+            collect_dyn_names(handler, pairs, dyn_any);
+        }
+        Expr::Do(a, b) => {
+            collect_dyn_names(a, pairs, dyn_any);
+            collect_dyn_names(b, pairs, dyn_any);
+        }
+        Expr::Binary(segs) => segs
+            .iter()
+            .for_each(|s| collect_dyn_names(&s.value, pairs, dyn_any)),
+        Expr::Map { pairs: mp, update } => {
+            for (k, _, v) in mp {
+                collect_dyn_names(k, pairs, dyn_any);
+                collect_dyn_names(v, pairs, dyn_any);
+            }
+            if let Some(u) = update {
+                collect_dyn_names(u, pairs, dyn_any);
+            }
+        }
+    }
+}
+
+/// Every atom literal in an expression tree, including clause patterns
+/// (protocol dispatch matches on module atoms) — drives apply export
+/// seeding in reachable_funs.
+fn collect_atoms(e: &Expr, out: &mut BTreeSet<String>) {
+    fn pat_atoms(p: &Pattern, out: &mut BTreeSet<String>) {
+        match p {
+            Pattern::Lit(Literal::Atom(a)) => {
+                out.insert(a.clone());
+            }
+            Pattern::Lit(_) | Pattern::Var(_) => {}
+            Pattern::Alias(_, inner) => pat_atoms(inner, out),
+            Pattern::Tuple(ps) => ps.iter().for_each(|p| pat_atoms(p, out)),
+            Pattern::Cons(h, t) => {
+                pat_atoms(h, out);
+                pat_atoms(t, out);
+            }
+            Pattern::Binary(segs) => segs.iter().for_each(|s| pat_atoms(&s.value, out)),
+            Pattern::Map(pairs) => pairs.iter().for_each(|(k, v)| {
+                collect_atoms(k, out);
+                pat_atoms(v, out);
+            }),
+        }
+    }
+    match e {
+        Expr::Lit(Literal::Atom(a)) => {
+            out.insert(a.clone());
+        }
+        Expr::Lit(_) | Expr::Var(_) | Expr::FunRef { .. } => {}
+        Expr::Tuple(items) | Expr::Values(items) => {
+            items.iter().for_each(|i| collect_atoms(i, out))
+        }
+        Expr::Cons(h, t) => {
+            collect_atoms(h, out);
+            collect_atoms(t, out);
+        }
+        Expr::Fun(f) => collect_atoms(&f.body, out),
+        Expr::Let { arg, body, .. } => {
+            collect_atoms(arg, out);
+            collect_atoms(body, out);
+        }
+        Expr::LetRec { defs, body } => {
+            defs.iter().for_each(|(_, f)| collect_atoms(&f.body, out));
+            collect_atoms(body, out);
+        }
+        Expr::Apply { args, .. } => args.iter().for_each(|a| collect_atoms(a, out)),
+        Expr::Call { args, .. } | Expr::PrimOp { args, .. } => {
+            args.iter().for_each(|a| collect_atoms(a, out))
+        }
+        Expr::CallDyn { module, name, args } => {
+            collect_atoms(module, out);
+            collect_atoms(name, out);
+            args.iter().for_each(|a| collect_atoms(a, out));
+        }
+        Expr::Case { arg, clauses } => {
+            collect_atoms(arg, out);
+            for c in clauses {
+                c.patterns.iter().for_each(|p| pat_atoms(p, out));
+                collect_atoms(&c.guard, out);
+                collect_atoms(&c.body, out);
+            }
+        }
+        Expr::Try { arg, body, handler, .. } => {
+            collect_atoms(arg, out);
+            collect_atoms(body, out);
+            collect_atoms(handler, out);
+        }
+        Expr::Do(a, b) => {
+            collect_atoms(a, out);
+            collect_atoms(b, out);
+        }
+        Expr::Binary(segs) => segs.iter().for_each(|s| collect_atoms(&s.value, out)),
+        Expr::Map { pairs, update } => {
+            for (k, _, v) in pairs {
+                collect_atoms(k, out);
+                collect_atoms(v, out);
+            }
+            if let Some(u) = update {
+                collect_atoms(u, out);
+            }
+        }
+    }
 }
 
 fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut HashSet<FunName>) {
