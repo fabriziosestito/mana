@@ -57,6 +57,15 @@ defmodule Mix.Tasks.Mana.Compile do
     app = Path.join(out, "app")
     # warm start: previously chased stdlib cores (unreached ones are free —
     # manac only compiles what the entry needs)
+    #
+    # TODO(xdg-cache): make this cache cross-project. The stdlib cores (and
+    # ideally manac's per-module OBJECT files, keyed by core content hash +
+    # manac version + target) belong under $XDG_CACHE_HOME/mana (fallback
+    # ~/.cache/mana), keyed by the Elixir/OTP version pair — every project
+    # on the same toolchain re-dumps and recompiles the identical ~200
+    # stdlib modules today (~50s of sequential per-module LLVM O2 in manac;
+    # object caching turns warm builds into link-only, and per-module
+    # codegen is embarrassingly parallel on top).
     cached = Path.wildcard(Path.join([out, "core-cache", "*.core"]))
     compile_loop(manac, mod, fun, arity, app, cached ++ cores, out, MapSet.new(), 400)
   end
