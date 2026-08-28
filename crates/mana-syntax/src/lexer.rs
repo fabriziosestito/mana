@@ -37,6 +37,9 @@ pub enum Tok {
     RBrace,
     LBracket,
     RBracket,
+    BinOpen,  // #{
+    BinClose, // }#
+    SegOpen,  // #<
     Lt,
     Gt,
     Comma,
@@ -116,7 +119,21 @@ impl<'a> Lexer<'a> {
             b'(' => Ok(Tok::LParen),
             b')' => Ok(Tok::RParen),
             b'{' => Ok(Tok::LBrace),
-            b'}' => Ok(Tok::RBrace),
+            // `}` followed by `#` closes a bitstring; a plain tuple-close is
+            // always followed by `,`/`)`/... in valid Core Erlang, never `#`.
+            b'}' => {
+                if self.peek() == Some(b'#') {
+                    self.bump();
+                    Ok(Tok::BinClose)
+                } else {
+                    Ok(Tok::RBrace)
+                }
+            }
+            b'#' => match self.bump() {
+                Some(b'{') => Ok(Tok::BinOpen),
+                Some(b'<') => Ok(Tok::SegOpen),
+                other => Err(format!("line {}: unexpected '#{:?}'", self.line, other)),
+            },
             b'[' => Ok(Tok::LBracket),
             b']' => Ok(Tok::RBracket),
             b'<' => Ok(Tok::Lt),

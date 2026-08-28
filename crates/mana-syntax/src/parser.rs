@@ -203,6 +203,10 @@ impl Parser {
                 Ok(Expr::Tuple(items))
             }
             Tok::LBracket => self.parse_list(),
+            Tok::BinOpen => {
+                let segs = self.parse_binary(|p| Ok(Box::new(p.parse_expr()?)))?;
+                Ok(Expr::Binary(segs))
+            }
             Tok::Lt => {
                 self.bump();
                 let items = self.parse_comma_exprs(Tok::Gt)?;
@@ -404,6 +408,32 @@ impl Parser {
         Ok(e)
     }
 
+    /// `#{ #<v>(spec...), ... }#` — caller supplies how to parse the value
+    /// (expression or pattern position). Consumes from BinOpen through BinClose.
+    fn parse_binary<V>(
+        &mut self,
+        parse_value: impl Fn(&mut Self) -> PResult<V>,
+    ) -> PResult<Vec<BinSegment<V>>> {
+        self.expect(Tok::BinOpen)?;
+        let mut segs = Vec::new();
+        if self.eat(&Tok::BinClose) {
+            return Ok(segs);
+        }
+        loop {
+            self.expect(Tok::SegOpen)?;
+            let value = parse_value(self)?;
+            self.expect(Tok::Gt)?;
+            self.expect(Tok::LParen)?;
+            let spec = self.parse_comma_exprs(Tok::RParen)?;
+            segs.push(BinSegment { value, spec });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::BinClose)?;
+        Ok(segs)
+    }
+
     fn parse_var_list(&mut self) -> PResult<Vec<String>> {
         if self.eat(&Tok::Lt) {
             let mut vars = Vec::new();
@@ -544,6 +574,10 @@ impl Parser {
                 }
                 Ok(p)
             }
+            Tok::BinOpen => {
+                let segs = self.parse_binary(|p| Ok(Box::new(p.parse_pattern()?)))?;
+                Ok(Pattern::Binary(segs))
+            }
             other => Err(format!(
                 "line {}: unsupported token in pattern: {}",
                 self.line(),
@@ -577,5 +611,26 @@ end
         assert_eq!(m.name, "m");
         assert_eq!(m.definitions.len(), 1);
         assert_eq!(m.definitions[0].0, FunName { name: "f".into(), arity: 1 });
+    }
+
+    #[test]
+    fn parses_binary_literals() {
+        // shape taken from Elixir's generated __info__/1 (exports_md5 clause)
+        let src = r#"
+module 'm' ['f'/0]
+    attributes []
+'f'/0 =
+    fun () ->
+        case 'x' of
+          <'exports_md5'> when 'true' ->
+              #{#<125>(8,1,'integer',['unsigned'|['big']]),
+                #<4>(8,1,'integer',['unsigned'|['big']])}#
+          <#{#<V>(8,1,'integer',['unsigned'|['big']])}#> when 'true' -> V
+          <_1> when 'true' -> 'nope'
+        end
+end
+"#;
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.definitions.len(), 1);
     }
 }

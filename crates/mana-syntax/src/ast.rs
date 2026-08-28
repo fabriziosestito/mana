@@ -28,6 +28,15 @@ pub enum Literal {
     Nil,
 }
 
+/// One segment of a bitstring: `#<value>(size, unit, type, flags)`.
+/// The spec args (size/unit/type/flags) are kept as raw expressions; only
+/// the syntax is supported for now — codegen rejects binaries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinSegment<V> {
+    pub value: V,
+    pub spec: Vec<Expr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Var(String),
@@ -66,6 +75,8 @@ pub enum Expr {
         arg: Box<Expr>,
         clauses: Vec<Clause>,
     },
+    /// `#{ seg, ... }#` bitstring construction
+    Binary(Vec<BinSegment<Box<Expr>>>),
     /// `do e1 e2` — sequence
     Do(Box<Expr>, Box<Expr>),
 }
@@ -91,4 +102,6 @@ pub enum Pattern {
     Cons(Box<Pattern>, Box<Pattern>),
     /// `V = pat` alias
     Alias(String, Box<Pattern>),
+    /// `#{ seg, ... }#` bitstring pattern
+    Binary(Vec<BinSegment<Box<Pattern>>>),
 }
