@@ -158,10 +158,15 @@ When asked to open a PR:
   value across an allocation. Functions proven non-allocating are frameless
   — don't break the effect analysis's conservatism.
 - **ProcCtx word offsets 0/1/2** (`heap_top`, `heap_end`, `roots_head`) are
-  a fixed contract between `mana-rt` and `mana-codegen`; tag `0b111` is the
-  GC forwarding marker. Change either only in lockstep, and run the GC
-  stress conformance program (`Conf.Gc`). `MANA_GC_LOG=1` prints
-  collections.
+  a fixed contract between `mana-rt` and `mana-codegen`: compiled code bumps
+  the nursery inline through words 0/1 and calls `mana_rt_alloc_slow` on
+  overflow. Tag `0b111` is the GC forwarding marker; a frame slot containing
+  0 is empty (frames are memset-zeroed). The collector is generational
+  (adaptive nursery + chunked old space) and relies on term immutability —
+  old objects never point young, so there are no write barriers; **never
+  emit code that mutates an existing heap term's fields** after
+  construction. Change any of this only in lockstep across both crates, and
+  run the GC stress program (`Conf.Gc`). `MANA_GC_LOG=1` prints collections.
 - **Tail calls are hints, not guarantees.** Calls in tail position get the
   LLVM `tail` marker under the C calling convention. Deep non-self recursion
   can still overflow the stack. The planned fix is `tailcc` + `musttail`
