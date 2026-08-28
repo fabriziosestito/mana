@@ -300,6 +300,8 @@ struct KnownAtoms {
     noproc: u64,
     true_a: u64,
     false_a: u64,
+    badarg: u64,
+    error_a: u64,
 }
 static KNOWN: std::sync::OnceLock<KnownAtoms> = std::sync::OnceLock::new();
 
@@ -319,6 +321,8 @@ pub extern "C" fn mana_rt_register_atoms(
     noproc: u64,
     true_a: u64,
     false_a: u64,
+    badarg: u64,
+    error_a: u64,
 ) {
     let _ = KNOWN.set(KnownAtoms {
         normal,
@@ -330,6 +334,8 @@ pub extern "C" fn mana_rt_register_atoms(
         noproc,
         true_a,
         false_a,
+        badarg,
+        error_a,
     });
 }
 
@@ -1583,6 +1589,367 @@ unsafe fn forward_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) -> 
 }
 
 // ---------------------------------------------------------------------------
+// term order, equality, list/tuple helpers
+
+fn atom_bytes(t: u64) -> &'static [u8] {
+    unsafe {
+        let p = (t & !TAG_MASK) as *const u64;
+        let len = *p as usize;
+        std::slice::from_raw_parts(p.add(1) as *const u8, len)
+    }
+}
+
+/// Erlang type rank: number < atom < ref < fun < pid < tuple < map < nil
+/// < list < bitstring.
+fn type_rank(t: u64) -> u8 {
+    match t & TAG_MASK {
+        TAG_SMALL => 0,
+        TAG_ATOM => 1,
+        _ if t == NIL => 7,
+        TAG_CONS => 8,
+        TAG_PID => {
+            if t & 0xF == PID_TAG4 {
+                4
+            } else {
+                2 // ref
+            }
+        }
+        TAG_BOXED => {
+            let header = unsafe { *(t as *const u64) };
+            match header & 0xff {
+                KIND_FLOAT => 0,
+                KIND_FUN => 3,
+                _ => 5, // tuple
+            }
+        }
+        _ => 10,
+    }
+}
+
+fn num_val(t: u64) -> f64 {
+    if t & TAG_MASK == TAG_SMALL {
+        ((t as i64) >> 3) as f64
+    } else {
+        f64::from_bits(unsafe { *(t as *const u64).add(1) })
+    }
+}
+
+/// Erlang term order with numeric coercion (== semantics for numbers).
+/// Lists compared iteratively (payloads can be arbitrarily long).
+#[no_mangle]
+pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
+    if a == b {
+        return 0;
+    }
+    let (ra, rb) = (type_rank(a), type_rank(b));
+    if ra != rb {
+        return if ra < rb { -1 } else { 1 };
+    }
+    match ra {
+        0 => {
+            // numbers, possibly mixed int/float
+            if a & TAG_MASK == TAG_SMALL && b & TAG_MASK == TAG_SMALL {
+                let (x, y) = ((a as i64) >> 3, (b as i64) >> 3);
+                return (x > y) as i64 - (x < y) as i64;
+            }
+            let (x, y) = (num_val(a), num_val(b));
+            (x > y) as i64 - (x < y) as i64
+        }
+        1 => {
+            // atoms: by text
+            let (x, y) = (atom_bytes(a), atom_bytes(b));
+            match x.cmp(y) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }
+        }
+        2 | 4 => {
+            let (x, y) = (a >> 4, b >> 4);
+            (x > y) as i64 - (x < y) as i64
+        }
+        3 => {
+            // funs: arbitrary but consistent (address order)
+            (a > b) as i64 - (a < b) as i64
+        }
+        5 => unsafe {
+            // tuples: size first, then elements
+            let (pa, pb) = (a as *const u64, b as *const u64);
+            let (na, nb) = ((*pa >> 8) as usize, (*pb >> 8) as usize);
+            if na != nb {
+                return if na < nb { -1 } else { 1 };
+            }
+            for i in 0..na {
+                let c = mana_rt_compare(*pa.add(1 + i), *pb.add(1 + i));
+                if c != 0 {
+                    return c;
+                }
+            }
+            0
+        },
+        8 => unsafe {
+            // lists: heads recursively, tails iteratively
+            let (mut x, mut y) = (a, b);
+            loop {
+                let (px, py) = ((x & !TAG_MASK) as *const u64, (y & !TAG_MASK) as *const u64);
+                let c = mana_rt_compare(*px, *py);
+                if c != 0 {
+                    return c;
+                }
+                x = *px.add(1);
+                y = *py.add(1);
+                if x == y {
+                    return 0;
+                }
+                let (tx, ty) = (x & TAG_MASK == TAG_CONS, y & TAG_MASK == TAG_CONS);
+                match (tx, ty) {
+                    (true, true) => continue,
+                    // improper/ended tails: fall back to general compare
+                    _ => return mana_rt_compare(x, y),
+                }
+            }
+        },
+        _ => 0,
+    }
+}
+
+/// Exact equality (`=:=`): like compare == 0, but 1 =:= 1.0 is false.
+#[no_mangle]
+pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
+    if a == b {
+        return 1;
+    }
+    let (ta, tb) = (a & TAG_MASK, b & TAG_MASK);
+    if ta != tb {
+        return 0; // exact: int never equals float (different tags)
+    }
+    match ta {
+        TAG_SMALL | TAG_ATOM | TAG_PID => 0, // immediates: raw inequality is final
+        _ if a == NIL || b == NIL => 0,
+        TAG_CONS => unsafe {
+            let (mut x, mut y) = (a, b);
+            loop {
+                let (px, py) = ((x & !TAG_MASK) as *const u64, (y & !TAG_MASK) as *const u64);
+                if mana_rt_eq_exact(*px, *py) == 0 {
+                    return 0;
+                }
+                x = *px.add(1);
+                y = *py.add(1);
+                if x == y {
+                    return 1;
+                }
+                if x & TAG_MASK != TAG_CONS || y & TAG_MASK != TAG_CONS {
+                    return mana_rt_eq_exact(x, y);
+                }
+            }
+        },
+        TAG_BOXED => unsafe {
+            let (pa, pb) = (a as *const u64, b as *const u64);
+            let (ha, hb) = (*pa, *pb);
+            if ha != hb {
+                return 0;
+            }
+            match ha & 0xff {
+                KIND_FLOAT => (*pa.add(1) == *pb.add(1)) as i64,
+                KIND_TUPLE => {
+                    for i in 0..(ha >> 8) as usize {
+                        if mana_rt_eq_exact(*pa.add(1 + i), *pb.add(1 + i)) == 0 {
+                            return 0;
+                        }
+                    }
+                    1
+                }
+                _ => 0, // funs: identity only (raw-equal handled above)
+            }
+        },
+        _ => 0,
+    }
+}
+
+/// Set exc and return the sentinel — the raising-BIF convention: codegen
+/// treats these helpers exactly like may-raise calls.
+fn raise_badarg(ctx: &mut ProcCtx) -> u64 {
+    ctx.exc_class = atom_error();
+    ctx.exc_reason = known().badarg;
+    EXC_SENTINEL
+}
+
+fn atom_error() -> u64 {
+    known().error_a
+}
+
+/// Allocate in this scheduler's nursery (falls back to the slow path).
+fn alloc_nursery(ctx: &mut ProcCtx, words: usize) -> *mut u64 {
+    unsafe {
+        if ctx.heap_top.add(words) <= ctx.heap_end {
+            let p = ctx.heap_top;
+            ctx.heap_top = ctx.heap_top.add(words);
+            p
+        } else {
+            mana_rt_alloc_slow(ctx, words as u64)
+        }
+    }
+}
+
+/// erlang:setelement/3 (1-based index).
+#[no_mangle]
+pub extern "C" fn mana_rt_setelement(ctx: *mut ProcCtx, i: u64, tup: u64, v: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if i & TAG_MASK != TAG_SMALL || tup & TAG_MASK != TAG_BOXED || tup == 0 {
+        return raise_badarg(ctx);
+    }
+    let idx = (i as i64) >> 3;
+    unsafe {
+        let p = tup as *const u64;
+        let header = *p;
+        if header & 0xff != KIND_TUPLE {
+            return raise_badarg(ctx);
+        }
+        let n = (header >> 8) as i64;
+        if idx < 1 || idx > n {
+            return raise_badarg(ctx);
+        }
+        // root the inputs across a potential collection
+        let frame = [0u64, 2, tup, v];
+        let saved = ctx.roots_head;
+        let mut fr = frame;
+        fr[0] = saved;
+        ctx.roots_head = fr.as_ptr() as u64;
+        let newp = alloc_nursery(ctx, 1 + n as usize);
+        ctx.roots_head = saved;
+        let (tup, v) = (fr[2], fr[3]);
+        std::ptr::copy_nonoverlapping(tup as *const u64, newp, 1 + n as usize);
+        *newp.add(idx as usize) = v;
+        newp as u64
+    }
+}
+
+/// erlang:length/1.
+#[no_mangle]
+pub extern "C" fn mana_rt_length(ctx: *mut ProcCtx, list: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut n: i64 = 0;
+    let mut t = list;
+    loop {
+        if t == NIL {
+            return ((n as u64) << 3) | TAG_SMALL;
+        }
+        if t & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        n += 1;
+        t = unsafe { *((t & !TAG_MASK) as *const u64).add(1) };
+    }
+}
+
+/// erlang:'++'/2 — copy the left list onto the right.
+#[no_mangle]
+pub extern "C" fn mana_rt_append(ctx: *mut ProcCtx, left: u64, right: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if left == NIL {
+        return right;
+    }
+    // count (and validate) left
+    let mut n = 0usize;
+    let mut t = left;
+    while t != NIL {
+        if t & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        n += 1;
+        t = unsafe { *((t & !TAG_MASK) as *const u64).add(1) };
+    }
+    // root left/right across allocation
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, left, right];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let block = alloc_nursery(ctx, 2 * n);
+    ctx.roots_head = saved;
+    let (left, right) = (fr[2], fr[3]);
+    unsafe {
+        let mut src = left;
+        let mut out = block;
+        for i in 0..n {
+            let p = (src & !TAG_MASK) as *const u64;
+            *out = *p;
+            let next = out.add(2);
+            *out.add(1) = if i == n - 1 {
+                right
+            } else {
+                next as u64 | TAG_CONS
+            };
+            src = *p.add(1);
+            out = next;
+        }
+    }
+    block as u64 | TAG_CONS
+}
+
+/// erlang:'--'/2 (quadratic, like small-input BEAM).
+#[no_mangle]
+pub extern "C" fn mana_rt_subtract(ctx: *mut ProcCtx, left: u64, right: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    // collect right into a scratch vec
+    let mut rem: Vec<u64> = Vec::new();
+    let mut t = right;
+    while t != NIL {
+        if t & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (t & !TAG_MASK) as *const u64;
+        unsafe {
+            rem.push(*p);
+            t = *p.add(1);
+        }
+    }
+    // collect kept elements of left
+    let mut kept: Vec<u64> = Vec::new();
+    let mut t = left;
+    while t != NIL {
+        if t & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (t & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if let Some(pos) = rem.iter().position(|&r| mana_rt_compare(r, h) == 0) {
+            rem.remove(pos);
+        } else {
+            kept.push(h);
+        }
+        t = unsafe { *p.add(1) };
+    }
+    if kept.is_empty() {
+        return NIL;
+    }
+    // scratch vecs are not GC roots: allocate first, then build (kept holds
+    // terms that could move if alloc collects!) — root them via a frame on
+    // the Rust stack sized dynamically: simplest is one allocation for the
+    // whole spine, done before any element is re-read... but kept already
+    // holds the terms as values. Rooting: temporary frame over the vec.
+    let saved = ctx.roots_head;
+    let mut fr: Vec<u64> = Vec::with_capacity(2 + kept.len());
+    fr.push(saved);
+    fr.push(kept.len() as u64);
+    fr.extend_from_slice(&kept);
+    ctx.roots_head = fr.as_ptr() as u64;
+    let block = alloc_nursery(ctx, 2 * kept.len());
+    ctx.roots_head = saved;
+    unsafe {
+        for (i, _) in kept.iter().enumerate() {
+            let cell = block.add(2 * i);
+            *cell = fr[2 + i];
+            *cell.add(1) = if i == kept.len() - 1 {
+                NIL
+            } else {
+                cell.add(2) as u64 | TAG_CONS
+            };
+        }
+    }
+    block as u64 | TAG_CONS
+}
+
+// ---------------------------------------------------------------------------
 // term output
 
 /// `erlang:display/1` — print a term followed by newline.
@@ -1626,6 +1993,13 @@ fn write_term(t: u64, out: &mut String) {
             }
         }
         TAG_CONS => {
+            // BEAM displays proper lists of printable chars as strings
+            if let Some(s) = printable_list(t) {
+                out.push('"');
+                out.push_str(&s);
+                out.push('"');
+                return;
+            }
             out.push('[');
             let mut cur = t;
             loop {
@@ -1671,5 +2045,39 @@ fn write_term(t: u64, out: &mut String) {
             }
         },
         _ => out.push_str("#<unknown>"),
+    }
+}
+
+/// BEAM's display heuristic: a proper list of printable latin-1 chars (or
+/// their escapes) renders as a quoted string. Returns the escaped body.
+fn printable_list(t: u64) -> Option<String> {
+    let mut s = String::new();
+    let mut cur = t;
+    loop {
+        if cur == NIL {
+            return if s.is_empty() { None } else { Some(s) };
+        }
+        if cur & TAG_MASK != TAG_CONS {
+            return None;
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if h & TAG_MASK != TAG_SMALL {
+            return None;
+        }
+        let c = (h as i64) >> 3;
+        match c {
+            32..=126 => {
+                let ch = c as u8 as char;
+                if ch == '"' || ch == '\\' {
+                    s.push('\\');
+                }
+                s.push(ch);
+            }
+            // BEAM writes these raw inside the quotes
+            8..=13 | 27 => s.push(c as u8 as char),
+            _ => return None,
+        }
+        cur = unsafe { *p.add(1) };
     }
 }

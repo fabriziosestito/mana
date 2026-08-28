@@ -347,7 +347,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn rt_register_atoms(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_register_atoms", || {
             let params: Vec<BasicMetadataTypeEnum> =
-                (0..9).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
+                (0..11).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
             self.ctx.void_type().fn_type(&params, false)
         })
     }
@@ -878,6 +878,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // atom terms (atoms are compiler statics)
         let names = [
             "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
+            "badarg", "error",
         ];
         let mut atom_args: Vec<BasicMetadataValueEnum> = Vec::new();
         for n in names {
@@ -1608,6 +1609,94 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
+    /// (term, term) -> i64 runtime helper.
+    fn rt_tt_i64(&self, name: &str) -> FunctionValue<'ctx> {
+        self.rt_fn(name, || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        })
+    }
+
+    fn bool_term(&self, cond: IntValue<'ctx>) -> CgResult<IntValue<'ctx>> {
+        let t = self.atom_term("true")?;
+        let fa = self.atom_term("false")?;
+        Ok(self
+            .builder
+            .build_select(cond, t, fa, "bool")
+            .map_err(be)?
+            .into_int_value())
+    }
+
+    /// Branch to a fresh block that raises `error:badarg` unless `ok`.
+    fn guard_badarg(
+        &self,
+        f: FunctionValue<'ctx>,
+        ok: IntValue<'ctx>,
+    ) -> CgResult<()> {
+        let bad = self.ctx.append_basic_block(f, "badarg");
+        let cont = self.ctx.append_basic_block(f, "ok");
+        self.builder
+            .build_conditional_branch(ok, cont, bad)
+            .map_err(be)?;
+        self.builder.position_at_end(bad);
+        let class = self.atom_term("error")?;
+        let reason = self.atom_term("badarg")?;
+        let ctx = self.ctx_val();
+        self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
+        self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
+        let target = self.unwind_target(f)?;
+        self.builder.build_unconditional_branch(target).map_err(be)?;
+        self.builder.position_at_end(cont);
+        Ok(())
+    }
+
+    /// `boxed(v) && header.kind == kind` as an i1, via control flow.
+    fn kind_test(
+        &self,
+        f: FunctionValue<'ctx>,
+        v: IntValue<'ctx>,
+        test: impl FnOnce(&Self, IntValue<'ctx>) -> CgResult<IntValue<'ctx>>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let entry = self.builder.get_insert_block().unwrap();
+        let boxed_bb = self.ctx.append_basic_block(f, "kt.boxed");
+        let merge = self.ctx.append_basic_block(f, "kt.merge");
+        let tag = self.tag_of(v)?;
+        let is_boxed = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, tag, self.i64t.const_zero(), "kt.tag")
+            .map_err(be)?;
+        let nonzero = self
+            .builder
+            .build_int_compare(IntPredicate::NE, v, self.i64t.const_zero(), "kt.nz")
+            .map_err(be)?;
+        let okptr = self.builder.build_and(is_boxed, nonzero, "kt.ptr").map_err(be)?;
+        self.builder
+            .build_conditional_branch(okptr, boxed_bb, merge)
+            .map_err(be)?;
+        self.builder.position_at_end(boxed_bb);
+        let p = self
+            .builder
+            .build_int_to_ptr(v, self.ptrt, "kt.p")
+            .map_err(be)?;
+        let header = self.load_word(p, 0)?;
+        let inner = test(self, header)?;
+        let boxed_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge).map_err(be)?;
+        self.builder.position_at_end(merge);
+        let phi = self
+            .builder
+            .build_phi(self.ctx.bool_type(), "kt.res")
+            .map_err(be)?;
+        let ff = self.ctx.bool_type().const_zero();
+        phi.add_incoming(&[(&ff, entry), (&inner, boxed_end)]);
+        Ok(phi.as_basic_value().into_int_value())
+    }
+
     fn compile_literal(&self, l: &Literal) -> CgResult<IntValue<'ctx>> {
         match l {
             Literal::Int(n) => Ok(self.small_int(*n)),
@@ -1948,8 +2037,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ("+", 1) => Ok(argv[0]),
             ("<", 2) | ("=<", 2) | (">", 2) | (">=", 2) | ("==", 2) | ("/=", 2)
             | ("=:=", 2) | ("=/=", 2) => {
-                // Correct for small ints (tagging is monotone) and exact
-                // (in)equality of immediates. TODO: full term ordering.
+                // fast path: both small ints (tagging is order-preserving);
+                // slow path: full Erlang term order in the runtime
                 let pred = match name {
                     "<" => IntPredicate::SLT,
                     "=<" => IntPredicate::SLE,
@@ -1958,17 +2047,83 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     "==" | "=:=" => IntPredicate::EQ,
                     _ => IntPredicate::NE,
                 };
-                let c = self
+                let (a, b) = (argv[0], argv[1]);
+                let one = self.i64t.const_int(1, false);
+                let ta = self.tag_of(a)?;
+                let tb = self.tag_of(b)?;
+                let sa = self
                     .builder
-                    .build_int_compare(pred, argv[0], argv[1], "cmp")
+                    .build_int_compare(IntPredicate::EQ, ta, one, "sa")
                     .map_err(be)?;
-                let t = self.atom_term("true")?;
-                let fa = self.atom_term("false")?;
-                Ok(self
+                let sb = self
                     .builder
-                    .build_select(c, t, fa, "bool")
-                    .map_err(be)?
-                    .into_int_value())
+                    .build_int_compare(IntPredicate::EQ, tb, one, "sb")
+                    .map_err(be)?;
+                let both = self.builder.build_and(sa, sb, "both.small").map_err(be)?;
+                let fast = self.ctx.append_basic_block(f, "cmp.fast");
+                let slow = self.ctx.append_basic_block(f, "cmp.slow");
+                let merge = self.ctx.append_basic_block(f, "cmp.merge");
+                self.builder
+                    .build_conditional_branch(both, fast, slow)
+                    .map_err(be)?;
+
+                self.builder.position_at_end(fast);
+                let cf = self
+                    .builder
+                    .build_int_compare(pred, a, b, "cmp.i")
+                    .map_err(be)?;
+                let vf = self.bool_term(cf)?;
+                let fast_end = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(merge).map_err(be)?;
+
+                self.builder.position_at_end(slow);
+                let vs = match name {
+                    "=:=" | "=/=" => {
+                        let call = self
+                            .builder
+                            .build_call(
+                                self.rt_tt_i64("mana_rt_eq_exact"),
+                                &[a.into(), b.into()],
+                                "eqx",
+                            )
+                            .map_err(be)?;
+                        let r = call_result(call)?.into_int_value();
+                        let want = if name == "=:=" { 1 } else { 0 };
+                        let c = self
+                            .builder
+                            .build_int_compare(
+                                IntPredicate::EQ,
+                                r,
+                                self.i64t.const_int(want, false),
+                                "eqx.c",
+                            )
+                            .map_err(be)?;
+                        self.bool_term(c)?
+                    }
+                    _ => {
+                        let call = self
+                            .builder
+                            .build_call(
+                                self.rt_tt_i64("mana_rt_compare"),
+                                &[a.into(), b.into()],
+                                "ord",
+                            )
+                            .map_err(be)?;
+                        let r = call_result(call)?.into_int_value();
+                        let c = self
+                            .builder
+                            .build_int_compare(pred, r, self.i64t.const_zero(), "ord.c")
+                            .map_err(be)?;
+                        self.bool_term(c)?
+                    }
+                };
+                let slow_end = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(merge).map_err(be)?;
+
+                self.builder.position_at_end(merge);
+                let phi = self.builder.build_phi(self.i64t, "cmp.v").map_err(be)?;
+                phi.add_incoming(&[(&vf, fast_end), (&vs, slow_end)]);
+                Ok(phi.as_basic_value().into_int_value())
             }
             ("self", 0) => {
                 let call = self
@@ -2170,6 +2325,356 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .build_select(a, fa, t, "not")
                     .map_err(be)?
                     .into_int_value())
+            }
+            ("is_integer", 1) | ("is_atom", 1) | ("is_pid", 1) | ("is_reference", 1) => {
+                let want: u64 = match name {
+                    "is_integer" => 1,
+                    "is_atom" => 2,
+                    "is_pid" => 0b0110,
+                    _ => 0b1110,
+                };
+                let mask: u64 = if name == "is_pid" || name == "is_reference" {
+                    0xF
+                } else {
+                    7
+                };
+                let m = self
+                    .builder
+                    .build_and(argv[0], self.i64t.const_int(mask, false), "tt")
+                    .map_err(be)?;
+                let c = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        m,
+                        self.i64t.const_int(want, false),
+                        "tt.c",
+                    )
+                    .map_err(be)?;
+                self.bool_term(c)
+            }
+            ("is_list", 1) => {
+                let tag = self.tag_of(argv[0])?;
+                let cons = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        self.i64t.const_int(0b100, false),
+                        "il.c",
+                    )
+                    .map_err(be)?;
+                let nil = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, argv[0], self.nil(), "il.n")
+                    .map_err(be)?;
+                let c = self.builder.build_or(cons, nil, "il").map_err(be)?;
+                self.bool_term(c)
+            }
+            ("is_boolean", 1) => {
+                let t = self.atom_term("true")?;
+                let fa = self.atom_term("false")?;
+                let a = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, argv[0], t, "ib.t")
+                    .map_err(be)?;
+                let b = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, argv[0], fa, "ib.f")
+                    .map_err(be)?;
+                let c = self.builder.build_or(a, b, "ib").map_err(be)?;
+                self.bool_term(c)
+            }
+            ("is_tuple", 1) | ("is_float", 1) | ("is_function", 1) => {
+                let kind: u64 = match name {
+                    "is_tuple" => KIND_TUPLE,
+                    "is_float" => KIND_FLOAT,
+                    _ => KIND_FUN,
+                };
+                let c = self.kind_test(f, argv[0], |s, header| {
+                    let k = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xff, false), "k")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(kind, false),
+                            "k.c",
+                        )
+                        .map_err(be)
+                })?;
+                self.bool_term(c)
+            }
+            ("is_function", 2) => {
+                let arity = argv[1];
+                let c = self.kind_test(f, argv[0], |s, header| {
+                    let ka = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xffff, false), "ka")
+                        .map_err(be)?;
+                    let want_lo = s
+                        .builder
+                        .build_right_shift(arity, s.i64t.const_int(3, false), true, "ar")
+                        .map_err(be)?;
+                    let want = s
+                        .builder
+                        .build_left_shift(want_lo, s.i64t.const_int(8, false), "ar8")
+                        .map_err(be)?;
+                    let want = s
+                        .builder
+                        .build_or(want, s.i64t.const_int(KIND_FUN, false), "want")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(IntPredicate::EQ, ka, want, "isf2")
+                        .map_err(be)
+                })?;
+                self.bool_term(c)
+            }
+            ("is_number", 1) => {
+                let tag = self.tag_of(argv[0])?;
+                let small = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        self.i64t.const_int(1, false),
+                        "n.s",
+                    )
+                    .map_err(be)?;
+                let isf = self.kind_test(f, argv[0], |s, header| {
+                    let k = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xff, false), "k")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(KIND_FLOAT, false),
+                            "k.f",
+                        )
+                        .map_err(be)
+                })?;
+                let c = self.builder.build_or(small, isf, "isnum").map_err(be)?;
+                self.bool_term(c)
+            }
+            ("is_binary", 1) | ("is_map", 1) | ("is_bitstring", 1) | ("is_port", 1) => {
+                // no such terms yet (S2/S3)
+                self.atom_term("false")
+            }
+            ("element", 2) => {
+                // element(I, Tuple), 1-based; badarg on any misuse
+                let (i, t) = (argv[0], argv[1]);
+                let ti = self.tag_of(i)?;
+                let i_ok = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        ti,
+                        self.i64t.const_int(1, false),
+                        "el.i",
+                    )
+                    .map_err(be)?;
+                let is_tup = self.kind_test(f, t, |s, header| {
+                    let k = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xff, false), "k")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(KIND_TUPLE, false),
+                            "k.t",
+                        )
+                        .map_err(be)
+                })?;
+                let ok = self.builder.build_and(i_ok, is_tup, "el.ok").map_err(be)?;
+                self.guard_badarg(f, ok)?;
+                let p = self
+                    .builder
+                    .build_int_to_ptr(t, self.ptrt, "el.p")
+                    .map_err(be)?;
+                let header = self.load_word(p, 0)?;
+                let arity = self
+                    .builder
+                    .build_right_shift(header, self.i64t.const_int(8, false), false, "el.n")
+                    .map_err(be)?;
+                let idx = self.untag_int(i)?;
+                let ge1 = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGE,
+                        idx,
+                        self.i64t.const_int(1, false),
+                        "el.ge",
+                    )
+                    .map_err(be)?;
+                let le = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLE, idx, arity, "el.le")
+                    .map_err(be)?;
+                let in_range = self.builder.build_and(ge1, le, "el.rng").map_err(be)?;
+                self.guard_badarg(f, in_range)?;
+                let slot = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(self.i64t, p, &[idx], "el.slot")
+                        .map_err(be)?
+                };
+                let v = self
+                    .builder
+                    .build_load(self.i64t, slot, "el.v")
+                    .map_err(be)?;
+                if let Some(inst) = v.as_instruction_value() {
+                    let _ = inst.set_metadata(self.tbaa_heap, self.tbaa_kind);
+                }
+                Ok(v.into_int_value())
+            }
+            ("tuple_size", 1) => {
+                let is_tup = self.kind_test(f, argv[0], |s, header| {
+                    let k = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xff, false), "k")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(KIND_TUPLE, false),
+                            "k.t",
+                        )
+                        .map_err(be)
+                })?;
+                self.guard_badarg(f, is_tup)?;
+                let p = self
+                    .builder
+                    .build_int_to_ptr(argv[0], self.ptrt, "ts.p")
+                    .map_err(be)?;
+                let header = self.load_word(p, 0)?;
+                let n = self
+                    .builder
+                    .build_right_shift(header, self.i64t.const_int(8, false), false, "ts.n")
+                    .map_err(be)?;
+                self.retag_int(n)
+            }
+            ("hd", 1) | ("tl", 1) => {
+                let tag = self.tag_of(argv[0])?;
+                let is_cons = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        self.i64t.const_int(0b100, false),
+                        "ht.c",
+                    )
+                    .map_err(be)?;
+                self.guard_badarg(f, is_cons)?;
+                let addr = self
+                    .builder
+                    .build_and(argv[0], self.i64t.const_int(!TAG_MASK, false), "ht.a")
+                    .map_err(be)?;
+                let p = self
+                    .builder
+                    .build_int_to_ptr(addr, self.ptrt, "ht.p")
+                    .map_err(be)?;
+                self.load_word(p, if name == "hd" { 0 } else { 1 })
+            }
+            ("abs", 1) => {
+                let tag = self.tag_of(argv[0])?;
+                let ok = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        self.i64t.const_int(1, false),
+                        "abs.i",
+                    )
+                    .map_err(be)?;
+                self.guard_badarg(f, ok)?;
+                let v = self.untag_int(argv[0])?;
+                let neg = self
+                    .builder
+                    .build_int_sub(self.i64t.const_zero(), v, "abs.n")
+                    .map_err(be)?;
+                let isneg = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SLT,
+                        v,
+                        self.i64t.const_zero(),
+                        "abs.c",
+                    )
+                    .map_err(be)?;
+                let r = self
+                    .builder
+                    .build_select(isneg, neg, v, "abs")
+                    .map_err(be)?
+                    .into_int_value();
+                self.retag_int(r)
+            }
+            ("min", 2) | ("max", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_tt_i64("mana_rt_compare"),
+                        &[argv[0].into(), argv[1].into()],
+                        "mm",
+                    )
+                    .map_err(be)?;
+                let r = call_result(call)?.into_int_value();
+                let pred = if name == "min" {
+                    IntPredicate::SLE
+                } else {
+                    IntPredicate::SGE
+                };
+                let c = self
+                    .builder
+                    .build_int_compare(pred, r, self.i64t.const_zero(), "mm.c")
+                    .map_err(be)?;
+                Ok(self
+                    .builder
+                    .build_select(c, argv[0], argv[1], "mm.v")
+                    .map_err(be)?
+                    .into_int_value())
+            }
+            ("setelement", 3) | ("length", 1) | ("++", 2) | ("--", 2) => {
+                let (fname, args_ll): (&str, Vec<BasicMetadataValueEnum>) = match name {
+                    "setelement" => (
+                        "mana_rt_setelement",
+                        vec![
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                    ),
+                    "length" => (
+                        "mana_rt_length",
+                        vec![self.ctx_val().into(), argv[0].into()],
+                    ),
+                    "++" => (
+                        "mana_rt_append",
+                        vec![self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    ),
+                    _ => (
+                        "mana_rt_subtract",
+                        vec![self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    ),
+                };
+                let nargs = args_ll.len();
+                let callee = self.rt_fn(fname, || {
+                    let mut params: Vec<BasicMetadataTypeEnum> =
+                        vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
+                    params.extend(
+                        (1..nargs).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)),
+                    );
+                    self.i64t.fn_type(&params, false)
+                });
+                let call = self.builder.build_call(callee, &args_ll, "rtb").map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
             }
             ("display", 1) => {
                 self.builder
@@ -2601,6 +3106,15 @@ fn expr_may_raise(
                         | ("spawn", 1)
                         | ("spawn_link", 1)
                         | ("spawn_monitor", 1)
+                        | ("element", 2)
+                        | ("setelement", 3)
+                        | ("tuple_size", 1)
+                        | ("hd", 1)
+                        | ("tl", 1)
+                        | ("length", 1)
+                        | ("++", 2)
+                        | ("--", 2)
+                        | ("abs", 1)
                 )
             } else {
                 raise_set.contains(&(
@@ -2677,6 +3191,15 @@ fn expr_may_gc(
                 return args
                     .iter()
                     .any(|a| raise_arg_may_gc(a, cur_mod, gc_set, letrec_bound));
+            }
+            // allocating erlang BIFs are GC points
+            if module == "erlang"
+                && matches!(
+                    (name.as_str(), args.len()),
+                    ("setelement", 3) | ("++", 2) | ("--", 2)
+                )
+            {
+                return true;
             }
             let callee_gc = module != "erlang"
                 && gc_set.contains(&(
