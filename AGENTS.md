@@ -138,6 +138,37 @@ When asked to open a PR:
 
 ## Gotchas
 
+- **Never delete half-built LLVM basic blocks.** Erasing a block that
+  another block still branches to leaves dangling references (LLVM's erase
+  does not fix up uses) and manifests as glibc heap corruption in manac
+  itself. When abandoning a half-compiled function (function-granular
+  poisoning), terminate every unterminated block with `unreachable` and
+  prepend a fresh stub entry block — O2 removes the dead body.
+- **The empty map pattern `~{}~` matches any MAP — but only maps.**
+  `Pattern::Map` must emit the is-map kind test even with zero pairs.
+  Getting this wrong made `Enum.into/2` silently return its input (erlc
+  compiles `%{} = m` catch-all-map clauses everywhere).
+- **`=>` vs `:=` in map updates is load-bearing.** erlc rewrites
+  `maps:put/3` calls into `~{K => V | M}~` assoc updates; `=>` means
+  insert-or-replace (`mana_rt_map_put`), `:=` means the key must exist
+  (`mana_rt_map_update_exact`, badkey on miss). Never flatten MapAssoc.
+- **BIF modules and native overrides.** `is_bif_module` lists modules never
+  compiled from beams (erlang, maps, io, unicode, persistent_term, code,
+  io_lib, logger, ets, application, file, erts_internal, elixir_erl,
+  erl_eval, beam_lib) — reachability skips them; codegen intercepts calls
+  (including `fun m:f/a` captures via mini-compiled shims and tail calls).
+  Separately, nif_error stub DEFINITIONS inside compiled modules (lists
+  reverse/member/keyfind…, all of binary.erl) are overridden with native
+  bodies at definition time so local and remote callers agree.
+- **The stdlib arrives via the chase loop.** `mix mana.compile` runs manac,
+  batch-pulls every "module 'X' … is not among the compiled" it reports
+  (located via `:code.which`, dumped to `_mana/core-cache`, mtime-keyed),
+  and also pulls "dynamic module candidate" notes — uncompiled `Elixir.*`
+  atoms mentioned in reachable code (that is how consolidated-protocol impl
+  modules like String.Chars.Integer arrive; build-tool apps are filtered).
+  Reachability seeds exports of mentioned Elixir modules for literally
+  named dynamic calls; erlang-side behaviour callbacks are not seeded yet
+  (TODO(behaviour-seeding)).
 - **One object file per module — keep it that way.** Codegen emits a
   separate object per Core module (a deliberate build-time decision so
   incremental caching and parallel codegen stay possible). Atom identity
