@@ -86,6 +86,9 @@ pub const KIND_FLOAT: u64 = 1;
 /// Fun object: `[header | code_ptr | captured terms...]`.
 /// Header: bits 0-7 kind, bits 8-15 arity, bits 16+ number of captures.
 pub const KIND_FUN: u64 = 2;
+/// Flatmap: `[header(size<<8|4) | k1..kn | v1..vn]`, keys canonically
+/// sorted (term order with an exactness tiebreak: 1 before 1.0).
+pub const KIND_MAP: u64 = 4;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
@@ -126,6 +129,7 @@ fn payload_words(header: u64) -> usize {
         KIND_TUPLE => (header >> 8) as usize,
         KIND_FLOAT => 1,
         KIND_FUN => 1 + (header >> 16) as usize,
+        KIND_MAP => 2 * (header >> 8) as usize,
         _ => 0,
     }
 }
@@ -302,6 +306,8 @@ struct KnownAtoms {
     false_a: u64,
     badarg: u64,
     error_a: u64,
+    badmap: u64,
+    badkey: u64,
 }
 static KNOWN: std::sync::OnceLock<KnownAtoms> = std::sync::OnceLock::new();
 
@@ -323,6 +329,8 @@ pub extern "C" fn mana_rt_register_atoms(
     false_a: u64,
     badarg: u64,
     error_a: u64,
+    badmap: u64,
+    badkey: u64,
 ) {
     let _ = KNOWN.set(KnownAtoms {
         normal,
@@ -336,6 +344,8 @@ pub extern "C" fn mana_rt_register_atoms(
         false_a,
         badarg,
         error_a,
+        badmap,
+        badkey,
     });
 }
 
@@ -668,6 +678,7 @@ fn promote_term(ctx: &mut ProcCtx, t: u64) -> u64 {
                     match header & 0xff {
                         KIND_TUPLE => (p, 1, (header >> 8) as usize),
                         KIND_FUN => (p, 2, (header >> 16) as usize),
+                        KIND_MAP => (p, 1, 2 * (header >> 8) as usize),
                         _ => (p, 0, 0),
                     }
                 }
@@ -1331,6 +1342,11 @@ unsafe fn scan_fields(p: *mut u64, is_cons: bool, f: &mut impl FnMut(*mut u64)) 
                     f(p.add(2 + i));
                 }
             }
+            KIND_MAP => {
+                for i in 0..2 * (header >> 8) as usize {
+                    f(p.add(1 + i));
+                }
+            }
             _ => {}
         }
     }
@@ -1619,6 +1635,7 @@ fn type_rank(t: u64) -> u8 {
             match header & 0xff {
                 KIND_FLOAT => 0,
                 KIND_FUN => 3,
+                KIND_MAP => 6,
                 _ => 5, // tuple
             }
         }
@@ -1672,6 +1689,27 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
             // funs: arbitrary but consistent (address order)
             (a > b) as i64 - (a < b) as i64
         }
+        6 => unsafe {
+            // maps: size, then keys pairwise, then values pairwise
+            let (pa, pb) = (a as *const u64, b as *const u64);
+            let (na, nb) = ((*pa >> 8) as usize, (*pb >> 8) as usize);
+            if na != nb {
+                return if na < nb { -1 } else { 1 };
+            }
+            for i in 0..na {
+                let c = mana_rt_compare(*pa.add(1 + i), *pb.add(1 + i));
+                if c != 0 {
+                    return c;
+                }
+            }
+            for i in 0..na {
+                let c = mana_rt_compare(*pa.add(1 + na + i), *pb.add(1 + na + i));
+                if c != 0 {
+                    return c;
+                }
+            }
+            0
+        },
         5 => unsafe {
             // tuples: size first, then elements
             let (pa, pb) = (a as *const u64, b as *const u64);
@@ -1753,6 +1791,14 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
                 KIND_FLOAT => (*pa.add(1) == *pb.add(1)) as i64,
                 KIND_TUPLE => {
                     for i in 0..(ha >> 8) as usize {
+                        if mana_rt_eq_exact(*pa.add(1 + i), *pb.add(1 + i)) == 0 {
+                            return 0;
+                        }
+                    }
+                    1
+                }
+                KIND_MAP => {
+                    for i in 0..2 * (ha >> 8) as usize {
                         if mana_rt_eq_exact(*pa.add(1 + i), *pb.add(1 + i)) == 0 {
                             return 0;
                         }
@@ -1950,6 +1996,378 @@ pub extern "C" fn mana_rt_subtract(ctx: *mut ProcCtx, left: u64, right: u64) -> 
 }
 
 // ---------------------------------------------------------------------------
+// maps (flatmap)
+
+/// Canonical key order: term order, with exactness tiebreak so that keys
+/// like 1 and 1.0 remain distinct (int sorts before float).
+fn map_key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
+    let c = mana_rt_compare(a, b);
+    if c != 0 {
+        return c.cmp(&0);
+    }
+    if mana_rt_eq_exact(a, b) == 1 {
+        return std::cmp::Ordering::Equal;
+    }
+    // numerically equal but exact-distinct: small int first
+    if a & TAG_MASK == TAG_SMALL {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Greater
+    }
+}
+
+fn map_parts(m: u64) -> Option<(*mut u64, usize)> {
+    if m & TAG_MASK != TAG_BOXED || m == 0 {
+        return None;
+    }
+    let p = m as *mut u64;
+    let header = unsafe { *p };
+    if header & 0xff != KIND_MAP {
+        return None;
+    }
+    Some((p, (header >> 8) as usize))
+}
+
+/// Find a key (exact match) via binary search; returns the pair index.
+fn map_index(p: *const u64, n: usize, key: u64) -> Result<usize, usize> {
+    let keys = unsafe { std::slice::from_raw_parts(p.add(1), n) };
+    keys.binary_search_by(|&k| map_key_cmp(k, key))
+}
+
+/// Normalize a freshly built map (unsorted pairs, not yet published):
+/// sort by key, deduplicate (last write wins). Shrinks the header size on
+/// dedupe; trailing words become unreachable garbage (worklist GC).
+#[no_mangle]
+pub extern "C" fn mana_rt_map_norm(m: u64) -> u64 {
+    let Some((p, n)) = map_parts(m) else { return m };
+    unsafe {
+        let mut pairs: Vec<(u64, u64)> = (0..n).map(|i| (*p.add(1 + i), *p.add(1 + n + i))).collect();
+        // stable sort keeps the LAST duplicate later in the run
+        pairs.sort_by(|a, b| map_key_cmp(a.0, b.0));
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(n);
+        for pair in pairs {
+            if let Some(last) = out.last_mut() {
+                if map_key_cmp(last.0, pair.0) == std::cmp::Ordering::Equal {
+                    *last = pair; // last wins
+                    continue;
+                }
+            }
+            out.push(pair);
+        }
+        let m2 = out.len();
+        *p = ((m2 as u64) << 8) | KIND_MAP;
+        for (i, (k, v)) in out.iter().enumerate() {
+            *p.add(1 + i) = *k;
+            *p.add(1 + m2 + i) = *v;
+        }
+    }
+    m
+}
+
+/// Pattern-match lookup: value, or the exception sentinel for miss /
+/// non-map. Non-allocating — safe inside match contexts.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_pat_get(m: u64, key: u64) -> u64 {
+    let Some((p, n)) = map_parts(m) else {
+        return EXC_SENTINEL;
+    };
+    match map_index(p, n, key) {
+        Ok(i) => unsafe { *p.add(1 + n + i) },
+        Err(_) => EXC_SENTINEL,
+    }
+}
+
+fn raise_map_err(ctx: &mut ProcCtx, tag_is_badmap: bool, culprit: u64) -> u64 {
+    // {badmap, M} / {badkey, K} with class error
+    let tag = if tag_is_badmap { "badmap" } else { "badkey" };
+    // eternal pair (never moved; GC scans fields)
+    let p = alloc_space(3);
+    ctx.global.eternal.lock().push((p as usize, false));
+    unsafe {
+        *p = (2 << 8) | KIND_TUPLE;
+        *p.add(1) = atom_by_name(tag);
+        *p.add(2) = culprit;
+    }
+    ctx.exc_class = atom_error();
+    ctx.exc_reason = p as u64;
+    EXC_SENTINEL
+}
+
+/// badmap/badkey atoms: registered alongside the rest.
+fn atom_by_name(name: &str) -> u64 {
+    match name {
+        "badmap" => known().badmap,
+        _ => known().badkey,
+    }
+}
+
+/// maps:put/3 — returns a new map (insert or replace).
+#[no_mangle]
+pub extern "C" fn mana_rt_map_put(ctx: *mut ProcCtx, key: u64, val: u64, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, n)) = map_parts(m) else {
+        return raise_map_err(ctx, true, m);
+    };
+    // root inputs across allocation
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 3, key, val, m];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let newp = alloc_nursery(ctx, 1 + 2 * (n + 1));
+    ctx.roots_head = saved;
+    let (key, val, m) = (fr[2], fr[3], fr[4]);
+    let (p, n) = map_parts(m).unwrap();
+    unsafe {
+        match map_index(p, n, key) {
+            Ok(i) => {
+                std::ptr::copy_nonoverlapping(p, newp, 1 + 2 * n);
+                *newp.add(1 + n + i) = val;
+            }
+            Err(pos) => {
+                *newp = (((n + 1) as u64) << 8) | KIND_MAP;
+                // keys with insertion at pos
+                for i in 0..pos {
+                    *newp.add(1 + i) = *p.add(1 + i);
+                    *newp.add(1 + (n + 1) + i) = *p.add(1 + n + i);
+                }
+                *newp.add(1 + pos) = key;
+                *newp.add(1 + (n + 1) + pos) = val;
+                for i in pos..n {
+                    *newp.add(1 + i + 1) = *p.add(1 + i);
+                    *newp.add(1 + (n + 1) + i + 1) = *p.add(1 + n + i);
+                }
+            }
+        }
+    }
+    newp as u64
+}
+
+/// maps:get/2 — badkey/badmap on miss.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_get(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((p, n)) = map_parts(m) else {
+        return raise_map_err(ctx, true, m);
+    };
+    match map_index(p, n, key) {
+        Ok(i) => unsafe { *p.add(1 + n + i) },
+        Err(_) => raise_map_err(ctx, false, key),
+    }
+}
+
+/// maps:remove/2.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_remove(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((p0, n)) = map_parts(m) else {
+        return raise_map_err(ctx, true, m);
+    };
+    let Ok(idx) = map_index(p0, n, key) else {
+        return m;
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, m];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let newp = alloc_nursery(ctx, 1 + 2 * (n - 1));
+    ctx.roots_head = saved;
+    let m = fr[2];
+    let (p, n) = map_parts(m).unwrap();
+    unsafe {
+        *newp = (((n - 1) as u64) << 8) | KIND_MAP;
+        let mut j = 0;
+        for i in 0..n {
+            if i == idx {
+                continue;
+            }
+            *newp.add(1 + j) = *p.add(1 + i);
+            *newp.add(1 + (n - 1) + j) = *p.add(1 + n + i);
+            j += 1;
+        }
+    }
+    newp as u64
+}
+
+/// maps:to_list/1 — [{K, V}] in key order.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_to_list(ctx: *mut ProcCtx, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, n)) = map_parts(m) else {
+        return raise_map_err(ctx, true, m);
+    };
+    if n == 0 {
+        return NIL;
+    }
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, m];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    // 2 words per cons + 3 per {K,V} tuple
+    let block = alloc_nursery(ctx, n * 5);
+    ctx.roots_head = saved;
+    let m = fr[2];
+    let (p, n) = map_parts(m).unwrap();
+    unsafe {
+        for i in 0..n {
+            let tup = block.add(5 * i);
+            *tup = (2 << 8) | KIND_TUPLE;
+            *tup.add(1) = *p.add(1 + i);
+            *tup.add(2) = *p.add(1 + n + i);
+            let cell = tup.add(3);
+            *cell = tup as u64;
+            *cell.add(1) = if i == n - 1 {
+                NIL
+            } else {
+                block.add(5 * (i + 1) + 3) as u64 | TAG_CONS
+            };
+        }
+    }
+    unsafe { block.add(3) as u64 | TAG_CONS }
+}
+
+/// maps:from_list/1 — builds then normalizes.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_from_list(ctx: *mut ProcCtx, list: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    // count and validate [{K,V}]
+    let mut n = 0usize;
+    let mut t = list;
+    while t != NIL {
+        if t & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (t & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if h & TAG_MASK != TAG_BOXED || h == 0 {
+            return raise_badarg(ctx);
+        }
+        let hh = unsafe { *(h as *const u64) };
+        if hh & 0xff != KIND_TUPLE || (hh >> 8) != 2 {
+            return raise_badarg(ctx);
+        }
+        n += 1;
+        t = unsafe { *p.add(1) };
+    }
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, list];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let newp = alloc_nursery(ctx, 1 + 2 * n);
+    ctx.roots_head = saved;
+    let list = fr[2];
+    unsafe {
+        *newp = ((n as u64) << 8) | KIND_MAP;
+        let mut t = list;
+        let mut i = 0;
+        while t != NIL {
+            let p = (t & !TAG_MASK) as *const u64;
+            let tup = *p as *const u64;
+            *newp.add(1 + i) = *tup.add(1);
+            *newp.add(1 + n + i) = *tup.add(2);
+            i += 1;
+            t = *p.add(1);
+        }
+    }
+    mana_rt_map_norm(newp as u64)
+}
+
+/// `~{K := V | M}~` update: key must exist (Elixir `%{m | k: v}`).
+#[no_mangle]
+pub extern "C" fn mana_rt_map_update_exact(ctx: *mut ProcCtx, key: u64, val: u64, m: u64) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    let Some((p, n)) = map_parts(m) else {
+        return raise_map_err(ctxr, true, m);
+    };
+    if map_index(p, n, key).is_err() {
+        return raise_map_err(ctxr, false, key);
+    }
+    mana_rt_map_put(ctx, key, val, m)
+}
+
+/// maps:is_key/2 → true/false atoms (badmap on non-map).
+#[no_mangle]
+pub extern "C" fn mana_rt_map_is_key(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((p, n)) = map_parts(m) else {
+        return raise_map_err(ctx, true, m);
+    };
+    if map_index(p, n, key).is_ok() {
+        known().true_a
+    } else {
+        known().false_a
+    }
+}
+
+/// maps:merge/2 — values from the second map win.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_merge(ctx: *mut ProcCtx, m1: u64, m2: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, n1)) = map_parts(m1) else {
+        return raise_map_err(ctx, true, m1);
+    };
+    let Some((_, n2)) = map_parts(m2) else {
+        return raise_map_err(ctx, true, m2);
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, m1, m2];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let newp = alloc_nursery(ctx, 1 + 2 * (n1 + n2));
+    ctx.roots_head = saved;
+    let (m1, m2) = (fr[2], fr[3]);
+    let (p1, n1) = map_parts(m1).unwrap();
+    let (p2, n2) = map_parts(m2).unwrap();
+    unsafe {
+        // merge two sorted pair sequences; m2 wins ties
+        let (mut i, mut j, mut o) = (0usize, 0usize, 0usize);
+        let total = n1 + n2;
+        let put = |newp: *mut u64, o: usize, k: u64, v: u64| {
+            *newp.add(1 + o) = k;
+            *newp.add(1 + total + o) = v;
+        };
+        while i < n1 && j < n2 {
+            let (k1, k2) = (*p1.add(1 + i), *p2.add(1 + j));
+            match map_key_cmp(k1, k2) {
+                std::cmp::Ordering::Less => {
+                    put(newp, o, k1, *p1.add(1 + n1 + i));
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    put(newp, o, k2, *p2.add(1 + n2 + j));
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    put(newp, o, k2, *p2.add(1 + n2 + j));
+                    i += 1;
+                    j += 1;
+                }
+            }
+            o += 1;
+        }
+        while i < n1 {
+            put(newp, o, *p1.add(1 + i), *p1.add(1 + n1 + i));
+            i += 1;
+            o += 1;
+        }
+        while j < n2 {
+            put(newp, o, *p2.add(1 + j), *p2.add(1 + n2 + j));
+            j += 1;
+            o += 1;
+        }
+        // compact values if o < total (ties merged): values were written at
+        // stride `total`; rewrite them at stride `o`
+        if o < total {
+            for idx in 0..o {
+                let v = *newp.add(1 + total + idx);
+                *newp.add(1 + o + idx) = v;
+            }
+        }
+        *newp = ((o as u64) << 8) | KIND_MAP;
+    }
+    newp as u64
+}
+
+// ---------------------------------------------------------------------------
 // term output
 
 /// `erlang:display/1` — print a term followed by newline.
@@ -1982,7 +2400,7 @@ fn write_term(t: u64, out: &mut String) {
             let p = (t & !TAG_MASK) as *const u64;
             let len = *p as usize;
             let bytes = std::slice::from_raw_parts(p.add(1) as *const u8, len);
-            out.push_str(&String::from_utf8_lossy(bytes));
+            write_atom(&String::from_utf8_lossy(bytes), out);
         },
         _ if t == NIL => out.push_str("[]"),
         TAG_PID => {
@@ -2041,11 +2459,54 @@ fn write_term(t: u64, out: &mut String) {
                     out.push_str(&format!("{:?}", f));
                 }
                 KIND_FUN => out.push_str("#Fun<mana>"),
+                KIND_MAP => {
+                    let n = (header >> 8) as usize;
+                    out.push_str("#{");
+                    for i in 0..n {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        write_term(*p.add(1 + i), out);
+                        out.push_str("=>");
+                        write_term(*p.add(1 + n + i), out);
+                    }
+                    out.push('}');
+                }
                 _ => out.push_str("#<unknown-boxed>"),
             }
         },
         _ => out.push_str("#<unknown>"),
     }
+}
+
+/// BEAM quotes atoms that are not plain identifiers ([a-z][a-zA-Z0-9_@]*)
+/// or that collide with Erlang reserved words. `'` and `\` are escaped;
+/// other chars print raw (matching display, not ~p).
+fn write_atom(name: &str, out: &mut String) {
+    const RESERVED: &[&str] = &[
+        "after", "and", "andalso", "band", "begin", "bnot", "bor", "bsl", "bsr",
+        "bxor", "case", "catch", "cond", "div", "end", "fun", "if", "let",
+        "maybe", "not", "of", "or", "orelse", "receive", "rem", "try", "when",
+        "xor",
+    ];
+    let plain = !name.is_empty()
+        && name.as_bytes()[0].is_ascii_lowercase()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'@')
+        && !RESERVED.contains(&name);
+    if plain {
+        out.push_str(name);
+        return;
+    }
+    out.push('\'');
+    for c in name.chars() {
+        if c == '\'' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
 }
 
 /// BEAM's display heuristic: a proper list of printable latin-1 chars (or

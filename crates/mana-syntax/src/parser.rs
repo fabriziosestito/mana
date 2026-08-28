@@ -229,11 +229,14 @@ impl Parser {
                 if !self.eat(&Tok::MapClose) {
                     loop {
                         let key = self.parse_expr()?;
-                        if !self.eat(&Tok::Assoc) {
+                        let assoc = if self.eat(&Tok::Assoc) {
+                            MapAssoc::Assoc
+                        } else {
                             self.expect(Tok::ExactAssoc)?;
-                        }
+                            MapAssoc::Exact
+                        };
                         let val = self.parse_expr()?;
-                        pairs.push((key, val));
+                        pairs.push((key, assoc, val));
                         if !self.eat(&Tok::Comma) {
                             break;
                         }

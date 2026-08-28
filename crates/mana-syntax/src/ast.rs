@@ -82,10 +82,12 @@ pub enum Expr {
     },
     /// `#{ seg, ... }#` bitstring construction
     Binary(Vec<BinSegment<Box<Expr>>>),
-    /// `~{ k => v, ... }~` or `~{ k => v | M }~` map construction/update.
-    /// Parse-only for now — codegen rejects maps.
+    /// `~{ k => v, ... }~` or `~{ k := v | M }~` map construction/update.
+    /// `=>` inserts-or-replaces; `:=` requires the key to exist (badkey).
+    /// erlc rewrites `maps:put/3` calls into `=>` updates, so the
+    /// distinction is load-bearing, not a syntax nicety.
     Map {
-        pairs: Vec<(Expr, Expr)>,
+        pairs: Vec<(Expr, MapAssoc, Expr)>,
         update: Option<Box<Expr>>,
     },
     /// `try Arg of <vars> -> Body catch <evars> -> Handler`
@@ -111,6 +113,14 @@ pub struct Clause {
     pub patterns: Vec<Pattern>,
     pub guard: Expr,
     pub body: Expr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapAssoc {
+    /// `=>` — insert or replace
+    Assoc,
+    /// `:=` — exact: key must already exist
+    Exact,
 }
 
 #[derive(Debug, Clone, PartialEq)]

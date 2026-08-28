@@ -59,7 +59,7 @@ use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 
-use mana_syntax::{ApplyTarget, Clause, Expr, Fun, FunName, Literal, Module, Pattern};
+use mana_syntax::{ApplyTarget, Clause, Expr, Fun, FunName, Literal, MapAssoc, Module, Pattern};
 
 const TAG_SMALL: u64 = 0b001;
 const TAG_ATOM: u64 = 0b010;
@@ -69,6 +69,7 @@ const TAG_MASK: u64 = 0b111;
 const KIND_TUPLE: u64 = 0;
 const KIND_FLOAT: u64 = 1;
 const KIND_FUN: u64 = 2;
+const KIND_MAP: u64 = 4;
 
 /// ctx word offsets (ProcCtx contract).
 const CTX_ROOTS: u64 = 2;
@@ -347,7 +348,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn rt_register_atoms(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_register_atoms", || {
             let params: Vec<BasicMetadataTypeEnum> =
-                (0..11).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
+                (0..13).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
             self.ctx.void_type().fn_type(&params, false)
         })
     }
@@ -878,7 +879,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // atom terms (atoms are compiler statics)
         let names = [
             "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
-            "badarg", "error",
+            "badarg", "error", "badmap", "badkey",
         ];
         let mut atom_args: Vec<BasicMetadataValueEnum> = Vec::new();
         for n in names {
@@ -1125,8 +1126,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
             }
             Expr::Call { module, name, args } => {
-                if module == "erlang" {
-                    self.compile_bif(f, name, args, scope)
+                if is_bif_module(module) {
+                    self.compile_bif(f, module, name, args, scope)
                 } else {
                     let callee = self.remote_fn(module, name, args.len());
                     let may_raise = self.raise_set.contains(&(
@@ -1213,7 +1214,94 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             Expr::Values(_) => Err("multi-value expression outside let/case".into()),
             Expr::Binary(_) => Err("bitstring construction is not supported yet".into()),
-            Expr::Map { .. } => Err("maps are not supported yet".into()),
+            Expr::Map { pairs, update } => {
+                match update {
+                    None => {
+                        // build unsorted, then normalize (pre-publication
+                        // mutation: the term hasn't escaped yet)
+                        let n = pairs.len();
+                        let mut children: Vec<&Expr> = Vec::with_capacity(2 * n);
+                        for (k, _, v) in pairs {
+                            children.push(k);
+                            children.push(v);
+                        }
+                        let slots = self.eval_all_rooted(f, &children, scope)?;
+                        let p = self.alloc_words(1 + 2 * n as u64)?;
+                        let header =
+                            self.i64t.const_int(((n as u64) << 8) | KIND_MAP, false);
+                        self.store_word(p, 0, header)?;
+                        for i in 0..n {
+                            let k = self.rooted_get(&slots[2 * i])?;
+                            self.store_word(p, 1 + i as u64, k)?;
+                            let v = self.rooted_get(&slots[2 * i + 1])?;
+                            self.store_word(p, 1 + (n + i) as u64, v)?;
+                        }
+                        let raw = self
+                            .builder
+                            .build_ptr_to_int(p, self.i64t, "map.raw")
+                            .map_err(be)?;
+                        let call = self
+                            .builder
+                            .build_call(
+                                self.rt_fn("mana_rt_map_norm", || {
+                                    self.i64t.fn_type(
+                                        &[BasicMetadataTypeEnum::IntType(self.i64t)],
+                                        false,
+                                    )
+                                }),
+                                &[raw.into()],
+                                "map",
+                            )
+                            .map_err(be)?;
+                        Ok(call_result(call)?.into_int_value())
+                    }
+                    Some(base) => {
+                        // `=>` = insert-or-replace (erlc rewrites maps:put/3
+                        // into these), `:=` = exact (badkey on miss)
+                        let mut acc = self.compile_value(f, base, scope)?;
+                        for (k, assoc, v) in pairs {
+                            let acc_slot =
+                                if self.framed() { Some(self.spill(acc)?) } else { None };
+                            let kv = self.eval_siblings(f, &[k, v], scope)?;
+                            let acc2 = match acc_slot {
+                                Some(s) => self.reload(s)?,
+                                None => acc,
+                            };
+                            let helper = match assoc {
+                                MapAssoc::Assoc => "mana_rt_map_put",
+                                MapAssoc::Exact => "mana_rt_map_update_exact",
+                            };
+                            let callee = self.rt_fn(helper, || {
+                                self.i64t.fn_type(
+                                    &[
+                                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                    ],
+                                    false,
+                                )
+                            });
+                            let call = self
+                                .builder
+                                .build_call(
+                                    callee,
+                                    &[
+                                        self.ctx_val().into(),
+                                        kv[0].into(),
+                                        kv[1].into(),
+                                        acc2.into(),
+                                    ],
+                                    "mup",
+                                )
+                                .map_err(be)?;
+                            let r = call_result(call)?.into_int_value();
+                            acc = self.check_exc(f, r)?;
+                        }
+                        Ok(acc)
+                    }
+                }
+            }
         }
     }
 
@@ -1909,7 +1997,29 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             Pattern::Lit(Literal::Float(_)) => Err("float patterns not supported yet".into()),
             Pattern::Binary(_) => Err("bitstring patterns are not supported yet".into()),
-            Pattern::Map(_) => Err("map patterns are not supported yet".into()),
+            Pattern::Map(pairs) => {
+                // no allocation inside a pattern: keys must be literals or
+                // vars; the lookup helper is non-allocating
+                for (k, sub) in pairs {
+                    let key = self.compile_value(f, k, scope)?;
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_tt_i64("mana_rt_map_pat_get"),
+                            &[val.into(), key.into()],
+                            "mpat",
+                        )
+                        .map_err(be)?;
+                    let v = call_result(call)?.into_int_value();
+                    let hit = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, v, self.sentinel(), "mpat.h")
+                        .map_err(be)?;
+                    self.branch_test(f, hit, fail)?;
+                    self.match_pattern(f, v, sub, scope, fail)?;
+                }
+                Ok(())
+            }
             Pattern::Lit(l) => {
                 let expect = self.compile_literal(l)?;
                 let eq = self
@@ -1996,10 +2106,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn compile_bif(
         &self,
         f: FunctionValue<'ctx>,
+        module: &str,
         name: &str,
         args: &[Expr],
         scope: &mut Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
+        if module == "maps" {
+            return self.compile_maps_bif(f, name, args, scope);
+        }
         // raising BIFs: reason terms use the eternal allocator so raise
         // paths don't create GC points
         if matches!(
@@ -2460,9 +2574,51 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let c = self.builder.build_or(small, isf, "isnum").map_err(be)?;
                 self.bool_term(c)
             }
-            ("is_binary", 1) | ("is_map", 1) | ("is_bitstring", 1) | ("is_port", 1) => {
-                // no such terms yet (S2/S3)
+            ("is_binary", 1) | ("is_bitstring", 1) | ("is_port", 1) => {
+                // no such terms yet (S3)
                 self.atom_term("false")
+            }
+            ("is_map", 1) => {
+                let c = self.kind_test(f, argv[0], |s, header| {
+                    let k = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xff, false), "k")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(KIND_MAP, false),
+                            "k.m",
+                        )
+                        .map_err(be)
+                })?;
+                self.bool_term(c)
+            }
+            ("map_size", 1) => self.map_size_of(f, argv[0]),
+            ("map_get", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_map_get"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "mg",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("is_map_key", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_map_is_key"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "mk",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
             }
             ("element", 2) => {
                 // element(I, Tuple), 1-based; badarg on any misuse
@@ -2689,6 +2845,230 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// Raise an exception: primop match_fail/raise or erlang:error|exit|throw.
     /// Reason terms are built with the eternal allocator (never moved, GC
     /// scans their fields). Leaves the builder in a dead block.
+    /// (ctx, term, term) -> term runtime helper.
+    fn rt_ptt_i64(&self, name: &str) -> FunctionValue<'ctx> {
+        self.rt_fn(name, || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        })
+    }
+
+    fn compile_maps_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let ctxv: BasicMetadataValueEnum = self.ctx_val().into();
+        match (name, argv.len()) {
+            ("get", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_map_get"),
+                        &[ctxv, argv[0].into(), argv[1].into()],
+                        "mg",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("get", 3) => {
+                // miss (or non-map) yields the default — TODO(badmap): a
+                // non-map should raise
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_tt_i64("mana_rt_map_pat_get"),
+                        &[argv[1].into(), argv[0].into()],
+                        "mg3",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                let miss = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, v, self.sentinel(), "mg3.m")
+                    .map_err(be)?;
+                Ok(self
+                    .builder
+                    .build_select(miss, argv[2], v, "mg3.v")
+                    .map_err(be)?
+                    .into_int_value())
+            }
+            ("find", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_tt_i64("mana_rt_map_pat_get"),
+                        &[argv[1].into(), argv[0].into()],
+                        "mf",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                let miss = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, v, self.sentinel(), "mf.m")
+                    .map_err(be)?;
+                let hit_bb = self.ctx.append_basic_block(f, "mf.hit");
+                let miss_bb = self.ctx.append_basic_block(f, "mf.miss");
+                let merge = self.ctx.append_basic_block(f, "mf.merge");
+                self.builder
+                    .build_conditional_branch(miss, miss_bb, hit_bb)
+                    .map_err(be)?;
+                self.builder.position_at_end(hit_bb);
+                // {ok, V}: alloc, so root v in a temp slot first
+                let vslot = if self.framed() { Some(self.spill(v)?) } else { None };
+                let p = self.alloc_words(3)?;
+                self.store_word(p, 0, self.i64t.const_int((2 << 8) | KIND_TUPLE, false))?;
+                let ok_atom = self.atom_term("ok")?;
+                self.store_word(p, 1, ok_atom)?;
+                let v2 = match vslot {
+                    Some(s) => self.reload(s)?,
+                    None => v,
+                };
+                self.store_word(p, 2, v2)?;
+                let tup = self
+                    .builder
+                    .build_ptr_to_int(p, self.i64t, "mf.t")
+                    .map_err(be)?;
+                let hit_end = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(merge).map_err(be)?;
+                self.builder.position_at_end(miss_bb);
+                let err_atom = self.atom_term("error")?;
+                self.builder.build_unconditional_branch(merge).map_err(be)?;
+                self.builder.position_at_end(merge);
+                let phi = self.builder.build_phi(self.i64t, "mf.v").map_err(be)?;
+                phi.add_incoming(&[(&tup, hit_end), (&err_atom, miss_bb)]);
+                Ok(phi.as_basic_value().into_int_value())
+            }
+            ("put", 3) => {
+                let callee = self.rt_fn("mana_rt_map_put", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[ctxv, argv[0].into(), argv[1].into(), argv[2].into()],
+                        "mp",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("is_key", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_map_is_key"),
+                        &[ctxv, argv[0].into(), argv[1].into()],
+                        "mk",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("remove", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_map_remove"),
+                        &[ctxv, argv[0].into(), argv[1].into()],
+                        "mr",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("merge", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_map_merge"),
+                        &[ctxv, argv[0].into(), argv[1].into()],
+                        "mm",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("from_list", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_map_from_list"),
+                        &[ctxv, argv[0].into()],
+                        "mfl",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("to_list", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_map_to_list"),
+                        &[ctxv, argv[0].into()],
+                        "mtl",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("size", 1) => self.map_size_of(f, argv[0]),
+            _ => Err(format!("unsupported BIF maps:{}/{}", name, argv.len())),
+        }
+    }
+
+    fn map_size_of(
+        &self,
+        f: FunctionValue<'ctx>,
+        m: IntValue<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let is_map = self.kind_test(f, m, |s, header| {
+            let k = s
+                .builder
+                .build_and(header, s.i64t.const_int(0xff, false), "k")
+                .map_err(be)?;
+            s.builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    k,
+                    s.i64t.const_int(KIND_MAP, false),
+                    "k.m",
+                )
+                .map_err(be)
+        })?;
+        self.guard_badarg(f, is_map)?;
+        let p = self
+            .builder
+            .build_int_to_ptr(m, self.ptrt, "ms.p")
+            .map_err(be)?;
+        let header = self.load_word(p, 0)?;
+        let n = self
+            .builder
+            .build_right_shift(header, self.i64t.const_int(8, false), false, "ms.n")
+            .map_err(be)?;
+        self.retag_int(n)
+    }
+
     fn compile_raise(
         &self,
         f: FunctionValue<'ctx>,
@@ -2978,6 +3358,11 @@ enum CaseVals<'ctx> {
     Slots(Vec<u64>),
 }
 
+/// Modules implemented natively (never compiled from beams).
+fn is_bif_module(m: &str) -> bool {
+    matches!(m, "erlang" | "maps")
+}
+
 fn is_raise(primop: &str) -> bool {
     matches!(primop, "match_fail" | "raise" | "error" | "exit" | "throw")
 }
@@ -3096,6 +3481,15 @@ fn expr_may_raise(
                     .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound))
         }
         Expr::Call { module, name, args } => {
+            if module == "maps" {
+                return matches!(
+                    name.as_str(),
+                    "get" | "put" | "is_key" | "remove" | "merge" | "from_list"
+                        | "to_list" | "size"
+                ) || args
+                    .iter()
+                    .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound));
+            }
             let callee = if module == "erlang" {
                 matches!(
                     (name.as_str(), args.len()),
@@ -3115,6 +3509,9 @@ fn expr_may_raise(
                         | ("++", 2)
                         | ("--", 2)
                         | ("abs", 1)
+                        | ("map_size", 1)
+                        | ("map_get", 2)
+                        | ("is_map_key", 2)
                 )
             } else {
                 raise_set.contains(&(
@@ -3148,7 +3545,15 @@ fn expr_may_raise(
             expr_may_raise(body, cur_mod, raise_set, letrec_bound)
                 || expr_may_raise(handler, cur_mod, raise_set, letrec_bound)
         }
-        Expr::Binary(_) | Expr::Map { .. } => false, // rejected at codegen
+        Expr::Binary(_) => false, // rejected at codegen
+        // updates raise badmap/badkey; construction only via children
+        Expr::Map { pairs, update } => {
+            update.is_some()
+                || pairs.iter().any(|(k, _, v)| {
+                    expr_may_raise(k, cur_mod, raise_set, letrec_bound)
+                        || expr_may_raise(v, cur_mod, raise_set, letrec_bound)
+                })
+        }
     }
 }
 
@@ -3197,6 +3602,14 @@ fn expr_may_gc(
                 && matches!(
                     (name.as_str(), args.len()),
                     ("setelement", 3) | ("++", 2) | ("--", 2)
+                )
+            {
+                return true;
+            }
+            if module == "maps"
+                && matches!(
+                    name.as_str(),
+                    "put" | "remove" | "merge" | "from_list" | "to_list" | "find"
                 )
             {
                 return true;
@@ -3342,7 +3755,7 @@ fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut usize) {
             }
         }
         Expr::Map { pairs, update } => {
-            for (k, v) in pairs {
+            for (k, _, v) in pairs {
                 frame_prepass(k, vars, nodes);
                 frame_prepass(v, vars, nodes);
             }
@@ -3442,7 +3855,7 @@ fn free_vars(e: &Expr, bound: &mut HashSet<String>, out: &mut BTreeSet<String>) 
             }
         }
         Expr::Map { pairs, update } => {
-            for (k, v) in pairs {
+            for (k, _, v) in pairs {
                 free_vars(k, bound, out);
                 free_vars(v, bound, out);
             }
@@ -3557,7 +3970,7 @@ fn reachable_funs(
         for edge in edges {
             let (tmod, tfun) = match edge {
                 Edge::Local(f) => (module.clone(), f),
-                Edge::Remote(m, _) if m == "erlang" => continue, // BIF
+                Edge::Remote(m, _) if is_bif_module(&m) => continue, // BIF
                 Edge::Remote(m, f) => (m, f),
             };
             if defs.contains_key(&(tmod.as_str(), &tfun)) {
@@ -3659,7 +4072,7 @@ fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut HashSet<FunNa
             }
         }
         Expr::Map { pairs, update } => {
-            for (k, v) in pairs {
+            for (k, _, v) in pairs {
                 collect_edges(k, out, letrec_bound);
                 collect_edges(v, out, letrec_bound);
             }
