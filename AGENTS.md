@@ -30,13 +30,16 @@ Design pillars (do not violate them casually):
 - `crates/mana-rt/` — the runtime, built as a `staticlib` every binary links
   against. **Its crate docs define the term representation contract**; read
   them before touching either side.
-- `crates/manac/` — CLI driver: runs `erlc +to_core` on `.erl` input, parses,
-  compiles code reachable from `--entry` (default `main/0`), links with `cc`.
+- `crates/manac/` — CLI driver: takes one or more `.erl`/`.core` files
+  (`.erl` goes through `erlc +to_core`), compiles code reachable from
+  `--entry [MODULE:]FUN/ARITY` (default `main/0` in the first file's
+  module), links with `cc`. Files that fail to parse are skipped with a
+  warning and only become errors if the program needs them.
 - `hex/mana/` — the Hex package Elixir projects depend on. Its
   `mix mana.compile --entry Mod.fun/0` task compiles the Mix project,
-  extracts textual Core Erlang from the entry module's `.beam` debug_info
+  extracts textual Core Erlang from every project `.beam`'s debug_info
   (`Mana.CoreDump`: `backend.debug_info(:core_v1, ...)` + `:core_pp.format/1`),
-  and invokes `manac`. Locates the compiler via `--bin` /
+  and invokes `manac` with all of them. Locates the compiler via `--bin` /
   `config :mana, :bin` / `MANA_BIN` / PATH.
 - `examples/erlang/` — single-file `.erl` programs used as end-to-end tests;
   `examples/elixir/` — Mix-project examples built via `mix mana.compile`.
@@ -135,10 +138,16 @@ When asked to open a PR:
 
 ## Gotchas
 
-- **Atom identity is per compilation unit.** Atoms are static structs;
-  equality is pointer equality. This breaks the moment two modules are
-  linked together — a global atom table is required before multi-module
-  support. Don't build multi-module features on top of the current scheme.
+- **One object file per module — keep it that way.** Codegen emits a
+  separate object per Core module (a deliberate build-time decision so
+  incremental caching and parallel codegen stay possible). Atom identity
+  across objects relies on atoms being `linkonce_odr` globals whose symbol
+  name is derived from the atom text — the linker keeps one per name. Do
+  not merge everything into a single LLVM module, change atom linkage, or
+  make atom symbol names non-deterministic.
+- **No dynamic atoms.** Atoms exist only as compile-time statics;
+  `list_to_atom` and friends are unsupported until a runtime atom table
+  exists.
 - **There is no GC.** `mana_rt_alloc` is malloc and leaks by design. Don't
   "fix" the leak with `free` — terms have no ownership discipline; the fix
   is the planned per-process copying collector.
