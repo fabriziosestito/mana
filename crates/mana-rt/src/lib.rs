@@ -1079,6 +1079,11 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
     let mut top = to_space;
     let mut worklist: Vec<u64> = Vec::new();
 
+    // pids currently swapped into a scheduler: their LIVE state is in the
+    // ctx (walked below); their saved_* fields are stale from the last
+    // yield and must not be scanned.
+    let mut running: Vec<usize> = Vec::new();
+
     unsafe {
         for id in 0..g.n_scheds {
             let octx = g.scheds[id].ctx_addr.load(Ordering::Acquire) as *mut ProcCtx;
@@ -1086,6 +1091,9 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
                 continue;
             }
             let octx = &mut *octx;
+            if octx.current != usize::MAX {
+                running.push(octx.current);
+            }
             let mut frame = octx.roots_head as *mut u64;
             while !frame.is_null() {
                 let len = *frame.add(1) as usize;
@@ -1100,12 +1108,14 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
         }
         {
             let tab = g.procs.read();
-            for slot in tab.iter() {
+            for (id, slot) in tab.iter().enumerate() {
                 let Some(cell) = slot else { continue };
                 let p = proc_mut(cell);
-                walk_proc_roots(p, |s| {
-                    *s = forward_major(*s, &mut top, &mut worklist);
-                });
+                if !running.contains(&id) {
+                    walk_proc_roots(p, |s| {
+                        *s = forward_major(*s, &mut top, &mut worklist);
+                    });
+                }
                 drain_ingress(p); // everyone is parked: no concurrent pushes
                 for m in p.private.iter_mut() {
                     *m = forward_major(*m, &mut top, &mut worklist);
