@@ -1,10 +1,16 @@
 //! manac — Core Erlang → native binary compiler driver.
 //!
-//! Usage: manac [-o OUT] [--entry NAME/ARITY] [--emit-ir] FILE.{erl,core}
+//! Usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES...
 //!
-//! .erl inputs are first run through `erlc +to_core`. Only code reachable
-//! from the entry function (default `main/0`) is compiled.
+//! Inputs are `.core` files or `.erl` files (run through `erlc +to_core`
+//! first). All modules are compiled together, closed-world: only code
+//! reachable from the entry (default: `main/0` in the first input's module)
+//! is compiled, one object per module, linked into a single binary.
+//!
+//! A file that fails to parse is skipped with a warning; it only becomes an
+//! error if the program actually needs that module.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -19,9 +25,9 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let mut input: Option<PathBuf> = None;
+    let mut inputs: Vec<PathBuf> = Vec::new();
     let mut output: Option<PathBuf> = None;
-    let mut entry = String::from("main/0");
+    let mut entry_spec: Option<String> = None;
     let mut emit_ir = false;
 
     let mut args = std::env::args().skip(1);
@@ -32,50 +38,94 @@ fn run() -> Result<(), String> {
                     args.next().ok_or("-o requires an argument")?,
                 ))
             }
-            "--entry" => entry = args.next().ok_or("--entry requires NAME/ARITY")?,
+            "--entry" => {
+                entry_spec = Some(args.next().ok_or("--entry requires [MODULE:]FUN/ARITY")?)
+            }
             "--emit-ir" => emit_ir = true,
             "-h" | "--help" => {
-                println!("usage: manac [-o OUT] [--entry NAME/ARITY] [--emit-ir] FILE.{{erl,core}}");
+                println!(
+                    "usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES..."
+                );
                 return Ok(());
             }
             other if other.starts_with('-') => return Err(format!("unknown flag {}", other)),
-            other => input = Some(PathBuf::from(other)),
+            other => inputs.push(PathBuf::from(other)),
         }
     }
-    let input = input.ok_or("no input file (try --help)")?;
-    let entry = parse_entry(&entry)?;
+    if inputs.is_empty() {
+        return Err("no input files (try --help)".into());
+    }
 
-    let core_path = match input.extension().and_then(|e| e.to_str()) {
-        Some("core") => input.clone(),
-        Some("erl") => erl_to_core(&input)?,
-        _ => return Err("input must be a .erl or .core file".into()),
-    };
+    // Parse every input; failures are only fatal if the module is needed.
+    let mut modules: Vec<mana_syntax::Module> = Vec::new();
+    let mut poisoned: HashMap<String, String> = HashMap::new();
+    for input in &inputs {
+        let core_path = match input.extension().and_then(|e| e.to_str()) {
+            Some("core") => input.clone(),
+            Some("erl") => erl_to_core(input)?,
+            _ => return Err(format!("{}: input must be .erl or .core", input.display())),
+        };
+        let src = std::fs::read_to_string(&core_path)
+            .map_err(|e| format!("reading {}: {}", core_path.display(), e))?;
+        match mana_syntax::parse_module(&src) {
+            Ok(m) => modules.push(m),
+            Err(e) => {
+                // module name is unknown when parsing fails; key by file stem
+                let name = core_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                eprintln!(
+                    "manac: warning: skipping {} (parse error: {})",
+                    core_path.display(),
+                    e
+                );
+                poisoned.insert(name, e);
+            }
+        }
+    }
+    if modules.is_empty() {
+        return Err("no input module could be parsed".into());
+    }
 
-    let src = std::fs::read_to_string(&core_path)
-        .map_err(|e| format!("reading {}: {}", core_path.display(), e))?;
-    let ast = mana_syntax::parse_module(&src)?;
+    let (entry_mod, entry) = resolve_entry(entry_spec.as_deref(), &modules[0].name)?;
 
-    let out = output.unwrap_or_else(|| PathBuf::from(&ast.name));
-    let obj = out.with_extension("o");
-    mana_codegen::compile_module(&ast, &obj, emit_ir, &entry)?;
+    let out = output.unwrap_or_else(|| PathBuf::from(&entry_mod));
+    let obj_dir = std::env::temp_dir().join(format!("manac-{}", std::process::id()));
+    let objs =
+        mana_codegen::compile_program(&modules, &entry_mod, &entry, &obj_dir, emit_ir, &poisoned)?;
 
-    link(&obj, &out)?;
-    let _ = std::fs::remove_file(&obj);
+    let link_result = link(&objs, &out);
+    let _ = std::fs::remove_dir_all(&obj_dir);
+    link_result?;
     println!("{}", out.display());
     Ok(())
 }
 
-fn parse_entry(s: &str) -> Result<mana_syntax::FunName, String> {
-    let (name, arity) = s
+/// `[MODULE:]FUN/ARITY`; module defaults to the first input file's module.
+/// (Module names may contain dots — 'Elixir.Foo' — but never colons.)
+fn resolve_entry(
+    spec: Option<&str>,
+    default_module: &str,
+) -> Result<(String, mana_syntax::FunName), String> {
+    let spec = spec.unwrap_or("main/0");
+    let (mf, arity) = spec
         .rsplit_once('/')
-        .ok_or_else(|| format!("bad --entry '{}': expected NAME/ARITY", s))?;
+        .ok_or_else(|| format!("bad --entry '{}': expected [MODULE:]FUN/ARITY", spec))?;
     let arity: usize = arity
         .parse()
-        .map_err(|_| format!("bad --entry arity in '{}'", s))?;
-    Ok(mana_syntax::FunName {
-        name: name.to_string(),
-        arity,
-    })
+        .map_err(|_| format!("bad --entry arity in '{}'", spec))?;
+    let (module, fun) = match mf.split_once(':') {
+        Some((m, f)) => (m.to_string(), f.to_string()),
+        None => (default_module.to_string(), mf.to_string()),
+    };
+    Ok((
+        module,
+        mana_syntax::FunName {
+            name: fun,
+            arity,
+        },
+    ))
 }
 
 fn erl_to_core(input: &Path) -> Result<PathBuf, String> {
@@ -96,10 +146,10 @@ fn erl_to_core(input: &Path) -> Result<PathBuf, String> {
     Ok(input.with_extension("core"))
 }
 
-fn link(obj: &Path, out: &Path) -> Result<(), String> {
+fn link(objs: &[PathBuf], out: &Path) -> Result<(), String> {
     let rt = runtime_lib()?;
     let status = Command::new("cc")
-        .arg(obj)
+        .args(objs)
         .arg(&rt)
         .args(["-lpthread", "-ldl", "-lm"])
         .arg("-o")

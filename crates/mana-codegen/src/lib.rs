@@ -4,17 +4,24 @@
 //! 3-bit tags — 001 small int, 010 atom ptr, 011 nil, 100 cons ptr,
 //! 000 boxed ptr.
 //!
+//! A program is one or more Core Erlang modules compiled to **one object
+//! file per module** (keeps incremental caching and parallel codegen
+//! possible). Atoms are emitted as `linkonce_odr` globals named by the atom
+//! text, so the system linker merges duplicates across objects: atom
+//! identity is one static address per name per binary. Cross-module calls
+//! are direct calls to the target's mangled symbol.
+//!
 //! Functions use the C calling convention with `tail` markers on calls in
 //! tail position. TODO(lco): switch to tailcc + musttail with a uniform
 //! signature so cross-function tail calls are guaranteed.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::module::Module as LlvmModule;
+use inkwell::module::{Linkage, Module as LlvmModule};
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
@@ -37,26 +44,66 @@ const KIND_FLOAT: u64 = 1;
 type CgResult<T> = Result<T, String>;
 type Env<'ctx> = HashMap<String, IntValue<'ctx>>;
 
-/// Compile `ast` to an object file. Only functions reachable from `entry`
-/// are compiled (closed world) — this is what lets us ignore generated
-/// functions like `__info__/1` and `module_info/0,1` that use unsupported
-/// constructs. A C `main` calling `entry` (arity 0) is emitted.
-pub fn compile_module(
-    ast: &Module,
-    out_obj: &Path,
-    dump_ir: bool,
+/// Compile a program (one or more Core Erlang modules) to one object file
+/// per module in `out_dir`; returns the object paths. Only functions
+/// reachable from `entry` in `entry_mod` are compiled (closed world) — this
+/// is what lets us ignore generated functions like `__info__/1` and
+/// `module_info/0,1` that use unsupported constructs. A C `main` calling
+/// the entry (arity 0) is emitted into the entry module's object.
+///
+/// `poisoned` maps module names that failed to parse to their parse errors;
+/// if reachability needs one of them, that error is surfaced.
+pub fn compile_program(
+    mods: &[Module],
+    entry_mod: &str,
     entry: &FunName,
-) -> CgResult<()> {
-    let context = Context::create();
-    let cg = Cg::new(&context, &ast.name);
-    cg.compile(ast, entry)?;
-    if dump_ir {
-        eprintln!("{}", cg.module.print_to_string().to_string());
+    out_dir: &Path,
+    dump_ir: bool,
+    poisoned: &HashMap<String, String>,
+) -> CgResult<Vec<PathBuf>> {
+    if entry.arity != 0 {
+        return Err(format!(
+            "entry function {}/{} must have arity 0",
+            entry.name, entry.arity
+        ));
     }
-    cg.module
-        .verify()
-        .map_err(|e| format!("LLVM verifier: {}", e))?;
-    cg.emit_object(out_obj)
+    {
+        let mut names = HashSet::new();
+        for m in mods {
+            if !names.insert(&m.name) {
+                return Err(format!("module '{}' provided more than once", m.name));
+            }
+        }
+    }
+    let reachable = reachable_funs(mods, entry_mod, entry, poisoned)?;
+
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("creating {}: {}", out_dir.display(), e))?;
+    let mut objs = Vec::new();
+    for m in mods {
+        let include: HashSet<FunName> = reachable
+            .iter()
+            .filter(|(module, _)| module == &m.name)
+            .map(|(_, f)| f.clone())
+            .collect();
+        if include.is_empty() {
+            continue; // nothing from this module is reachable
+        }
+        let context = Context::create();
+        let cg = Cg::new(&context, &m.name);
+        let entry_here = (m.name == entry_mod).then_some(entry);
+        cg.compile(m, &include, entry_here)?;
+        if dump_ir {
+            eprintln!("{}", cg.module.print_to_string().to_string());
+        }
+        cg.module
+            .verify()
+            .map_err(|e| format!("LLVM verifier ({}): {}", m.name, e))?;
+        let obj = out_dir.join(format!("{}.o", sanitize(&m.name)));
+        cg.emit_object(&obj)?;
+        objs.push(obj);
+    }
+    Ok(objs)
 }
 
 struct Cg<'ctx> {
@@ -146,6 +193,9 @@ impl<'ctx> Cg<'ctx> {
                 g.set_initializer(&init);
                 g.set_constant(true);
                 g.set_alignment(8);
+                // Same atom name → same symbol name in every object; the
+                // linker keeps exactly one, giving program-wide identity.
+                g.set_linkage(Linkage::LinkOnceODR);
                 atoms.insert(name.to_string(), g);
                 g
             }
@@ -165,18 +215,15 @@ impl<'ctx> Cg<'ctx> {
 
     // ---- module compilation ----
 
-    fn compile(&self, ast: &Module, entry: &FunName) -> CgResult<()> {
-        if entry.arity != 0 {
-            return Err(format!(
-                "entry function {}/{} must have arity 0",
-                entry.name, entry.arity
-            ));
-        }
-        let reachable = reachable_funs(ast, entry)?;
-
-        // Declare reachable functions first so any order of definition works.
+    fn compile(
+        &self,
+        ast: &Module,
+        include: &HashSet<FunName>,
+        entry: Option<&FunName>,
+    ) -> CgResult<()> {
+        // Declare included functions first so any order of definition works.
         for (fname, fun) in &ast.definitions {
-            if !reachable.contains(fname) {
+            if !include.contains(fname) {
                 continue;
             }
             let params: Vec<BasicMetadataTypeEnum> = (0..fun.params.len())
@@ -190,13 +237,16 @@ impl<'ctx> Cg<'ctx> {
         }
 
         for (fname, fun) in &ast.definitions {
-            if !reachable.contains(fname) {
+            if !include.contains(fname) {
                 continue;
             }
             self.compile_fn(fname, fun)?;
         }
 
-        self.emit_main(entry)
+        match entry {
+            Some(e) => self.emit_main(e),
+            None => Ok(()),
+        }
     }
 
     fn compile_fn(&self, fname: &FunName, fun: &Fun) -> CgResult<()> {
@@ -254,6 +304,20 @@ impl<'ctx> Cg<'ctx> {
                 args,
             } => {
                 let callee = self.local_fn(fname)?;
+                let argv = self.compile_args(f, args, env)?;
+                let call = self
+                    .builder
+                    .build_call(callee, &argv, "tail")
+                    .map_err(be)?;
+                call.set_tail_call(true);
+                let v = call_result(call)?;
+                self.builder.build_return(Some(&v)).map_err(be)?;
+                Ok(())
+            }
+            // cross-module call in tail position (erlang: goes through the
+            // BIF path in compile_value instead)
+            Expr::Call { module, name, args } if module != "erlang" => {
+                let callee = self.remote_fn(module, name, args.len());
                 let argv = self.compile_args(f, args, env)?;
                 let call = self
                     .builder
@@ -337,7 +401,18 @@ impl<'ctx> Cg<'ctx> {
                 Ok(call_result(call)?.into_int_value())
             }
             Expr::Apply { .. } => Err("apply of a fun value is not supported yet (closures)".into()),
-            Expr::Call { module, name, args } => self.compile_bif(f, module, name, args, env),
+            Expr::Call { module, name, args } => {
+                if module == "erlang" {
+                    self.compile_bif(f, name, args, env)
+                } else {
+                    // Reachability already verified the target module and
+                    // function exist among the compiled modules.
+                    let callee = self.remote_fn(module, name, args.len());
+                    let argv = self.compile_args(f, args, env)?;
+                    let call = self.builder.build_call(callee, &argv, "call").map_err(be)?;
+                    Ok(call_result(call)?.into_int_value())
+                }
+            }
             Expr::PrimOp { name, args } if is_raise(name) => {
                 self.compile_raise(f, name, args, env)?;
                 // continue in a dead block so callers can keep building
@@ -360,6 +435,7 @@ impl<'ctx> Cg<'ctx> {
             }
             Expr::Values(_) => Err("multi-value expression outside let/case".into()),
             Expr::Binary(_) => Err("bitstring construction is not supported yet".into()),
+            Expr::Map { .. } => Err("maps are not supported yet".into()),
             Expr::Fun(_) => Err("fun expressions (closures) are not supported yet".into()),
             Expr::LetRec { .. } => {
                 Err("letrec is not supported yet (list comprehensions)".into())
@@ -510,6 +586,7 @@ impl<'ctx> Cg<'ctx> {
             }
             Pattern::Lit(Literal::Float(_)) => Err("float patterns not supported yet".into()),
             Pattern::Binary(_) => Err("bitstring patterns are not supported yet".into()),
+            Pattern::Map(_) => Err("map patterns are not supported yet".into()),
             Pattern::Lit(l) => {
                 let expect = self.compile_literal(l)?;
                 let eq = self
@@ -600,19 +677,10 @@ impl<'ctx> Cg<'ctx> {
     fn compile_bif(
         &self,
         f: FunctionValue<'ctx>,
-        module: &str,
         name: &str,
         args: &[Expr],
         env: &mut Env<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
-        if module != "erlang" {
-            return Err(format!(
-                "unsupported remote call {}:{}/{}",
-                module,
-                name,
-                args.len()
-            ));
-        }
         let argv: Vec<IntValue<'ctx>> = args
             .iter()
             .map(|a| self.compile_value(f, a, env))
@@ -702,6 +770,25 @@ impl<'ctx> Cg<'ctx> {
             .get(fname)
             .copied()
             .ok_or_else(|| format!("undefined local function {}/{}", fname.name, fname.arity))
+    }
+
+    /// Get-or-declare the mangled symbol of a function in another module.
+    /// Reachability guarantees a definition exists in some other object.
+    fn remote_fn(&self, module: &str, name: &str, arity: usize) -> FunctionValue<'ctx> {
+        let sym = mangle(
+            module,
+            &FunName {
+                name: name.to_string(),
+                arity,
+            },
+        );
+        self.module.get_function(&sym).unwrap_or_else(|| {
+            let params: Vec<BasicMetadataTypeEnum> = (0..arity)
+                .map(|_| BasicMetadataTypeEnum::IntType(self.i64t))
+                .collect();
+            self.module
+                .add_function(&sym, self.i64t.fn_type(&params, false), None)
+        })
     }
 
     fn compile_args(
@@ -824,83 +911,153 @@ fn is_raise(primop: &str) -> bool {
     matches!(primop, "match_fail" | "raise" | "error" | "exit" | "throw")
 }
 
-/// Functions transitively reachable from `entry` via `apply` of local fnames.
-/// (Fun-value escapes don't exist yet — closures are unsupported.)
-fn reachable_funs(ast: &Module, entry: &FunName) -> CgResult<HashSet<FunName>> {
-    let defs: HashMap<&FunName, &Fun> = ast.definitions.iter().map(|(f, b)| (f, b)).collect();
-    if !defs.contains_key(entry) {
-        let known: Vec<String> = ast
-            .definitions
+enum Edge {
+    Local(FunName),
+    Remote(String, FunName),
+}
+
+/// Functions transitively reachable from `entry_mod:entry` across `apply`
+/// (local) and `call` (remote) edges. Calls to `erlang` are BIFs, resolved
+/// at codegen. (Fun-value escapes don't exist yet — closures unsupported.)
+fn reachable_funs(
+    mods: &[Module],
+    entry_mod: &str,
+    entry: &FunName,
+    poisoned: &HashMap<String, String>,
+) -> CgResult<HashSet<(String, FunName)>> {
+    let defs: HashMap<(&str, &FunName), &Fun> = mods
+        .iter()
+        .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
+        .collect();
+    let have_module: HashSet<&str> = mods.iter().map(|m| m.name.as_str()).collect();
+
+    if !defs.contains_key(&(entry_mod, entry)) {
+        if !have_module.contains(entry_mod) {
+            return Err(format!(
+                "entry module '{}' is not among the compiled modules ({})",
+                entry_mod,
+                have_module.iter().copied().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        let known: Vec<String> = mods
             .iter()
-            .map(|(f, _)| format!("{}/{}", f.name, f.arity))
-            .collect();
+            .find(|m| m.name == entry_mod)
+            .map(|m| {
+                m.definitions
+                    .iter()
+                    .map(|(f, _)| format!("{}/{}", f.name, f.arity))
+                    .collect()
+            })
+            .unwrap_or_default();
         return Err(format!(
             "entry function {}/{} is not defined in module '{}' (defined: {})",
             entry.name,
             entry.arity,
-            ast.name,
+            entry_mod,
             known.join(", ")
         ));
     }
-    let mut seen: HashSet<FunName> = HashSet::new();
-    let mut work = vec![entry.clone()];
-    while let Some(f) = work.pop() {
-        if !seen.insert(f.clone()) {
+
+    let mut seen: HashSet<(String, FunName)> = HashSet::new();
+    let mut work = vec![(entry_mod.to_string(), entry.clone())];
+    while let Some((module, fname)) = work.pop() {
+        if !seen.insert((module.clone(), fname.clone())) {
             continue;
         }
-        if let Some(fun) = defs.get(&f) {
-            let mut targets = Vec::new();
-            collect_applies(&fun.body, &mut targets);
-            work.extend(targets);
+        let fun = defs[&(module.as_str(), &fname)];
+        let mut edges = Vec::new();
+        collect_edges(&fun.body, &mut edges);
+        for edge in edges {
+            let (tmod, tfun) = match edge {
+                Edge::Local(f) => (module.clone(), f),
+                Edge::Remote(m, _) if m == "erlang" => continue, // BIF
+                Edge::Remote(m, f) => (m, f),
+            };
+            if defs.contains_key(&(tmod.as_str(), &tfun)) {
+                work.push((tmod, tfun));
+            } else if have_module.contains(tmod.as_str()) {
+                return Err(format!(
+                    "function {}:{}/{} (required by {}:{}/{}) is not defined",
+                    tmod, tfun.name, tfun.arity, module, fname.name, fname.arity
+                ));
+            } else if let Some(parse_err) = poisoned.get(&tmod) {
+                return Err(format!(
+                    "module '{}' (required by {}:{}/{}) failed to parse: {}",
+                    tmod, module, fname.name, fname.arity, parse_err
+                ));
+            } else {
+                return Err(format!(
+                    "module '{}' (required by {}:{}/{}) is not among the compiled \
+                     modules — the Erlang/Elixir standard library is not yet supported",
+                    tmod, module, fname.name, fname.arity
+                ));
+            }
         }
     }
     Ok(seen)
 }
 
-fn collect_applies(e: &Expr, out: &mut Vec<FunName>) {
+fn collect_edges(e: &Expr, out: &mut Vec<Edge>) {
     match e {
         Expr::Var(_) | Expr::Lit(_) => {}
         Expr::Tuple(items) | Expr::Values(items) => {
-            items.iter().for_each(|i| collect_applies(i, out))
+            items.iter().for_each(|i| collect_edges(i, out))
         }
         Expr::Cons(h, t) => {
-            collect_applies(h, out);
-            collect_applies(t, out);
+            collect_edges(h, out);
+            collect_edges(t, out);
         }
-        Expr::Fun(f) => collect_applies(&f.body, out),
+        Expr::Fun(f) => collect_edges(&f.body, out),
         Expr::Let { arg, body, .. } => {
-            collect_applies(arg, out);
-            collect_applies(body, out);
+            collect_edges(arg, out);
+            collect_edges(body, out);
         }
         Expr::LetRec { defs, body } => {
-            defs.iter().for_each(|(_, f)| collect_applies(&f.body, out));
-            collect_applies(body, out);
+            defs.iter().for_each(|(_, f)| collect_edges(&f.body, out));
+            collect_edges(body, out);
         }
         Expr::Apply { target, args } => {
             if let ApplyTarget::LocalFun(f) = target {
-                out.push(f.clone());
+                out.push(Edge::Local(f.clone()));
             }
-            args.iter().for_each(|a| collect_applies(a, out));
+            args.iter().for_each(|a| collect_edges(a, out));
         }
-        Expr::Call { args, .. } | Expr::PrimOp { args, .. } => {
-            args.iter().for_each(|a| collect_applies(a, out))
+        Expr::Call { module, name, args } => {
+            out.push(Edge::Remote(
+                module.clone(),
+                FunName {
+                    name: name.clone(),
+                    arity: args.len(),
+                },
+            ));
+            args.iter().for_each(|a| collect_edges(a, out));
         }
+        Expr::PrimOp { args, .. } => args.iter().for_each(|a| collect_edges(a, out)),
         Expr::Case { arg, clauses } => {
-            collect_applies(arg, out);
+            collect_edges(arg, out);
             for c in clauses {
-                collect_applies(&c.guard, out);
-                collect_applies(&c.body, out);
+                collect_edges(&c.guard, out);
+                collect_edges(&c.body, out);
             }
         }
         Expr::Binary(segs) => {
             for s in segs {
-                collect_applies(&s.value, out);
-                s.spec.iter().for_each(|x| collect_applies(x, out));
+                collect_edges(&s.value, out);
+                s.spec.iter().for_each(|x| collect_edges(x, out));
+            }
+        }
+        Expr::Map { pairs, update } => {
+            for (k, v) in pairs {
+                collect_edges(k, out);
+                collect_edges(v, out);
+            }
+            if let Some(u) = update {
+                collect_edges(u, out);
             }
         }
         Expr::Do(a, b) => {
-            collect_applies(a, out);
-            collect_applies(b, out);
+            collect_edges(a, out);
+            collect_edges(b, out);
         }
     }
 }
