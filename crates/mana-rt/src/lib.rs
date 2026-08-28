@@ -82,6 +82,11 @@ pub const KIND_FLOAT: u64 = 1;
 /// Fun object: `[header | code_ptr | captured terms...]`.
 /// Header: bits 0-7 kind, bits 8-15 arity, bits 16+ number of captures.
 pub const KIND_FUN: u64 = 2;
+/// Cons cell as a boxed object `[header | head | tail]` — every heap object
+/// carries a header so its size derives from a reference (MMTk requirement;
+/// measured ~zero time cost).
+pub const KIND_CONS: u64 = 3;
+pub const CONS_HEADER: u64 = (2 << 8) | KIND_CONS;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
@@ -121,6 +126,7 @@ fn payload_words(header: u64) -> usize {
         KIND_TUPLE => (header >> 8) as usize,
         KIND_FLOAT => 1,
         KIND_FUN => 1 + (header >> 16) as usize,
+        KIND_CONS => 2,
         _ => 0,
     }
 }
@@ -529,11 +535,7 @@ fn suspend_current(ctx: &mut ProcCtx) {
 // promotion: copy young parts of a term into the shared old space
 
 fn term_in_nursery(ctx: &ProcCtx, t: u64) -> bool {
-    match t & TAG_MASK {
-        TAG_CONS => in_my_nursery(ctx, t & !TAG_MASK),
-        TAG_BOXED if t != 0 => in_my_nursery(ctx, t),
-        _ => false,
-    }
+    t & TAG_MASK == TAG_BOXED && t != 0 && in_my_nursery(ctx, t)
 }
 
 /// Deep-copy every part of `t` living in this scheduler's nursery into the
@@ -552,13 +554,13 @@ fn promote_term(ctx: &mut ProcCtx, t: u64) -> u64 {
     while let Some(nt) = scan.pop() {
         unsafe {
             let (p, base, n) = match nt & TAG_MASK {
-                TAG_CONS => ((nt & !TAG_MASK) as *mut u64, 0usize, 2usize),
                 TAG_BOXED => {
                     let p = nt as *mut u64;
                     let header = *p;
                     match header & 0xff {
                         KIND_TUPLE => (p, 1, (header >> 8) as usize),
                         KIND_FUN => (p, 2, (header >> 16) as usize),
+                        KIND_CONS => (p, 1, 2),
                         _ => (p, 0, 0),
                     }
                 }
@@ -581,13 +583,6 @@ fn promote_copy(ctx: &ProcCtx, old: &mut OldSpace, t: u64) -> u64 {
     let g = ctx.global;
     unsafe {
         match t & TAG_MASK {
-            TAG_CONS => {
-                let p = (t & !TAG_MASK) as *const u64;
-                let new = old.alloc(2, &g.old_used);
-                *new = *p;
-                *new.add(1) = *p.add(1);
-                new as u64 | TAG_CONS
-            }
             TAG_BOXED => {
                 let p = t as *const u64;
                 let words = 1 + payload_words(*p);
@@ -903,9 +898,7 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
         }
 
         while let Some(t) = worklist.pop() {
-            let is_cons = t & TAG_MASK == TAG_CONS;
-            let p = (t & !TAG_MASK) as *mut u64;
-            scan_fields(p, is_cons, &mut |s| {
+            scan_fields(t as *mut u64, false, &mut |s| {
                 *s = forward_minor(ctx, &mut old, *s, &mut worklist);
             });
         }
@@ -928,13 +921,8 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
 
 /// Apply `f` to each term-field slot of the object at `p`.
 /// For cons cells pass `is_cons` (no header); boxed objects self-describe.
-unsafe fn scan_fields(p: *mut u64, is_cons: bool, f: &mut impl FnMut(*mut u64)) {
+unsafe fn scan_fields(p: *mut u64, _is_cons: bool, f: &mut impl FnMut(*mut u64)) {
     unsafe {
-        if is_cons {
-            f(p);
-            f(p.add(1));
-            return;
-        }
         let header = *p;
         match header & 0xff {
             KIND_TUPLE => {
@@ -946,6 +934,10 @@ unsafe fn scan_fields(p: *mut u64, is_cons: bool, f: &mut impl FnMut(*mut u64)) 
                 for i in 0..(header >> 16) as usize {
                     f(p.add(2 + i));
                 }
+            }
+            KIND_CONS => {
+                f(p.add(1));
+                f(p.add(2));
             }
             _ => {}
         }
@@ -964,23 +956,6 @@ unsafe fn forward_minor(
     match t & TAG_MASK {
         TAG_SMALL | TAG_ATOM | TAG_PID => t,
         _ if t == NIL => t,
-        TAG_CONS => unsafe {
-            let addr = t & !TAG_MASK;
-            if !in_my_nursery(ctx, addr) {
-                return t;
-            }
-            let p = addr as *mut u64;
-            if *p & TAG_MASK == TAG_FORWARD {
-                return (*p & !TAG_MASK) | TAG_CONS;
-            }
-            let new = old.alloc(2, &ctx.global.old_used);
-            *new = *p;
-            *new.add(1) = *p.add(1);
-            *p = new as u64 | TAG_FORWARD;
-            let nt = new as u64 | TAG_CONS;
-            worklist.push(nt);
-            nt
-        },
         TAG_BOXED => unsafe {
             if !in_my_nursery(ctx, t) {
                 return t;
@@ -1079,6 +1054,11 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
     let mut top = to_space;
     let mut worklist: Vec<u64> = Vec::new();
 
+    // pids currently swapped into a scheduler: their LIVE state is in the
+    // ctx (walked below); their saved_* fields are stale from the last
+    // yield and must not be scanned.
+    let mut running: Vec<usize> = Vec::new();
+
     unsafe {
         for id in 0..g.n_scheds {
             let octx = g.scheds[id].ctx_addr.load(Ordering::Acquire) as *mut ProcCtx;
@@ -1086,6 +1066,9 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
                 continue;
             }
             let octx = &mut *octx;
+            if octx.current != usize::MAX {
+                running.push(octx.current);
+            }
             let mut frame = octx.roots_head as *mut u64;
             while !frame.is_null() {
                 let len = *frame.add(1) as usize;
@@ -1100,12 +1083,14 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
         }
         {
             let tab = g.procs.read();
-            for slot in tab.iter() {
+            for (id, slot) in tab.iter().enumerate() {
                 let Some(cell) = slot else { continue };
                 let p = proc_mut(cell);
-                walk_proc_roots(p, |s| {
-                    *s = forward_major(*s, &mut top, &mut worklist);
-                });
+                if !running.contains(&id) {
+                    walk_proc_roots(p, |s| {
+                        *s = forward_major(*s, &mut top, &mut worklist);
+                    });
+                }
                 drain_ingress(p); // everyone is parked: no concurrent pushes
                 for m in p.private.iter_mut() {
                     *m = forward_major(*m, &mut top, &mut worklist);
@@ -1121,9 +1106,7 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
             }
         }
         while let Some(t) = worklist.pop() {
-            let is_cons = t & TAG_MASK == TAG_CONS;
-            let p = (t & !TAG_MASK) as *mut u64;
-            scan_fields(p, is_cons, &mut |s| {
+            scan_fields(t as *mut u64, false, &mut |s| {
                 *s = forward_major(*s, &mut top, &mut worklist);
             });
         }
@@ -1159,20 +1142,6 @@ unsafe fn forward_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) -> 
     match t & TAG_MASK {
         TAG_SMALL | TAG_ATOM | TAG_PID => t,
         _ if t == NIL => t,
-        TAG_CONS => unsafe {
-            let p = (t & !TAG_MASK) as *mut u64;
-            if *p & TAG_MASK == TAG_FORWARD {
-                return (*p & !TAG_MASK) | TAG_CONS;
-            }
-            let new = *top;
-            *new = *p;
-            *new.add(1) = *p.add(1);
-            *top = top.add(2);
-            *p = new as u64 | TAG_FORWARD;
-            let nt = new as u64 | TAG_CONS;
-            worklist.push(nt);
-            nt
-        },
         TAG_BOXED => unsafe {
             let p = t as *mut u64;
             if *p & TAG_MASK == TAG_FORWARD {
@@ -1233,28 +1202,6 @@ fn write_term(t: u64, out: &mut String) {
         TAG_PID => {
             out.push_str(&format!("<0.{}.0>", t >> 3));
         }
-        TAG_CONS => {
-            out.push('[');
-            let mut cur = t;
-            loop {
-                unsafe {
-                    let p = (cur & !TAG_MASK) as *const u64;
-                    write_term(*p, out);
-                    let tail = *p.add(1);
-                    if tail == NIL {
-                        break;
-                    } else if tail & TAG_MASK == TAG_CONS {
-                        out.push(',');
-                        cur = tail;
-                    } else {
-                        out.push('|');
-                        write_term(tail, out);
-                        break;
-                    }
-                }
-            }
-            out.push(']');
-        }
         TAG_BOXED => unsafe {
             let p = t as *const u64;
             let header = *p;
@@ -1275,6 +1222,28 @@ fn write_term(t: u64, out: &mut String) {
                     out.push_str(&format!("{:?}", f));
                 }
                 KIND_FUN => out.push_str("#Fun<mana>"),
+                KIND_CONS => {
+                    out.push('[');
+                    let mut q = p;
+                    loop {
+                        write_term(*q.add(1), out);
+                        let tail = *q.add(2);
+                        if tail == NIL {
+                            break;
+                        } else if tail & TAG_MASK == TAG_BOXED
+                            && tail != 0
+                            && *(tail as *const u64) & 0xff == KIND_CONS
+                        {
+                            out.push(',');
+                            q = tail as *const u64;
+                        } else {
+                            out.push('|');
+                            write_term(tail, out);
+                            break;
+                        }
+                    }
+                    out.push(']');
+                }
                 _ => out.push_str("#<unknown-boxed>"),
             }
         },
