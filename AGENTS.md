@@ -145,6 +145,17 @@ When asked to open a PR:
   name is derived from the atom text — the linker keeps one per name. Do
   not merge everything into a single LLVM module, change atom linkage, or
   make atom symbol names non-deterministic.
+- **Processes: shared heap, zero-copy messages, single scheduler.** All
+  processes share one heap (safe: terms are immutable) — `!` just pushes
+  the term into the target mailbox, no copying. Each process is a
+  corosensei coroutine; the scheduler swaps the per-process ctx fields
+  (roots_head, exc, reductions — word 5 is the reduction counter contract)
+  while heap words 0/1 stay put. **Yield points are a subset of GC points**:
+  reduction checks only at framed-function entries after params are rooted
+  — preemption must never be added anywhere a live term sits in an SSA
+  register. GC walks every process (saved frame chains, mailboxes, pending
+  spawn closures, exc slots). Known limits: CPU-bound frameless loops don't
+  preempt; stacks are fixed (root 32MB, spawned 1MB — TODO(stacks)).
 - **Exceptions unwind by sentinel, not EH tables.** A raise stores class/
   reason into ctx words 3/4 and returns the reserved word `0b101` (tag 101 —
   never a valid term); calls to may-raise functions (a whole-program

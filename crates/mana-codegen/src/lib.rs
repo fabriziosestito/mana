@@ -74,6 +74,7 @@ const KIND_FUN: u64 = 2;
 const CTX_ROOTS: u64 = 2;
 const CTX_EXC_CLASS: u64 = 3;
 const CTX_EXC_REASON: u64 = 4;
+const CTX_REDUCTIONS: u64 = 5;
 /// Reserved non-term word (tag 0b101): "an exception is unwinding".
 const EXC_SENTINEL: u64 = 0b101;
 
@@ -321,6 +322,70 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 &[
                     BasicMetadataTypeEnum::PointerType(self.ptrt),
                     BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        })
+    }
+
+    fn rt_p_i64(&self, name: &str) -> FunctionValue<'ctx> {
+        self.rt_fn(name, || {
+            self.i64t
+                .fn_type(&[BasicMetadataTypeEnum::PointerType(self.ptrt)], false)
+        })
+    }
+
+    fn rt_p_void(&self, name: &str) -> FunctionValue<'ctx> {
+        self.rt_fn(name, || {
+            self.ctx
+                .void_type()
+                .fn_type(&[BasicMetadataTypeEnum::PointerType(self.ptrt)], false)
+        })
+    }
+
+    fn rt_run(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_run", || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                ],
+                false,
+            )
+        })
+    }
+
+    fn rt_spawn(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_spawn", || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        })
+    }
+
+    fn rt_send(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_send", || {
+            self.ctx.void_type().fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        })
+    }
+
+    fn rt_recv_wait(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_recv_wait", || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
                     BasicMetadataTypeEnum::IntType(self.i64t),
                 ],
                 false,
@@ -668,7 +733,46 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             v.set_name(p);
             self.bind_var(&mut scope, p, v)?;
         }
+        self.emit_reduction_check(f)?;
         self.compile_tail(f, &fun.body, &mut scope)
+    }
+
+    /// Preemption point: decrement the reduction budget, yield to the
+    /// scheduler on exhaustion. Only in framed functions AFTER params are
+    /// rooted — yield points are GC points, and everything live is already
+    /// in frame slots here, so preemption costs no extra spills.
+    fn emit_reduction_check(&self, f: FunctionValue<'ctx>) -> CgResult<()> {
+        if !self.framed() {
+            return Ok(());
+        }
+        let ctx = self.ctx_val();
+        let red = self.mem_load(ctx, CTX_REDUCTIONS, MemKind::Ctx)?;
+        let dec = self
+            .builder
+            .build_int_sub(red, self.i64t.const_int(1, false), "red.dec")
+            .map_err(be)?;
+        self.mem_store(ctx, CTX_REDUCTIONS, dec, MemKind::Ctx)?;
+        let out = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SLT,
+                dec,
+                self.i64t.const_zero(),
+                "red.out",
+            )
+            .map_err(be)?;
+        let yield_bb = self.ctx.append_basic_block(f, "yield");
+        let cont = self.ctx.append_basic_block(f, "red.cont");
+        self.builder
+            .build_conditional_branch(out, yield_bb, cont)
+            .map_err(be)?;
+        self.builder.position_at_end(yield_bb);
+        self.builder
+            .build_call(self.rt_p_void("mana_rt_yield"), &[ctx.into()], "")
+            .map_err(be)?;
+        self.builder.build_unconditional_branch(cont).map_err(be)?;
+        self.builder.position_at_end(cont);
+        Ok(())
     }
 
     /// Compile bodies of lambda-lifted funs queued during compilation.
@@ -731,6 +835,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     scope.funs.insert(fname.clone(), (sib, cl_slot));
                 }
             }
+            self.emit_reduction_check(f)?;
             self.compile_tail(f, &l.body, &mut scope)?;
         }
         Ok(())
@@ -749,9 +854,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
         let ctx = call_result(init)?.into_pointer_value();
         let target = self.fns.borrow()[entry];
+        let entry_ptr = target.as_global_value().as_pointer_value();
         let call = self
             .builder
-            .build_call(target, &[ctx.into()], "ret")
+            .build_call(self.rt_run(), &[ctx.into(), entry_ptr.into()], "ret")
             .map_err(be)?;
         let ret = call_result(call)?.into_int_value();
         let is_exc = self
@@ -1008,6 +1114,54 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Expr::PrimOp { name, args } if is_raise(name) => {
                 self.compile_raise(f, name, args, scope)?;
                 Ok(self.i64t.get_undef())
+            }
+            Expr::PrimOp { name, args } if name == "remove_message" && args.is_empty() => {
+                self.builder
+                    .build_call(
+                        self.rt_p_void("mana_rt_recv_remove"),
+                        &[self.ctx_val().into()],
+                        "",
+                    )
+                    .map_err(be)?;
+                Ok(self.nil())
+            }
+            Expr::PrimOp { name, args } if name == "recv_next" && args.is_empty() => {
+                self.builder
+                    .build_call(
+                        self.rt_p_void("mana_rt_recv_next"),
+                        &[self.ctx_val().into()],
+                        "",
+                    )
+                    .map_err(be)?;
+                Ok(self.nil())
+            }
+            Expr::PrimOp { name, args } if name == "recv_wait_timeout" && args.len() == 1 => {
+                let t = self.compile_value(f, &args[0], scope)?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_recv_wait(),
+                        &[self.ctx_val().into(), t.into()],
+                        "recv.wait",
+                    )
+                    .map_err(be)?;
+                let timed_out = call_result(call)?.into_int_value();
+                let c = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        timed_out,
+                        self.i64t.const_int(1, false),
+                        "timedout",
+                    )
+                    .map_err(be)?;
+                let tr = self.atom_term("true")?;
+                let fa = self.atom_term("false")?;
+                Ok(self
+                    .builder
+                    .build_select(c, tr, fa, "waited")
+                    .map_err(be)?
+                    .into_int_value())
             }
             Expr::PrimOp { name, .. } => Err(format!("unsupported primop {}", name)),
             Expr::Case { arg, clauses } => {
@@ -1450,6 +1604,47 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = self.compile_value(f, arg, scope)?;
                 self.bind_var(scope, &vars[0], v)
             }
+            (2, Expr::PrimOp { name, args })
+                if name == "recv_peek_message" && args.is_empty() =>
+            {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_p_i64("mana_rt_recv_ready"),
+                        &[self.ctx_val().into()],
+                        "recv.ready",
+                    )
+                    .map_err(be)?;
+                let ready = call_result(call)?.into_int_value();
+                let c = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        ready,
+                        self.i64t.const_int(1, false),
+                        "has.msg",
+                    )
+                    .map_err(be)?;
+                let tr = self.atom_term("true")?;
+                let fa = self.atom_term("false")?;
+                let flag = self
+                    .builder
+                    .build_select(c, tr, fa, "ready")
+                    .map_err(be)?
+                    .into_int_value();
+                self.bind_var(scope, &vars[0], flag)?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_p_i64("mana_rt_recv_peek"),
+                        &[self.ctx_val().into()],
+                        "recv.msg",
+                    )
+                    .map_err(be)?;
+                let msg = call_result(call)?.into_int_value();
+                self.bind_var(scope, &vars[1], msg)?;
+                Ok(())
+            }
             (_, Expr::Values(es)) if es.len() == vars.len() => {
                 for (var, e) in vars.iter().zip(es) {
                     let v = self.compile_value(f, e, scope)?;
@@ -1740,6 +1935,54 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .build_select(c, t, fa, "bool")
                     .map_err(be)?
                     .into_int_value())
+            }
+            ("self", 0) => {
+                let call = self
+                    .builder
+                    .build_call(self.rt_p_i64("mana_rt_self"), &[self.ctx_val().into()], "self")
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("spawn", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_spawn(),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "spawn",
+                    )
+                    .map_err(be)?;
+                let pid = call_result(call)?.into_int_value();
+                // 0 = not an arity-0 fun
+                let bad = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, pid, self.i64t.const_zero(), "spawn.bad")
+                    .map_err(be)?;
+                let bad_bb = self.ctx.append_basic_block(f, "spawn.badarg");
+                let ok_bb = self.ctx.append_basic_block(f, "spawn.ok");
+                self.builder
+                    .build_conditional_branch(bad, bad_bb, ok_bb)
+                    .map_err(be)?;
+                self.builder.position_at_end(bad_bb);
+                let class = self.atom_term("error")?;
+                let reason = self.atom_term("badarg")?;
+                let ctx = self.ctx_val();
+                self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
+                self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
+                let target = self.unwind_target(f)?;
+                self.builder.build_unconditional_branch(target).map_err(be)?;
+                self.builder.position_at_end(ok_bb);
+                Ok(pid)
+            }
+            ("!", 2) | ("send", 2) => {
+                self.builder
+                    .build_call(
+                        self.rt_send(),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "",
+                    )
+                    .map_err(be)?;
+                Ok(argv[1])
             }
             ("display", 1) => {
                 self.builder
@@ -2164,7 +2407,7 @@ fn expr_may_raise(
             let callee = if module == "erlang" {
                 matches!(
                     (name.as_str(), args.len()),
-                    ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1)
+                    ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1) | ("spawn", 1)
                 )
             } else {
                 raise_set.contains(&(
@@ -2258,6 +2501,9 @@ fn expr_may_gc(
         Expr::PrimOp { name, args } if is_raise(name) => args
             .iter()
             .any(|a| raise_arg_may_gc(a, cur_mod, gc_set, letrec_bound)),
+        // recv_wait_timeout suspends the process — other processes run and
+        // may collect the shared heap, so it is a GC point
+        Expr::PrimOp { name, .. } if name == "recv_wait_timeout" => true,
         Expr::PrimOp { args, .. } => args
             .iter()
             .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound)),
