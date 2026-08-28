@@ -65,19 +65,30 @@ impl ObjectModel<Mana> for ManaObjectModel {
     const OBJECT_REF_OFFSET_LOWER_BOUND: isize = 0;
 
     fn copy(
-        _from: ObjectReference,
-        _semantics: CopySemantics,
-        _copy_context: &mut GCWorkerCopyContext<Mana>,
+        from: ObjectReference,
+        semantics: CopySemantics,
+        copy_context: &mut GCWorkerCopyContext<Mana>,
     ) -> ObjectReference {
-        todo!("copying plans — after NoGC milestone")
+        let bytes = Self::get_current_size(from);
+        let dst = copy_context.alloc_copy(from, bytes, 8, 0, semantics);
+        unsafe {
+            std::ptr::copy_nonoverlapping::<u8>(
+                from.to_raw_address().to_ptr(),
+                dst.to_mut_ptr(),
+                bytes,
+            );
+        }
+        let to_obj = unsafe { ObjectReference::from_raw_address_unchecked(dst) };
+        copy_context.post_copy(to_obj, bytes, semantics);
+        to_obj
     }
 
     fn copy_to(_from: ObjectReference, _to: ObjectReference, _region: Address) -> Address {
-        todo!("copying plans — after NoGC milestone")
+        unimplemented!("compacting plans are not used")
     }
 
-    fn get_reference_when_copied_to(_from: ObjectReference, _to: Address) -> ObjectReference {
-        todo!("copying plans — after NoGC milestone")
+    fn get_reference_when_copied_to(_from: ObjectReference, to: Address) -> ObjectReference {
+        unsafe { ObjectReference::from_raw_address_unchecked(to) }
     }
 
     fn get_current_size(object: ObjectReference) -> usize {
@@ -149,9 +160,31 @@ impl Scanning<Mana> for ManaScanning {
     fn scan_roots_in_mutator_thread(
         _tls: VMWorkerThread,
         _mutator: &'static mut Mutator<Mana>,
-        _factory: impl RootsWorkFactory<mmtk::vm::slot::SimpleSlot>,
+        mut factory: impl RootsWorkFactory<mmtk::vm::slot::SimpleSlot>,
     ) {
-        todo!("walk ProcCtx frame chain")
+        // Walk the ProcCtx frame chain: [prev, len, slots...]. A slot holds
+        // a heap reference iff non-zero with tag 000 (headered cons made
+        // every heap ref a plain address).
+        let ctx = CTX_PTR.load(std::sync::atomic::Ordering::Acquire);
+        assert!(!ctx.is_null(), "ProcCtx not registered");
+        let mut slots = Vec::new();
+        unsafe {
+            let mut frame = (*ctx).roots_head as *mut u64;
+            while !frame.is_null() {
+                let len = *frame.add(1) as usize;
+                for i in 0..len {
+                    let slot = frame.add(2 + i);
+                    let t = *slot;
+                    if t != 0 && t & 0b111 == 0 {
+                        slots.push(mmtk::vm::slot::SimpleSlot::from_address(
+                            Address::from_mut_ptr(slot),
+                        ));
+                    }
+                }
+                frame = *frame as *mut u64;
+            }
+        }
+        factory.create_process_roots_work(slots);
     }
 
     fn scan_vm_specific_roots(
@@ -170,25 +203,46 @@ impl Scanning<Mana> for ManaScanning {
 pub struct ManaCollection;
 
 impl Collection<Mana> for ManaCollection {
-    fn stop_all_mutators<F>(_tls: VMWorkerThread, _mutator_visitor: F)
+    fn stop_all_mutators<F>(_tls: VMWorkerThread, mut mutator_visitor: F)
     where
         F: FnMut(&'static mut Mutator<Mana>),
     {
-        todo!("single-mutator stop-the-world")
+        let mut s = GC_SYNC.lock().unwrap();
+        while !s.parked {
+            s = GC_CONDVAR.wait(s).unwrap();
+        }
+        drop(s);
+        mutator_visitor(the_mutator());
     }
 
     fn resume_mutators(_tls: VMWorkerThread) {
-        todo!("single-mutator stop-the-world")
+        let mut s = GC_SYNC.lock().unwrap();
+        s.epoch += 1;
+        GC_CONDVAR.notify_all();
     }
 
     fn block_for_gc(_tls: VMMutatorThread) {
-        todo!("single-mutator stop-the-world")
+        let mut s = GC_SYNC.lock().unwrap();
+        s.parked = true;
+        GC_CONDVAR.notify_all();
+        let epoch = s.epoch;
+        while s.epoch == epoch {
+            s = GC_CONDVAR.wait(s).unwrap();
+        }
+        s.parked = false;
     }
 
     fn spawn_gc_thread(_tls: VMThread, ctx: GCThreadContext<Mana>) {
+        // Every worker needs a unique, non-null TLS opaque pointer.
+        static WORKER_ID: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(1);
+        let id = WORKER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::thread::spawn(move || match ctx {
             GCThreadContext::Worker(w) => {
-                mmtk::memory_manager::start_worker(mmtk_instance(), VMWorkerThread(VMThread::UNINITIALIZED), w)
+                let tls = VMWorkerThread(VMThread(OpaquePointer::from_address(unsafe {
+                    Address::from_usize(id << 4)
+                })));
+                mmtk::memory_manager::start_worker(mmtk_instance(), tls, w)
             }
         });
     }
@@ -201,18 +255,18 @@ impl ActivePlan<Mana> for ManaActivePlan {
         1
     }
 
-    fn is_mutator(_tls: VMThread) -> bool {
-        true
+    fn is_mutator(tls: VMThread) -> bool {
+        // only the single mutator thread (TLS 0x8) — GC workers must not be
+        // mistaken for mutators or MMTk's pause protocol breaks
+        tls.0.to_address().as_usize() == 0x8
     }
 
     fn mutator(_tls: VMMutatorThread) -> &'static mut Mutator<Mana> {
-        unsafe { &mut *MUTATOR.with(|m| *m.borrow()) }
+        the_mutator()
     }
 
     fn mutators<'a>() -> Box<dyn Iterator<Item = &'a mut Mutator<Mana>> + 'a> {
-        Box::new(std::iter::once(unsafe {
-            &mut *MUTATOR.with(|m| *m.borrow())
-        }))
+        Box::new(std::iter::once(the_mutator()))
     }
 }
 
@@ -236,17 +290,36 @@ impl ReferenceGlue<Mana> for ManaReferenceGlue {
     fn enqueue_references(_references: &[ObjectReference], _tls: VMWorkerThread) {}
 }
 
-// ---- runtime surface (same extern C API as mana-rt) ----
+// ---- global single-mutator state (GC workers access from other threads) ----
 
 static MMTK_SINGLETON: OnceLock<MMTK<Mana>> = OnceLock::new();
+static MUTATOR_PTR: std::sync::atomic::AtomicPtr<Mutator<Mana>> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static CTX_PTR: std::sync::atomic::AtomicPtr<ProcCtx> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-thread_local! {
-    static MUTATOR: std::cell::RefCell<*mut Mutator<Mana>> =
-        const { std::cell::RefCell::new(std::ptr::null_mut()) };
+/// Single-mutator stop-the-world with a proper handshake: the mutator
+/// parks in `block_for_gc` and workers wait for it in `stop_all_mutators`
+/// (otherwise a fast GC could resume before the mutator ever parked and
+/// the wakeup would be lost). `epoch` guards against spurious wakeups.
+struct GcSync {
+    parked: bool,
+    epoch: u64,
 }
+static GC_SYNC: std::sync::Mutex<GcSync> = std::sync::Mutex::new(GcSync {
+    parked: false,
+    epoch: 0,
+});
+static GC_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
 
 fn mmtk_instance() -> &'static MMTK<Mana> {
     MMTK_SINGLETON.get().expect("mmtk not initialized")
+}
+
+fn the_mutator() -> &'static mut Mutator<Mana> {
+    let p = MUTATOR_PTR.load(std::sync::atomic::Ordering::Acquire);
+    assert!(!p.is_null(), "mutator not bound");
+    unsafe { &mut *p }
 }
 
 /// ProcCtx mirror of mana-rt's contract: words 0/1 are made permanently
@@ -263,24 +336,37 @@ pub struct ProcCtx {
 #[no_mangle]
 pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
     let mut builder = MMTKBuilder::new();
-    // Spike milestone 1: NoGC plan with a large fixed heap — allocation
-    // through MMTk end-to-end, collection never triggers.
-    builder.options.plan.set(mmtk::util::options::PlanSelector::NoGC);
+    // SemiSpace: real moving collection through MMTk. Plan/heap tunable via
+    // env for the spike: MANA_MMTK_PLAN, MANA_MMTK_HEAP_MB.
+    let plan = std::env::var("MANA_MMTK_PLAN").unwrap_or_else(|_| "SemiSpace".into());
+    builder
+        .options
+        .plan
+        .set(plan.parse().unwrap_or(mmtk::util::options::PlanSelector::SemiSpace));
+    let heap_mb: usize = std::env::var("MANA_MMTK_HEAP_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
     builder.options.gc_trigger.set(
-        mmtk::util::options::GCTriggerSelector::FixedHeapSize(2 << 30),
+        mmtk::util::options::GCTriggerSelector::FixedHeapSize(heap_mb << 20),
     );
     let mmtk = MMTK_SINGLETON.get_or_init(|| builder.build());
-    let tls = VMMutatorThread(VMThread::UNINITIALIZED);
+    // the mutator TLS must also be a valid non-null opaque pointer
+    let tls = VMMutatorThread(VMThread(OpaquePointer::from_address(unsafe {
+        Address::from_usize(0x8)
+    })));
     mmtk::memory_manager::initialize_collection(mmtk, VMThread::UNINITIALIZED);
     let mutator = mmtk::memory_manager::bind_mutator(mmtk, tls);
     let mutator = Box::into_raw(mutator);
-    MUTATOR.with(|m| *m.borrow_mut() = mutator);
-    Box::into_raw(Box::new(ProcCtx {
+    MUTATOR_PTR.store(mutator, std::sync::atomic::Ordering::Release);
+    let ctx = Box::into_raw(Box::new(ProcCtx {
         heap_top: 8, // top > end: force slow path
         heap_end: 0,
         roots_head: 0,
         mutator,
-    }))
+    }));
+    CTX_PTR.store(ctx, std::sync::atomic::Ordering::Release);
+    ctx
 }
 
 #[no_mangle]
