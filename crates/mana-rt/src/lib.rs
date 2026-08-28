@@ -82,11 +82,17 @@ pub struct ProcCtx {
     pub heap_top: *mut u64, // word offset 0 — codegen contract (nursery)
     pub heap_end: *mut u64, // word offset 1 — codegen contract (nursery)
     pub roots_head: u64,    // word offset 2 — codegen contract
+    pub exc_class: u64,     // word offset 3 — codegen contract (atom term)
+    pub exc_reason: u64,    // word offset 4 — codegen contract
     nursery_start: *mut u64,
     nursery_words: usize,
     old: Vec<Chunk>,
     old_used: usize,
     old_limit: usize,
+    /// Raise-path allocations: never freed or moved, but their fields may
+    /// reference heap terms, so collections scan them like roots.
+    /// (ptr, is_cons) — cons cells have no header to derive layout from.
+    eternal: Vec<(*mut u64, bool)>,
 }
 
 fn alloc_space(words: usize) -> *mut u64 {
@@ -112,11 +118,14 @@ pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
         heap_top: nursery,
         heap_end: unsafe { nursery.add(NURSERY_WORDS) },
         roots_head: 0,
+        exc_class: 0,
+        exc_reason: 0,
         nursery_start: nursery,
         nursery_words: NURSERY_WORDS,
         old: Vec::new(),
         old_used: 0,
         old_limit: OLD_LIMIT_INIT,
+        eternal: Vec::new(),
     }))
 }
 
@@ -158,11 +167,16 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
 }
 
 /// Allocation for raise-path terms (exception reasons): plain malloc,
-/// never collected — the process is about to die, and this keeps abort
-/// paths from turning every multi-clause function into a GC-framed one.
+/// never moved — keeps abort paths from turning every multi-clause
+/// function into a GC-framed one. Registered so collections can scan the
+/// fields (a caught reason may reference heap terms). `is_cons` != 0 marks
+/// a headerless cons cell. Leaks by design (TODO: free on catch).
 #[no_mangle]
-pub extern "C" fn mana_rt_alloc_eternal(words: u64) -> *mut u64 {
-    alloc_space(words as usize)
+pub extern "C" fn mana_rt_alloc_eternal(ctx: *mut ProcCtx, words: u64, is_cons: u64) -> *mut u64 {
+    let ctx = unsafe { &mut *ctx };
+    let p = alloc_space(words as usize);
+    ctx.eternal.push((p, is_cons != 0));
+    p
 }
 
 fn old_alloc(ctx: &mut ProcCtx, words: usize) -> *mut u64 {
@@ -214,6 +228,11 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
             }
             frame = *frame as *mut u64;
         }
+        let eternal = std::mem::take(&mut ctx.eternal);
+        for (p, is_cons) in &eternal {
+            scan_eternal(ctx, *p, *is_cons, &mut worklist, true, &mut std::ptr::null_mut());
+        }
+        ctx.eternal = eternal;
         while let Some(t) = worklist.pop() {
             scan_minor(ctx, t, &mut worklist);
         }
@@ -330,6 +349,11 @@ fn major_collect(ctx: &mut ProcCtx) {
             }
             frame = *frame as *mut u64;
         }
+        let eternal = std::mem::take(&mut ctx.eternal);
+        for (p, is_cons) in &eternal {
+            scan_eternal(ctx, *p, *is_cons, &mut worklist, false, &mut top);
+        }
+        ctx.eternal = eternal;
         while let Some(t) = worklist.pop() {
             scan_major(t, &mut top, &mut worklist);
         }
@@ -447,24 +471,59 @@ pub extern "C" fn mana_rt_display(term: u64) {
     let _ = std::io::stdout().write_all(out.as_bytes());
 }
 
-/// A pattern match failed and no clause handled it. Exceptions proper are a
-/// later milestone; for now this terminates the program.
+/// An exception unwound past the entry function (uncaught).
 #[no_mangle]
-pub extern "C" fn mana_rt_match_fail(reason: u64) -> ! {
-    let mut out = String::new();
-    write_term(reason, &mut out);
-    eprintln!("mana: no matching clause / exception: {}", out);
+pub extern "C" fn mana_rt_uncaught(ctx: *mut ProcCtx) -> ! {
+    let ctx = unsafe { &*ctx };
+    let mut class = String::new();
+    let mut reason = String::new();
+    write_term(ctx.exc_class, &mut class);
+    write_term(ctx.exc_reason, &mut reason);
+    eprintln!("** exception {}: {}", class, reason);
     std::process::exit(1);
 }
 
-/// A fun was applied to the wrong number of arguments, or a non-fun value
-/// was applied.
-#[no_mangle]
-pub extern "C" fn mana_rt_badfun(term: u64) -> ! {
-    let mut out = String::new();
-    write_term(term, &mut out);
-    eprintln!("mana: bad fun application: {}", out);
-    std::process::exit(1);
+/// Forward the term fields of one eternal object (minor or major mode).
+/// The object itself never moves.
+unsafe fn scan_eternal(
+    ctx: &mut ProcCtx,
+    p: *mut u64,
+    is_cons: bool,
+    worklist: &mut Vec<u64>,
+    minor: bool,
+    major_top: &mut *mut u64,
+) {
+    unsafe {
+        macro_rules! fwd {
+            ($slot:expr) => {{
+                let s = $slot;
+                if minor {
+                    *s = forward_minor(ctx, *s, worklist);
+                } else {
+                    *s = forward_major(*s, major_top, worklist);
+                }
+            }};
+        }
+        if is_cons {
+            fwd!(p);
+            fwd!(p.add(1));
+            return;
+        }
+        let header = *p;
+        match header & 0xff {
+            KIND_TUPLE => {
+                for i in 0..(header >> 8) as usize {
+                    fwd!(p.add(1 + i));
+                }
+            }
+            KIND_FUN => {
+                for i in 0..(header >> 16) as usize {
+                    fwd!(p.add(2 + i));
+                }
+            }
+            _ => {} // float: no term fields
+        }
+    }
 }
 
 fn write_term(t: u64, out: &mut String) {

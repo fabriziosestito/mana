@@ -145,6 +145,15 @@ When asked to open a PR:
   name is derived from the atom text — the linker keeps one per name. Do
   not merge everything into a single LLVM module, change atom linkage, or
   make atom symbol names non-deterministic.
+- **Exceptions unwind by sentinel, not EH tables.** A raise stores class/
+  reason into ctx words 3/4 and returns the reserved word `0b101` (tag 101 —
+  never a valid term); calls to may-raise functions (a whole-program
+  fixpoint, like may-GC) check it and branch to the enclosing `try` handler
+  or propagate. Tail calls propagate for free via the return value. Reason
+  terms are built with `mana_rt_alloc_eternal` (never moved; the GC scans
+  their fields via a registry). Stacktraces don't exist yet — the catch
+  "stacktrace" variable carries the class atom so re-raises keep their
+  class (TODO(stacktraces)).
 - **No dynamic atoms.** Atoms exist only as compile-time statics;
   `list_to_atom` and friends are unsupported until a runtime atom table
   exists.

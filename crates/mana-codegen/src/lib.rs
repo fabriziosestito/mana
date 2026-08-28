@@ -70,8 +70,12 @@ const KIND_TUPLE: u64 = 0;
 const KIND_FLOAT: u64 = 1;
 const KIND_FUN: u64 = 2;
 
-/// ctx word offset of `roots_head` (ProcCtx contract).
+/// ctx word offsets (ProcCtx contract).
 const CTX_ROOTS: u64 = 2;
+const CTX_EXC_CLASS: u64 = 3;
+const CTX_EXC_REASON: u64 = 4;
+/// Reserved non-term word (tag 0b101): "an exception is unwinding".
+const EXC_SENTINEL: u64 = 0b101;
 
 type CgResult<T> = Result<T, String>;
 type GcSet = HashSet<(String, FunName)>;
@@ -138,6 +142,7 @@ pub fn compile_program(
     }
     let reachable = reachable_funs(mods, entry_mod, entry, poisoned)?;
     let gc_set = compute_may_gc(mods, &reachable);
+    let raise_set = compute_may_raise(mods, &reachable);
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("creating {}: {}", out_dir.display(), e))?;
@@ -152,7 +157,7 @@ pub fn compile_program(
             continue;
         }
         let context = Context::create();
-        let cg = Cg::new(&context, &m.name, &gc_set);
+        let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
         let entry_here = (m.name == entry_mod).then_some(entry);
         cg.compile(m, &include, entry_here)?;
         if dump_ir {
@@ -181,6 +186,7 @@ struct Cg<'ctx, 'p> {
     lift_counter: Cell<u32>,
     module_name: String,
     gc_set: &'p GcSet,
+    raise_set: &'p GcSet,
     // TBAA: ctx words / frame slots / heap objects never alias
     tbaa_kind: u32,
     tbaa_ctx: inkwell::values::MetadataValue<'ctx>,
@@ -191,13 +197,22 @@ struct Cg<'ctx, 'p> {
     cur_frame: Cell<Option<PointerValue<'ctx>>>,
     /// raise-path compilation: allocations go to the eternal allocator
     eternal_alloc: Cell<bool>,
+    /// innermost enclosing try handler blocks (current function)
+    handlers: RefCell<Vec<BasicBlock<'ctx>>>,
+    /// lazily created per-function "pop frame; return sentinel" block
+    propagate_bb: Cell<Option<BasicBlock<'ctx>>>,
     var_slots: RefCell<HashMap<String, u64>>,
     next_slot: Cell<u64>,
     slot_cap: Cell<u64>,
 }
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    fn new(ctx: &'ctx Context, module_name: &str, gc_set: &'p GcSet) -> Self {
+    fn new(
+        ctx: &'ctx Context,
+        module_name: &str,
+        gc_set: &'p GcSet,
+        raise_set: &'p GcSet,
+    ) -> Self {
         let module = ctx.create_module(module_name);
         // TBAA tree: three disjoint scalar classes under one root. Lets LLVM
         // keep heap_top/frame slots in registers across heap stores.
@@ -227,6 +242,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             lift_counter: Cell::new(0),
             module_name: module_name.to_string(),
             gc_set,
+            raise_set,
             tbaa_kind: ctx.get_kind_id("tbaa"),
             tbaa_ctx,
             tbaa_frame,
@@ -234,6 +250,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             cur_ctx: Cell::new(None),
             cur_frame: Cell::new(None),
             eternal_alloc: Cell::new(false),
+            handlers: RefCell::new(Vec::new()),
+            propagate_bb: Cell::new(None),
             var_slots: Default::default(),
             next_slot: Cell::new(0),
             slot_cap: Cell::new(0),
@@ -299,24 +317,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
 
     fn rt_alloc_eternal(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_alloc_eternal", || {
-            self.ptrt
-                .fn_type(&[BasicMetadataTypeEnum::IntType(self.i64t)], false)
+            self.ptrt.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
         })
     }
 
-    fn rt_match_fail(&self) -> FunctionValue<'ctx> {
-        self.rt_fn("mana_rt_match_fail", || {
+    fn rt_uncaught(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_uncaught", || {
             self.ctx
                 .void_type()
-                .fn_type(&[BasicMetadataTypeEnum::IntType(self.i64t)], false)
-        })
-    }
-
-    fn rt_badfun(&self) -> FunctionValue<'ctx> {
-        self.rt_fn("mana_rt_badfun", || {
-            self.ctx
-                .void_type()
-                .fn_type(&[BasicMetadataTypeEnum::IntType(self.i64t)], false)
+                .fn_type(&[BasicMetadataTypeEnum::PointerType(self.ptrt)], false)
         })
     }
 
@@ -451,6 +467,95 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
+    fn sentinel(&self) -> IntValue<'ctx> {
+        self.i64t.const_int(EXC_SENTINEL, false)
+    }
+
+    /// Where an unwinding exception goes: the innermost try handler, or the
+    /// per-function propagate block (unlink frame, return the sentinel).
+    fn unwind_target(&self, f: FunctionValue<'ctx>) -> CgResult<BasicBlock<'ctx>> {
+        if let Some(h) = self.handlers.borrow().last() {
+            return Ok(*h);
+        }
+        if let Some(bb) = self.propagate_bb.get() {
+            return Ok(bb);
+        }
+        let saved = self.builder.get_insert_block();
+        let bb = self.ctx.append_basic_block(f, "unwind");
+        self.builder.position_at_end(bb);
+        self.pop_frame()?;
+        self.builder.build_return(Some(&self.sentinel())).map_err(be)?;
+        if let Some(s) = saved {
+            self.builder.position_at_end(s);
+        }
+        self.propagate_bb.set(Some(bb));
+        Ok(bb)
+    }
+
+    /// Store class/reason into the ctx and jump to the unwind target.
+    /// Leaves the builder in a fresh dead block.
+    fn emit_raise(
+        &self,
+        f: FunctionValue<'ctx>,
+        class: IntValue<'ctx>,
+        reason: IntValue<'ctx>,
+    ) -> CgResult<()> {
+        let ctx = self.ctx_val();
+        self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
+        self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
+        let target = self.unwind_target(f)?;
+        self.builder.build_unconditional_branch(target).map_err(be)?;
+        let dead = self.ctx.append_basic_block(f, "dead");
+        self.builder.position_at_end(dead);
+        Ok(())
+    }
+
+    /// After a call to a may-raise function: branch to the unwind target if
+    /// the sentinel came back.
+    fn check_exc(
+        &self,
+        f: FunctionValue<'ctx>,
+        ret: IntValue<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let is_exc = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, ret, self.sentinel(), "is.exc")
+            .map_err(be)?;
+        let target = self.unwind_target(f)?;
+        let cont = self.ctx.append_basic_block(f, "call.ok");
+        self.builder
+            .build_conditional_branch(is_exc, target, cont)
+            .map_err(be)?;
+        self.builder.position_at_end(cont);
+        Ok(ret)
+    }
+
+    /// Build an eternal (non-moving) 2-tuple for an exception reason.
+    fn eternal_pair(
+        &self,
+        tag: &str,
+        v: IntValue<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let call = self
+            .builder
+            .build_call(
+                self.rt_alloc_eternal(),
+                &[
+                    self.ctx_val().into(),
+                    self.i64t.const_int(3, false).into(),
+                    self.i64t.const_zero().into(),
+                ],
+                "exc.reason",
+            )
+            .map_err(be)?;
+        let p = call_result(call)?.into_pointer_value();
+        self.store_word(p, 0, self.i64t.const_int((2 << 8) | KIND_TUPLE, false))?;
+        let tag_atom = self.atom_term(tag)?;
+        self.store_word(p, 1, tag_atom)?;
+        self.store_word(p, 2, v)?;
+        self.builder.build_ptr_to_int(p, self.i64t, "reason").map_err(be)
+    }
+
     fn slot_ptr(&self, idx: u64) -> CgResult<PointerValue<'ctx>> {
         let frame = self.cur_frame.get().expect("slot in frameless function");
         unsafe {
@@ -554,6 +659,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.builder.position_at_end(entry);
         self.cur_ctx
             .set(Some(f.get_nth_param(0).unwrap().into_pointer_value()));
+        self.handlers.borrow_mut().clear();
+        self.propagate_bb.set(None);
         self.setup_frame(&fun.body, &fun.params, &[])?;
         let mut scope = Scope::default();
         for (i, p) in fun.params.iter().enumerate() {
@@ -576,6 +683,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.builder.position_at_end(entry);
             self.cur_ctx
                 .set(Some(f.get_nth_param(0).unwrap().into_pointer_value()));
+            self.handlers.borrow_mut().clear();
+            self.propagate_bb.set(None);
 
             let closure_slot_name = "closure$".to_string();
             let mut var_names: Vec<String> = l.params.clone();
@@ -640,9 +749,26 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
         let ctx = call_result(init)?.into_pointer_value();
         let target = self.fns.borrow()[entry];
-        self.builder
+        let call = self
+            .builder
             .build_call(target, &[ctx.into()], "ret")
             .map_err(be)?;
+        let ret = call_result(call)?.into_int_value();
+        let is_exc = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, ret, self.sentinel(), "is.exc")
+            .map_err(be)?;
+        let bad = self.ctx.append_basic_block(main, "uncaught");
+        let ok = self.ctx.append_basic_block(main, "ok");
+        self.builder
+            .build_conditional_branch(is_exc, bad, ok)
+            .map_err(be)?;
+        self.builder.position_at_end(bad);
+        self.builder
+            .build_call(self.rt_uncaught(), &[ctx.into()], "")
+            .map_err(be)?;
+        self.builder.build_unreachable().map_err(be)?;
+        self.builder.position_at_end(ok);
         self.builder
             .build_return(Some(&i32t.const_zero()))
             .map_err(be)?;
@@ -675,18 +801,35 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.compile_case(f, &vals, clauses, scope, None)
             }
             Expr::Try {
-                arg, vars, body, ..
+                arg,
+                vars,
+                body,
+                evars,
+                handler,
             } => {
-                // TODO(exceptions): degenerates to a let-binding for now.
                 if vars.len() != 1 {
                     return Err("multi-value try is not supported".into());
                 }
-                let v = self.compile_value(f, arg, scope)?;
+                let hbb = self.ctx.append_basic_block(f, "catch");
+                self.handlers.borrow_mut().push(hbb);
+                let v = self.compile_value(f, arg, scope);
+                self.handlers.borrow_mut().pop();
+                let v = v?;
                 self.bind_var(scope, &vars[0], v)?;
-                self.compile_tail(f, body, scope)
+                self.compile_tail(f, body, scope)?;
+
+                self.builder.position_at_end(hbb);
+                let ctx = self.ctx_val();
+                let class = self.mem_load(ctx, CTX_EXC_CLASS, MemKind::Ctx)?;
+                let reason = self.mem_load(ctx, CTX_EXC_REASON, MemKind::Ctx)?;
+                let mut hscope = scope.clone();
+                self.bind_try_evars(&mut hscope, evars, class, reason)?;
+                self.compile_tail(f, handler, &mut hscope)
             }
             Expr::Apply { target, args } => {
-                let call = self.compile_apply(f, target, args, scope, true)?;
+                // the sentinel propagates through the returned value —
+                // tail calls need no exception check
+                let (call, _) = self.compile_apply(f, target, args, scope, true)?;
                 call.set_tail_call(true);
                 let v = call_result(call)?;
                 self.builder.build_return(Some(&v)).map_err(be)?;
@@ -703,7 +846,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 Ok(())
             }
             Expr::PrimOp { name, args } if is_raise(name) => {
-                self.compile_raise(f, name, args, scope)
+                self.compile_raise(f, name, args, scope)?;
+                self.builder.build_unreachable().map_err(be)?;
+                Ok(())
             }
             _ => {
                 let v = self.compile_value(f, e, scope)?;
@@ -739,7 +884,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             Expr::Cons(h, t) => {
                 let slots = self.eval_all_rooted(f, &[h.as_ref(), t.as_ref()], scope)?;
-                let p = self.alloc_words(2)?;
+                let p = self.alloc_words_kind(2, true)?;
                 for (i, s) in slots.iter().enumerate() {
                     let v = self.rooted_get(s)?;
                     self.store_word(p, i as u64, v)?;
@@ -793,34 +938,75 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.compile_value(f, then, scope)
             }
             Expr::Try {
-                arg, vars, body, ..
+                arg,
+                vars,
+                body,
+                evars,
+                handler,
             } => {
-                // TODO(exceptions): degenerates to a let-binding for now.
                 if vars.len() != 1 {
                     return Err("multi-value try is not supported".into());
                 }
-                let v = self.compile_value(f, arg, scope)?;
+                let hbb = self.ctx.append_basic_block(f, "catch");
+                let merge = self.ctx.append_basic_block(f, "try.merge");
+
+                self.handlers.borrow_mut().push(hbb);
+                let v = self.compile_value(f, arg, scope);
+                self.handlers.borrow_mut().pop();
+                let v = v?;
                 self.bind_var(scope, &vars[0], v)?;
-                self.compile_value(f, body, scope)
+                let bv = self.compile_value(f, body, scope)?;
+                let body_end = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(merge).map_err(be)?;
+
+                self.builder.position_at_end(hbb);
+                let ctx = self.ctx_val();
+                let class = self.mem_load(ctx, CTX_EXC_CLASS, MemKind::Ctx)?;
+                let reason = self.mem_load(ctx, CTX_EXC_REASON, MemKind::Ctx)?;
+                let mut hscope = scope.clone();
+                self.bind_try_evars(&mut hscope, evars, class, reason)?;
+                let hv = self.compile_value(f, handler, &mut hscope)?;
+                let handler_end = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(merge).map_err(be)?;
+
+                self.builder.position_at_end(merge);
+                let phi = self.builder.build_phi(self.i64t, "try.val").map_err(be)?;
+                phi.add_incoming(&[(&bv, body_end), (&hv, handler_end)]);
+                Ok(phi.as_basic_value().into_int_value())
             }
             Expr::Apply { target, args } => {
-                let call = self.compile_apply(f, target, args, scope, false)?;
-                Ok(call_result(call)?.into_int_value())
+                let (call, may_raise) = self.compile_apply(f, target, args, scope, false)?;
+                let v = call_result(call)?.into_int_value();
+                if may_raise {
+                    self.check_exc(f, v)
+                } else {
+                    Ok(v)
+                }
             }
             Expr::Call { module, name, args } => {
                 if module == "erlang" {
                     self.compile_bif(f, name, args, scope)
                 } else {
                     let callee = self.remote_fn(module, name, args.len());
+                    let may_raise = self.raise_set.contains(&(
+                        module.clone(),
+                        FunName {
+                            name: name.clone(),
+                            arity: args.len(),
+                        },
+                    ));
                     let argv = self.eval_args(f, args, scope)?;
                     let call = self.builder.build_call(callee, &argv, "call").map_err(be)?;
-                    Ok(call_result(call)?.into_int_value())
+                    let v = call_result(call)?.into_int_value();
+                    if may_raise {
+                        self.check_exc(f, v)
+                    } else {
+                        Ok(v)
+                    }
                 }
             }
             Expr::PrimOp { name, args } if is_raise(name) => {
                 self.compile_raise(f, name, args, scope)?;
-                let dead = self.ctx.append_basic_block(f, "dead");
-                self.builder.position_at_end(dead);
                 Ok(self.i64t.get_undef())
             }
             Expr::PrimOp { name, .. } => Err(format!("unsupported primop {}", name)),
@@ -952,6 +1138,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// Compile any `apply`; `tail` pops the frame just before the call.
+    /// Returns the call site and whether the callee may raise (tail calls
+    /// propagate the sentinel for free via the return value; non-tail
+    /// callers must `check_exc`).
     fn compile_apply(
         &self,
         f: FunctionValue<'ctx>,
@@ -959,7 +1148,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         args: &[Expr],
         scope: &mut Scope<'ctx>,
         tail: bool,
-    ) -> CgResult<CallSiteValue<'ctx>> {
+    ) -> CgResult<(CallSiteValue<'ctx>, bool)> {
         match target {
             ApplyTarget::LocalFun(fname) => {
                 if let Some((lf, cl_slot)) = scope.funs.get(fname).copied() {
@@ -969,20 +1158,26 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     if tail {
                         self.pop_frame()?;
                     }
-                    self.builder.build_call(lf, &argv, "call").map_err(be)
+                    let call = self.builder.build_call(lf, &argv, "call").map_err(be)?;
+                    Ok((call, true)) // letrec bodies: conservatively may raise
                 } else {
                     let callee = self.local_fn(fname)?;
+                    let may_raise = self
+                        .raise_set
+                        .contains(&(self.module_name.clone(), fname.clone()));
                     let argv = self.eval_args(f, args, scope)?;
                     if tail {
                         self.pop_frame()?;
                     }
-                    self.builder.build_call(callee, &argv, "call").map_err(be)
+                    let call = self.builder.build_call(callee, &argv, "call").map_err(be)?;
+                    Ok((call, may_raise))
                 }
             }
             ApplyTarget::Var(v) => {
                 let argv = self.eval_args(f, args, scope)?;
                 let fun_val = self.read_var(scope, v)?;
-                self.compile_apply_value(f, fun_val, &argv, args.len(), tail)
+                let call = self.compile_apply_value(f, fun_val, &argv, args.len(), tail)?;
+                Ok((call, true))
             }
         }
     }
@@ -1030,10 +1225,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
 
         self.builder.position_at_end(bad);
-        self.builder
-            .build_call(self.rt_badfun(), &[fun_val.into()], "")
-            .map_err(be)?;
-        self.builder.build_unreachable().map_err(be)?;
+        {
+            let reason = self.eternal_pair("badfun", fun_val)?;
+            let class = self.atom_term("error")?;
+            let ctx = self.ctx_val();
+            self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
+            self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
+            let target = self.unwind_target(f)?;
+            self.builder.build_unconditional_branch(target).map_err(be)?;
+        }
 
         self.builder.position_at_end(good);
         let code = self.load_word(p, 1)?;
@@ -1194,6 +1394,32 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(shim)
     }
 
+    /// Bind try-catch variables: `<Class, Reason, Stk>` (3), `<Class,
+    /// Reason>` (2) or `<Reason>` (1). The stacktrace slot carries the class
+    /// atom so `primop raise(Stk, Reason)` re-raises with the right class
+    /// (TODO(stacktraces)).
+    fn bind_try_evars(
+        &self,
+        scope: &mut Scope<'ctx>,
+        evars: &[String],
+        class: IntValue<'ctx>,
+        reason: IntValue<'ctx>,
+    ) -> CgResult<()> {
+        match evars.len() {
+            1 => self.bind_var(scope, &evars[0], reason),
+            2 => {
+                self.bind_var(scope, &evars[0], class)?;
+                self.bind_var(scope, &evars[1], reason)
+            }
+            3 => {
+                self.bind_var(scope, &evars[0], class)?;
+                self.bind_var(scope, &evars[1], reason)?;
+                self.bind_var(scope, &evars[2], class)
+            }
+            n => Err(format!("try with {} catch variables is not supported", n)),
+        }
+    }
+
     fn compile_literal(&self, l: &Literal) -> CgResult<IntValue<'ctx>> {
         match l {
             Literal::Int(n) => Ok(self.small_int(*n)),
@@ -1328,10 +1554,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
 
         self.builder.position_at_end(fail_bb);
-        self.builder
-            .build_call(self.rt_match_fail(), &[self.nil().into()], "")
-            .map_err(be)?;
-        self.builder.build_unreachable().map_err(be)?;
+        {
+            let v0 = match vals {
+                CaseVals::Ssa(vs) => vs.first().copied().unwrap_or_else(|| self.nil()),
+                CaseVals::Slots(slots) => match slots.first() {
+                    Some(s) => self.reload(*s)?,
+                    None => self.nil(),
+                },
+            };
+            let reason = self.eternal_pair("case_clause", v0)?;
+            let class = self.atom_term("error")?;
+            let ctx = self.ctx_val();
+            self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
+            self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
+            let target = self.unwind_target(f)?;
+            self.builder.build_unconditional_branch(target).map_err(be)?;
+        }
         Ok(())
     }
 
@@ -1444,15 +1682,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         args: &[Expr],
         scope: &mut Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
-        // raising BIFs terminate: their reason terms use the eternal
-        // allocator so abort paths don't create GC points (TODO(exceptions))
+        // raising BIFs: reason terms use the eternal allocator so raise
+        // paths don't create GC points
         if matches!(
             (name, args.len()),
             ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1)
         ) {
             self.compile_raise(f, name, args, scope)?;
-            let dead = self.ctx.append_basic_block(f, "dead");
-            self.builder.position_at_end(dead);
             return Ok(self.i64t.get_undef());
         }
 
@@ -1515,25 +1751,65 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
+    /// Raise an exception: primop match_fail/raise or erlang:error|exit|throw.
+    /// Reason terms are built with the eternal allocator (never moved, GC
+    /// scans their fields). Leaves the builder in a dead block.
     fn compile_raise(
         &self,
         f: FunctionValue<'ctx>,
-        _name: &str,
+        name: &str,
         args: &[Expr],
         scope: &mut Scope<'ctx>,
     ) -> CgResult<()> {
         let was = self.eternal_alloc.replace(true);
-        let reason = match args.first() {
-            Some(a) => self.compile_value(f, a, scope),
-            None => Ok(self.nil()),
-        };
+        let result: CgResult<(IntValue<'ctx>, IntValue<'ctx>)> = (|| {
+            let (class, reason) = match name {
+                // primop raise(Stk, Reason): re-raise. The "stacktrace" slot
+                // carries the class atom (TODO(stacktraces)).
+                "raise" if args.len() == 2 => {
+                    let class = self.compile_value(f, &args[0], scope)?;
+                    let reason = self.compile_value(f, &args[1], scope)?;
+                    (class, reason)
+                }
+                "exit" => {
+                    let reason = match args.first() {
+                        Some(a) => self.compile_value(f, a, scope)?,
+                        None => self.nil(),
+                    };
+                    (self.atom_term("exit")?, reason)
+                }
+                "throw" => {
+                    let reason = match args.first() {
+                        Some(a) => self.compile_value(f, a, scope)?,
+                        None => self.nil(),
+                    };
+                    (self.atom_term("throw")?, reason)
+                }
+                // match_fail / error / anything else: class error.
+                // BEAM reports function_clause as a bare atom (the args go
+                // into the stacktrace, which we don't build yet).
+                _ => {
+                    let reason = match args.first() {
+                        Some(Expr::Tuple(items))
+                            if name == "match_fail"
+                                && matches!(
+                                    items.first(),
+                                    Some(Expr::Lit(Literal::Atom(a))) if a == "function_clause"
+                                ) =>
+                        {
+                            self.atom_term("function_clause")?
+                        }
+                        Some(a) => self.compile_value(f, a, scope)?,
+                        None => self.nil(),
+                    };
+                    (self.atom_term("error")?, reason)
+                }
+            };
+            Ok((class, reason))
+        })();
         self.eternal_alloc.set(was);
-        let reason = reason?;
-        self.builder
-            .build_call(self.rt_match_fail(), &[reason.into()], "")
-            .map_err(be)?;
-        self.builder.build_unreachable().map_err(be)?;
-        Ok(())
+        let (class, reason) = result?;
+        self.emit_raise(f, class, reason)
     }
 
     // ---- helpers ----
@@ -1586,12 +1862,20 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// bump on the fast path, call `mana_rt_alloc_slow` (collect) on
     /// overflow. Remains a GC point via the slow path.
     fn alloc_words(&self, n: u64) -> CgResult<PointerValue<'ctx>> {
+        self.alloc_words_kind(n, false)
+    }
+
+    fn alloc_words_kind(&self, n: u64, is_cons: bool) -> CgResult<PointerValue<'ctx>> {
         if self.eternal_alloc.get() {
             let call = self
                 .builder
                 .build_call(
                     self.rt_alloc_eternal(),
-                    &[self.i64t.const_int(n, false).into()],
+                    &[
+                        self.ctx_val().into(),
+                        self.i64t.const_int(n, false).into(),
+                        self.i64t.const_int(is_cons as u64, false).into(),
+                    ],
                     "alloc.eternal",
                 )
                 .map_err(be)?;
@@ -1790,6 +2074,131 @@ fn compute_may_gc(mods: &[Module], reachable: &HashSet<(String, FunName)>) -> Gc
         if !changed {
             return set;
         }
+    }
+}
+
+/// Fixpoint: which reachable functions may raise an exception.
+fn compute_may_raise(mods: &[Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
+    let defs: HashMap<(&str, &FunName), &Fun> = mods
+        .iter()
+        .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
+        .collect();
+    let mut set: GcSet = GcSet::new();
+    loop {
+        let mut changed = false;
+        for (m, f) in reachable {
+            if set.contains(&(m.clone(), f.clone())) {
+                continue;
+            }
+            let Some(fun) = defs.get(&(m.as_str(), f)) else {
+                continue;
+            };
+            let mut letrec = HashSet::new();
+            if expr_may_raise(&fun.body, m, &set, &mut letrec) {
+                set.insert((m.clone(), f.clone()));
+                changed = true;
+            }
+        }
+        if !changed {
+            return set;
+        }
+    }
+}
+
+fn clause_irrefutable(c: &Clause) -> bool {
+    is_true_atom(&c.guard) && c.patterns.iter().all(|p| matches!(p, Pattern::Var(_)))
+}
+
+/// Can evaluating `e` raise? Sources: raising primops/BIFs, fun-value
+/// applies (badfun), refutable cases (case_clause/function_clause), and
+/// calls to may-raise functions. Raises inside a `try` argument are caught.
+fn expr_may_raise(
+    e: &Expr,
+    cur_mod: &str,
+    raise_set: &GcSet,
+    letrec_bound: &mut HashSet<FunName>,
+) -> bool {
+    match e {
+        Expr::Var(_) | Expr::Lit(_) | Expr::FunRef { .. } | Expr::Fun(_) => false,
+        Expr::Tuple(items) | Expr::Values(items) => items
+            .iter()
+            .any(|i| expr_may_raise(i, cur_mod, raise_set, letrec_bound)),
+        Expr::Cons(h, t) => {
+            expr_may_raise(h, cur_mod, raise_set, letrec_bound)
+                || expr_may_raise(t, cur_mod, raise_set, letrec_bound)
+        }
+        Expr::Let { arg, body, .. } => {
+            expr_may_raise(arg, cur_mod, raise_set, letrec_bound)
+                || expr_may_raise(body, cur_mod, raise_set, letrec_bound)
+        }
+        Expr::Do(a, b) => {
+            expr_may_raise(a, cur_mod, raise_set, letrec_bound)
+                || expr_may_raise(b, cur_mod, raise_set, letrec_bound)
+        }
+        Expr::LetRec { defs, body } => {
+            let added: Vec<FunName> = defs
+                .iter()
+                .map(|(f, _)| f.clone())
+                .filter(|f| letrec_bound.insert(f.clone()))
+                .collect();
+            let r = expr_may_raise(body, cur_mod, raise_set, letrec_bound);
+            for f in added {
+                letrec_bound.remove(&f);
+            }
+            r
+        }
+        Expr::Apply { target, args } => {
+            let target_raises = match target {
+                ApplyTarget::Var(_) => true, // badfun/badarity
+                ApplyTarget::LocalFun(f) => {
+                    letrec_bound.contains(f)
+                        || raise_set.contains(&(cur_mod.to_string(), f.clone()))
+                }
+            };
+            target_raises
+                || args
+                    .iter()
+                    .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound))
+        }
+        Expr::Call { module, name, args } => {
+            let callee = if module == "erlang" {
+                matches!(
+                    (name.as_str(), args.len()),
+                    ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1)
+                )
+            } else {
+                raise_set.contains(&(
+                    module.clone(),
+                    FunName {
+                        name: name.clone(),
+                        arity: args.len(),
+                    },
+                ))
+            };
+            callee
+                || args
+                    .iter()
+                    .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound))
+        }
+        Expr::PrimOp { name, .. } if is_raise(name) => true,
+        Expr::PrimOp { args, .. } => args
+            .iter()
+            .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound)),
+        Expr::Case { arg, clauses } => {
+            let refutable = clauses.last().map_or(true, |c| !clause_irrefutable(c));
+            refutable
+                || expr_may_raise(arg, cur_mod, raise_set, letrec_bound)
+                || clauses.iter().any(|c| {
+                    expr_may_raise(&c.guard, cur_mod, raise_set, letrec_bound)
+                        || expr_may_raise(&c.body, cur_mod, raise_set, letrec_bound)
+                })
+        }
+        // raises inside the protected argument are caught by this try
+        Expr::Try { body, handler, .. } => {
+            expr_may_raise(body, cur_mod, raise_set, letrec_bound)
+                || expr_may_raise(handler, cur_mod, raise_set, letrec_bound)
+        }
+        Expr::Binary(_) | Expr::Map { .. } => false, // rejected at codegen
     }
 }
 
