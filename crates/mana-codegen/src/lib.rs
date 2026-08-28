@@ -52,7 +52,7 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, FunctionType, IntType, PointerType};
 use inkwell::values::{
-    BasicMetadataValueEnum, CallSiteValue, FunctionValue, GlobalValue, IntValue, PointerValue,
+    BasicMetadataValueEnum, BasicValue, CallSiteValue, FunctionValue, GlobalValue, IntValue, PointerValue,
     ValueKind,
 };
 use inkwell::AddressSpace;
@@ -75,6 +75,14 @@ const CTX_ROOTS: u64 = 2;
 
 type CgResult<T> = Result<T, String>;
 type GcSet = HashSet<(String, FunName)>;
+
+/// Disjoint memory classes for TBAA (never alias each other).
+#[derive(Clone, Copy)]
+enum MemKind {
+    Ctx,
+    Frame,
+    Heap,
+}
 
 /// Where a variable's current value lives.
 #[derive(Clone, Copy)]
@@ -173,9 +181,16 @@ struct Cg<'ctx, 'p> {
     lift_counter: Cell<u32>,
     module_name: String,
     gc_set: &'p GcSet,
+    // TBAA: ctx words / frame slots / heap objects never alias
+    tbaa_kind: u32,
+    tbaa_ctx: inkwell::values::MetadataValue<'ctx>,
+    tbaa_frame: inkwell::values::MetadataValue<'ctx>,
+    tbaa_heap: inkwell::values::MetadataValue<'ctx>,
     // per-function state
     cur_ctx: Cell<Option<PointerValue<'ctx>>>,
     cur_frame: Cell<Option<PointerValue<'ctx>>>,
+    /// raise-path compilation: allocations go to the eternal allocator
+    eternal_alloc: Cell<bool>,
     var_slots: RefCell<HashMap<String, u64>>,
     next_slot: Cell<u64>,
     slot_cap: Cell<u64>,
@@ -184,6 +199,21 @@ struct Cg<'ctx, 'p> {
 impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn new(ctx: &'ctx Context, module_name: &str, gc_set: &'p GcSet) -> Self {
         let module = ctx.create_module(module_name);
+        // TBAA tree: three disjoint scalar classes under one root. Lets LLVM
+        // keep heap_top/frame slots in registers across heap stores.
+        let i64t = ctx.i64_type();
+        let root = ctx.metadata_node(&[ctx.metadata_string("mana-tbaa").into()]);
+        let mk_tag = |name: &str| {
+            let ty = ctx.metadata_node(&[
+                ctx.metadata_string(name).into(),
+                root.into(),
+                i64t.const_zero().into(),
+            ]);
+            ctx.metadata_node(&[ty.into(), ty.into(), i64t.const_zero().into()])
+        };
+        let tbaa_ctx = mk_tag("procctx");
+        let tbaa_frame = mk_tag("gcframe");
+        let tbaa_heap = mk_tag("heap");
         Cg {
             ctx,
             module,
@@ -197,8 +227,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             lift_counter: Cell::new(0),
             module_name: module_name.to_string(),
             gc_set,
+            tbaa_kind: ctx.get_kind_id("tbaa"),
+            tbaa_ctx,
+            tbaa_frame,
+            tbaa_heap,
             cur_ctx: Cell::new(None),
             cur_frame: Cell::new(None),
+            eternal_alloc: Cell::new(false),
             var_slots: Default::default(),
             next_slot: Cell::new(0),
             slot_cap: Cell::new(0),
@@ -259,6 +294,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 ],
                 false,
             )
+        })
+    }
+
+    fn rt_alloc_eternal(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_alloc_eternal", || {
+            self.ptrt
+                .fn_type(&[BasicMetadataTypeEnum::IntType(self.i64t)], false)
         })
     }
 
@@ -362,9 +404,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_alloca(frame_ty, "gc.frame")
             .map_err(be)?;
         let ctx = self.ctx_val();
-        let prev = self.load_word(ctx, CTX_ROOTS)?;
-        self.store_word(frame, 0, prev)?;
-        self.store_word(frame, 1, self.i64t.const_int(cap, false))?;
+        let prev = self.mem_load(ctx, CTX_ROOTS, MemKind::Ctx)?;
+        self.mem_store(frame, 0, prev, MemKind::Frame)?;
+        self.mem_store(frame, 1, self.i64t.const_int(cap, false), MemKind::Frame)?;
         // zero-init all slots with one memset — 0 marks an empty slot the
         // collector skips (cheaper than storing NIL per slot)
         let slots = unsafe {
@@ -389,7 +431,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .builder
             .build_ptr_to_int(frame, self.i64t, "frame.addr")
             .map_err(be)?;
-        self.store_word(ctx, CTX_ROOTS, frame_int)?;
+        self.mem_store(ctx, CTX_ROOTS, frame_int, MemKind::Ctx)?;
         self.cur_frame.set(Some(frame));
         Ok(())
     }
@@ -397,8 +439,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// Unlink the frame (before any return or tail call).
     fn pop_frame(&self) -> CgResult<()> {
         if let Some(frame) = self.cur_frame.get() {
-            let prev = self.load_word(frame, 0)?;
-            self.store_word(self.ctx_val(), CTX_ROOTS, prev)?;
+            let prev = self.mem_load(frame, 0, MemKind::Frame)?;
+            self.mem_store(self.ctx_val(), CTX_ROOTS, prev, MemKind::Ctx)?;
         }
         Ok(())
     }
@@ -433,17 +475,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn spill(&self, v: IntValue<'ctx>) -> CgResult<u64> {
         let idx = self.alloc_temp();
         let p = self.slot_ptr(idx)?;
-        self.builder.build_store(p, v).map_err(be)?;
+        let inst = self.builder.build_store(p, v).map_err(be)?;
+        let _ = inst.set_metadata(self.tbaa_frame, self.tbaa_kind);
         Ok(idx)
     }
 
     fn reload(&self, idx: u64) -> CgResult<IntValue<'ctx>> {
         let p = self.slot_ptr(idx)?;
-        Ok(self
-            .builder
-            .build_load(self.i64t, p, "reload")
-            .map_err(be)?
-            .into_int_value())
+        let v = self.builder.build_load(self.i64t, p, "reload").map_err(be)?;
+        if let Some(inst) = v.as_instruction_value() {
+            let _ = inst.set_metadata(self.tbaa_frame, self.tbaa_kind);
+        }
+        Ok(v.into_int_value())
     }
 
     fn bind_var(&self, scope: &mut Scope<'ctx>, name: &str, v: IntValue<'ctx>) -> CgResult<()> {
@@ -454,7 +497,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .get(name)
                 .unwrap_or_else(|| panic!("no slot preassigned for variable {}", name));
             let p = self.slot_ptr(idx)?;
-            self.builder.build_store(p, v).map_err(be)?;
+            let inst = self.builder.build_store(p, v).map_err(be)?;
+            let _ = inst.set_metadata(self.tbaa_frame, self.tbaa_kind);
             scope.vars.insert(name.to_string(), Binding::Slot(idx));
         } else {
             scope.vars.insert(name.to_string(), Binding::Reg(v));
@@ -686,7 +730,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .const_int(((slots.len() as u64) << 8) | KIND_TUPLE, false);
                 self.store_word(p, 0, header)?;
                 for (i, s) in slots.iter().enumerate() {
-                    let v = self.reload(*s)?;
+                    let v = self.rooted_get(s)?;
                     self.store_word(p, 1 + i as u64, v)?;
                 }
                 self.builder
@@ -697,7 +741,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let slots = self.eval_all_rooted(f, &[h.as_ref(), t.as_ref()], scope)?;
                 let p = self.alloc_words(2)?;
                 for (i, s) in slots.iter().enumerate() {
-                    let v = self.reload(*s)?;
+                    let v = self.rooted_get(s)?;
                     self.store_word(p, i as u64, v)?;
                 }
                 let as_int = self
@@ -820,10 +864,24 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
         let mut held = Vec::with_capacity(exprs.len());
         for (i, e) in exprs.iter().enumerate() {
-            let v = self.compile_value(f, e, scope)?;
             if gc_after[i] && self.framed() {
+                if let Expr::Var(name) = e {
+                    if let Some(Binding::Slot(idx)) = scope.vars.get(name.as_str()) {
+                        held.push(Held::Slot(*idx));
+                        continue;
+                    }
+                }
+                if matches!(
+                    e,
+                    Expr::Lit(Literal::Int(_) | Literal::Atom(_) | Literal::Nil)
+                ) {
+                    held.push(Held::Val(self.compile_value(f, e, scope)?));
+                    continue;
+                }
+                let v = self.compile_value(f, e, scope)?;
                 held.push(Held::Slot(self.spill(v)?));
             } else {
+                let v = self.compile_value(f, e, scope)?;
                 held.push(Held::Val(v));
             }
         }        held.into_iter()
@@ -835,20 +893,49 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// Evaluate and root every expression (used when the consumer itself is
-    /// an allocation). Only valid in framed functions.
+    /// an allocation). In frameless functions this can only be reached in
+    /// eternal-alloc (raise) mode, where allocation never collects — values
+    /// stay in SSA.
     fn eval_all_rooted(
         &self,
         f: FunctionValue<'ctx>,
         exprs: &[&Expr],
         scope: &mut Scope<'ctx>,
-    ) -> CgResult<Vec<u64>> {
+    ) -> CgResult<Vec<Rooted<'ctx>>> {
         exprs
             .iter()
             .map(|e| {
+                // a variable already in a frame slot IS a root — reuse it;
+                // immediates (ints/atoms/nil) never move — keep in SSA
+                if let Expr::Var(name) = e {
+                    if let Some(Binding::Slot(idx)) = scope.vars.get(name.as_str()) {
+                        return Ok(Rooted::Slot(*idx));
+                    }
+                }
+                if matches!(
+                    e,
+                    Expr::Lit(Literal::Int(_) | Literal::Atom(_) | Literal::Nil)
+                ) {
+                    return Ok(Rooted::Val(self.compile_value(f, e, scope)?));
+                }
                 let v = self.compile_value(f, e, scope)?;
-                self.spill(v)
+                if self.framed() {
+                    Ok(Rooted::Slot(self.spill(v)?))
+                } else {
+                    // frameless: the effect analysis proved no GC point
+                    // exists anywhere in this function (raise-path allocs
+                    // use the eternal allocator), so SSA is safe
+                    Ok(Rooted::Val(v))
+                }
             })
             .collect()
+    }
+
+    fn rooted_get(&self, r: &Rooted<'ctx>) -> CgResult<IntValue<'ctx>> {
+        match r {
+            Rooted::Slot(idx) => self.reload(*idx),
+            Rooted::Val(v) => Ok(*v),
+        }
     }
 
     /// Arguments for a call: ctx first, then sibling-rule values.
@@ -1164,7 +1251,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         };
         let any_guard_gc = clauses.iter().any(|c| self.expr_gc(&c.guard));
         if any_guard_gc && self.framed() {
-            let slots = self.eval_all_rooted(f, &exprs, scope)?;
+            let slots = exprs
+                .iter()
+                .map(|e| {
+                    let v = self.compile_value(f, e, scope)?;
+                    self.spill(v)
+                })
+                .collect::<CgResult<Vec<_>>>()?;
             Ok(CaseVals::Slots(slots))
         } else {
             Ok(CaseVals::Ssa(self.eval_siblings(f, &exprs, scope)?))
@@ -1351,6 +1444,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         args: &[Expr],
         scope: &mut Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
+        // raising BIFs terminate: their reason terms use the eternal
+        // allocator so abort paths don't create GC points (TODO(exceptions))
+        if matches!(
+            (name, args.len()),
+            ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1)
+        ) {
+            self.compile_raise(f, name, args, scope)?;
+            let dead = self.ctx.append_basic_block(f, "dead");
+            self.builder.position_at_end(dead);
+            return Ok(self.i64t.get_undef());
+        }
+
         let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
 
         match (name, argv.len()) {
@@ -1406,16 +1511,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 self.atom_term("true")
             }
-            // raising BIFs terminate via the runtime (TODO(exceptions))
-            ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1) => {
-                self.builder
-                    .build_call(self.rt_match_fail(), &[argv[0].into()], "")
-                    .map_err(be)?;
-                self.builder.build_unreachable().map_err(be)?;
-                let dead = self.ctx.append_basic_block(f, "dead");
-                self.builder.position_at_end(dead);
-                Ok(self.i64t.get_undef())
-            }
             _ => Err(format!("unsupported BIF erlang:{}/{}", name, argv.len())),
         }
     }
@@ -1427,10 +1522,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         args: &[Expr],
         scope: &mut Scope<'ctx>,
     ) -> CgResult<()> {
+        let was = self.eternal_alloc.replace(true);
         let reason = match args.first() {
-            Some(a) => self.compile_value(f, a, scope)?,
-            None => self.nil(),
+            Some(a) => self.compile_value(f, a, scope),
+            None => Ok(self.nil()),
         };
+        self.eternal_alloc.set(was);
+        let reason = reason?;
         self.builder
             .build_call(self.rt_match_fail(), &[reason.into()], "")
             .map_err(be)?;
@@ -1488,6 +1586,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// bump on the fast path, call `mana_rt_alloc_slow` (collect) on
     /// overflow. Remains a GC point via the slow path.
     fn alloc_words(&self, n: u64) -> CgResult<PointerValue<'ctx>> {
+        if self.eternal_alloc.get() {
+            let call = self
+                .builder
+                .build_call(
+                    self.rt_alloc_eternal(),
+                    &[self.i64t.const_int(n, false).into()],
+                    "alloc.eternal",
+                )
+                .map_err(be)?;
+            return Ok(call_result(call)?.into_pointer_value());
+        }
         let f = self
             .builder
             .get_insert_block()
@@ -1499,12 +1608,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let slow = self.ctx.append_basic_block(f, "alloc.slow");
         let merge = self.ctx.append_basic_block(f, "alloc.done");
 
-        let top = self.load_word(ctx, 0)?;
+        let top = self.mem_load(ctx, 0, MemKind::Ctx)?;
         let new_top = self
             .builder
             .build_int_add(top, self.i64t.const_int(n * 8, false), "alloc.newtop")
             .map_err(be)?;
-        let end = self.load_word(ctx, 1)?;
+        let end = self.mem_load(ctx, 1, MemKind::Ctx)?;
         let fits = self
             .builder
             .build_int_compare(IntPredicate::ULE, new_top, end, "alloc.fits")
@@ -1514,7 +1623,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
 
         self.builder.position_at_end(fast);
-        self.store_word(ctx, 0, new_top)?;
+        self.mem_store(ctx, 0, new_top, MemKind::Ctx)?;
         self.builder.build_unconditional_branch(merge).map_err(be)?;
 
         self.builder.position_at_end(slow);
@@ -1542,11 +1651,20 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)
     }
 
-    fn store_word(
+    fn tbaa_tag(&self, kind: MemKind) -> inkwell::values::MetadataValue<'ctx> {
+        match kind {
+            MemKind::Ctx => self.tbaa_ctx,
+            MemKind::Frame => self.tbaa_frame,
+            MemKind::Heap => self.tbaa_heap,
+        }
+    }
+
+    fn mem_store(
         &self,
         p: PointerValue<'ctx>,
         index: u64,
         v: IntValue<'ctx>,
+        kind: MemKind,
     ) -> CgResult<()> {
         let slot = unsafe {
             self.builder
@@ -1558,11 +1676,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 )
                 .map_err(be)?
         };
-        self.builder.build_store(slot, v).map_err(be)?;
+        let inst = self.builder.build_store(slot, v).map_err(be)?;
+        let _ = inst.set_metadata(self.tbaa_tag(kind), self.tbaa_kind);
         Ok(())
     }
 
-    fn load_word(&self, p: PointerValue<'ctx>, index: u64) -> CgResult<IntValue<'ctx>> {
+    fn mem_load(
+        &self,
+        p: PointerValue<'ctx>,
+        index: u64,
+        kind: MemKind,
+    ) -> CgResult<IntValue<'ctx>> {
         let slot = unsafe {
             self.builder
                 .build_in_bounds_gep(
@@ -1573,11 +1697,25 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 )
                 .map_err(be)?
         };
-        Ok(self
-            .builder
-            .build_load(self.i64t, slot, "word")
-            .map_err(be)?
-            .into_int_value())
+        let v = self.builder.build_load(self.i64t, slot, "word").map_err(be)?;
+        if let Some(inst) = v.as_instruction_value() {
+            let _ = inst.set_metadata(self.tbaa_tag(kind), self.tbaa_kind);
+        }
+        Ok(v.into_int_value())
+    }
+
+    /// Heap-object word access (the overwhelmingly common case).
+    fn store_word(
+        &self,
+        p: PointerValue<'ctx>,
+        index: u64,
+        v: IntValue<'ctx>,
+    ) -> CgResult<()> {
+        self.mem_store(p, index, v, MemKind::Heap)
+    }
+
+    fn load_word(&self, p: PointerValue<'ctx>, index: u64) -> CgResult<IntValue<'ctx>> {
+        self.mem_load(p, index, MemKind::Heap)
     }
 
     // ---- output ----
@@ -1607,6 +1745,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         tm.write_to_file(&self.module, FileType::Object, out)
             .map_err(|e| format!("emit object: {}", e))
     }
+}
+
+/// A child value of an allocation: rooted in a frame slot, or (raise-path /
+/// frameless) held in SSA.
+enum Rooted<'ctx> {
+    Slot(u64),
+    Val(IntValue<'ctx>),
 }
 
 enum CaseVals<'ctx> {
@@ -1678,6 +1823,16 @@ fn expr_may_gc(
                     .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound))
         }
         Expr::Call { module, name, args } => {
+            if module == "erlang"
+                && matches!(
+                    (name.as_str(), args.len()),
+                    ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1)
+                )
+            {
+                return args
+                    .iter()
+                    .any(|a| raise_arg_may_gc(a, cur_mod, gc_set, letrec_bound));
+            }
             let callee_gc = module != "erlang"
                 && gc_set.contains(&(
                     module.clone(),
@@ -1691,6 +1846,9 @@ fn expr_may_gc(
                     .iter()
                     .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound))
         }
+        Expr::PrimOp { name, args } if is_raise(name) => args
+            .iter()
+            .any(|a| raise_arg_may_gc(a, cur_mod, gc_set, letrec_bound)),
         Expr::PrimOp { args, .. } => args
             .iter()
             .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound)),
@@ -1722,17 +1880,43 @@ fn expr_may_gc(
     }
 }
 
-/// Count bound variable names and expression nodes for frame sizing. Does
-/// not descend into Fun/LetRec definition bodies (they get their own
-/// frames when lifted).
+/// GC-point analysis for raise arguments: the reason term is built with the
+/// eternal allocator (no GC), so allocation nodes don't count — only calls
+/// into compiled code do.
+fn raise_arg_may_gc(
+    e: &Expr,
+    cur_mod: &str,
+    gc_set: &GcSet,
+    letrec_bound: &mut HashSet<FunName>,
+) -> bool {
+    match e {
+        Expr::Var(_) | Expr::Lit(_) | Expr::FunRef { .. } | Expr::Fun(_) => false,
+        Expr::Tuple(items) | Expr::Values(items) => items
+            .iter()
+            .any(|i| raise_arg_may_gc(i, cur_mod, gc_set, letrec_bound)),
+        Expr::Cons(h, t) => {
+            raise_arg_may_gc(h, cur_mod, gc_set, letrec_bound)
+                || raise_arg_may_gc(t, cur_mod, gc_set, letrec_bound)
+        }
+        // anything with control flow or calls: fall back to the full analysis
+        other => expr_may_gc(other, cur_mod, gc_set, letrec_bound),
+    }
+}
+
+/// Count bound variable names and *spill sites* for frame sizing. Spills
+/// only happen for children of allocations (eval_all_rooted), call/BIF
+/// arguments (eval_siblings), case scrutinees, and letrec closures — the
+/// sum over those sites bounds any execution path. Does not descend into
+/// Fun/LetRec definition bodies (they get their own frames when lifted).
 fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut usize) {
-    *nodes += 1;
     match e {
         Expr::Var(_) | Expr::Lit(_) | Expr::FunRef { .. } | Expr::Fun(_) => {}
         Expr::Tuple(items) | Expr::Values(items) => {
+            *nodes += items.len();
             items.iter().for_each(|i| frame_prepass(i, vars, nodes))
         }
         Expr::Cons(h, t) => {
+            *nodes += 2;
             frame_prepass(h, vars, nodes);
             frame_prepass(t, vars, nodes);
         }
@@ -1741,12 +1925,23 @@ fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut usize) {
             frame_prepass(arg, vars, nodes);
             frame_prepass(body, vars, nodes);
         }
-        Expr::LetRec { body, .. } => frame_prepass(body, vars, nodes),
-        Expr::Apply { args, .. } => args.iter().for_each(|a| frame_prepass(a, vars, nodes)),
+        Expr::LetRec { body, .. } => {
+            *nodes += 1; // shared closure slot
+            frame_prepass(body, vars, nodes);
+        }
+        Expr::Apply { args, .. } => {
+            *nodes += args.len();
+            args.iter().for_each(|a| frame_prepass(a, vars, nodes))
+        }
         Expr::Call { args, .. } | Expr::PrimOp { args, .. } => {
+            *nodes += args.len();
             args.iter().for_each(|a| frame_prepass(a, vars, nodes))
         }
         Expr::Case { arg, clauses } => {
+            *nodes += match arg.as_ref() {
+                Expr::Values(es) => es.len(),
+                _ => 1,
+            };
             frame_prepass(arg, vars, nodes);
             for c in clauses {
                 let mut pvars = Vec::new();

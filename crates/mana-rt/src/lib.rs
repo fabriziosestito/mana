@@ -132,12 +132,12 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
     if ctx.old_used > ctx.old_limit {
         major_collect(ctx);
     }
-    // Adaptive nursery: heavy promotion means survivors are medium-lived
-    // and the nursery is too small for the allocation pattern — grow it so
-    // they can die young instead of being copied out.
+    // Adaptive nursery: promotion means survivors are medium-lived and the
+    // nursery is too small for the allocation pattern — grow until copying
+    // out of the nursery is rare (<1/16 per minor), so most data dies young.
     let grow_to = if words > ctx.nursery_words {
         usize::max(ctx.nursery_words * 2, words * 2)
-    } else if promoted > ctx.nursery_words / 4 {
+    } else if promoted > ctx.nursery_words / 16 {
         ctx.nursery_words * 2
     } else {
         0
@@ -155,6 +155,14 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
         ctx.heap_top = ctx.heap_top.add(words);
         p
     }
+}
+
+/// Allocation for raise-path terms (exception reasons): plain malloc,
+/// never collected — the process is about to die, and this keeps abort
+/// paths from turning every multi-clause function into a GC-framed one.
+#[no_mangle]
+pub extern "C" fn mana_rt_alloc_eternal(words: u64) -> *mut u64 {
+    alloc_space(words as usize)
 }
 
 fn old_alloc(ctx: &mut ProcCtx, words: usize) -> *mut u64 {
