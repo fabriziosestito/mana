@@ -57,8 +57,10 @@ use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+use crossbeam_queue::SegQueue;
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
@@ -176,9 +178,13 @@ struct Process {
     saved_roots: u64,
     saved_exc_class: u64,
     saved_exc_reason: u64,
-    /// contents are always old-space or immediate (send promotes)
-    mailbox: Mutex<Vec<u64>>,
-    /// receive cursor — home scheduler only
+    /// lock-free sender-side queue. Cross-scheduler senders only ever push
+    /// old-space/immediate terms (send promotes); same-scheduler pushes may
+    /// be young (local minors drain + scan).
+    ingress: SegQueue<u64>,
+    /// receiver-private message list — home scheduler only, no lock
+    private: Vec<u64>,
+    /// receive cursor into `private` — home scheduler only
     cursor: usize,
     state: Mutex<PState>,
     /// spawn closure (old-space) until first resume
@@ -192,8 +198,8 @@ unsafe impl Send for ProcessCell {}
 unsafe impl Sync for ProcessCell {}
 
 struct SchedShared {
-    /// pids made runnable by other threads
-    inject: Mutex<VecDeque<usize>>,
+    /// pids made runnable by other threads (lock-free)
+    inject: SegQueue<usize>,
     /// wake signal for an idle scheduler; the bool defeats lost wakeups
     cv: Condvar,
     cv_m: Mutex<bool>,
@@ -211,10 +217,8 @@ struct Global {
     n_scheds: usize,
     /// fast-path flag mirroring StwState.collecting
     stw_flag: AtomicBool,
-    /// fast-path flags: scheduler i has injected work
-    inject_flags: Vec<AtomicBool>,
     scheds: Vec<SchedShared>,
-    procs: Mutex<Vec<Option<&'static ProcessCell>>>,
+    procs: RwLock<Vec<Option<&'static ProcessCell>>>,
     old: Mutex<OldSpace>,
     old_used: AtomicUsize,
     old_limit: AtomicUsize,
@@ -245,7 +249,7 @@ pub struct ProcCtx {
 }
 
 fn proc_ref(g: &Global, pid: usize) -> Option<&'static ProcessCell> {
-    g.procs.lock().unwrap().get(pid).copied().flatten()
+    g.procs.read().get(pid).copied().flatten()
 }
 
 /// Home-thread (or STW-requester) access to a process's interior.
@@ -276,16 +280,15 @@ pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
     let global: &'static Global = Box::leak(Box::new(Global {
         n_scheds: n,
         stw_flag: AtomicBool::new(false),
-        inject_flags: (0..n).map(|_| AtomicBool::new(false)).collect(),
         scheds: (0..n)
             .map(|_| SchedShared {
-                inject: Mutex::new(VecDeque::new()),
+                inject: SegQueue::new(),
                 cv: Condvar::new(),
                 cv_m: Mutex::new(false),
                 ctx_addr: AtomicUsize::new(0),
             })
             .collect(),
-        procs: Mutex::new(Vec::new()),
+        procs: RwLock::new(Vec::new()),
         old: Mutex::new(OldSpace { chunks: Vec::new() }),
         old_used: AtomicUsize::new(0),
         old_limit: AtomicUsize::new(OLD_LIMIT_INIT),
@@ -328,14 +331,14 @@ fn new_sched_ctx(global: &'static Global, sched_id: usize) -> *mut ProcCtx {
 
 fn wake_sched(g: &Global, id: usize) {
     let s = &g.scheds[id];
-    let mut pending = s.cv_m.lock().unwrap();
+    let mut pending = s.cv_m.lock();
     *pending = true;
     s.cv.notify_all();
 }
 
 fn register_process(g: &Global, p: Process) -> usize {
     let cell: &'static ProcessCell = Box::leak(Box::new(ProcessCell(UnsafeCell::new(p))));
-    let mut tab = g.procs.lock().unwrap();
+    let mut tab = g.procs.write();
     tab.push(Some(cell));
     tab.len() - 1
 }
@@ -386,7 +389,8 @@ pub extern "C" fn mana_rt_run(
                 saved_roots: 0,
                 saved_exc_class: 0,
                 saved_exc_reason: 0,
-                mailbox: Mutex::new(Vec::new()),
+                ingress: SegQueue::new(),
+                private: Vec::new(),
                 cursor: 0,
                 state: Mutex::new(PState::Runnable),
                 pending_closure: 0,
@@ -420,17 +424,10 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
         }
         park_if_stw(ctx);
 
-        let pid = ctx.run_q.pop_front().or_else(|| {
-            if !global.inject_flags[ctx.sched_id].load(Ordering::Acquire) {
-                return None;
-            }
-            let mut q = global.scheds[ctx.sched_id].inject.lock().unwrap();
-            let pid = q.pop_front();
-            if q.is_empty() {
-                global.inject_flags[ctx.sched_id].store(false, Ordering::Release);
-            }
-            pid
-        });
+        let pid = ctx
+            .run_q
+            .pop_front()
+            .or_else(|| global.scheds[ctx.sched_id].inject.pop());
         let Some(pid) = pid else {
             idle_wait(ctx);
             continue;
@@ -439,7 +436,7 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
             continue;
         };
         let p = unsafe { proc_mut(cell) };
-        *p.state.lock().unwrap() = PState::Running;
+        *p.state.lock() = PState::Running;
         ctx.roots_head = p.saved_roots;
         ctx.exc_class = p.saved_exc_class;
         ctx.exc_reason = p.saved_exc_reason;
@@ -454,7 +451,7 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
                 p.saved_roots = ctx.roots_head;
                 p.saved_exc_class = ctx.exc_class;
                 p.saved_exc_reason = ctx.exc_reason;
-                let mut st = p.state.lock().unwrap();
+                let mut st = p.state.lock();
                 if *st == PState::Running {
                     *st = PState::Runnable;
                     drop(st);
@@ -475,7 +472,7 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
                     write_term(ctx.exc_reason, &mut reason);
                     eprintln!("mana: process <0.{}.0> exited: {} {}", pid, class, reason);
                 }
-                global.procs.lock().unwrap()[pid] = None;
+                global.procs.write()[pid] = None;
             }
         }
         ctx.current = usize::MAX;
@@ -489,14 +486,14 @@ fn idle_wait(ctx: &mut ProcCtx) {
     let now = Instant::now();
     let mut nearest: Option<Instant> = None;
     {
-        let tab = global.procs.lock().unwrap();
+        let tab = global.procs.read();
         for (id, slot) in tab.iter().enumerate() {
             let Some(cell) = slot else { continue };
             let p = unsafe { &*cell.0.get() };
             if p.home != ctx.sched_id {
                 continue;
             }
-            let mut st = p.state.lock().unwrap();
+            let mut st = p.state.lock();
             if let PState::Waiting(Some(dl)) = *st {
                 if dl <= now {
                     *st = PState::Runnable;
@@ -511,7 +508,7 @@ fn idle_wait(ctx: &mut ProcCtx) {
         return;
     }
     let s = &global.scheds[ctx.sched_id];
-    let mut pending = s.cv_m.lock().unwrap();
+    let mut pending = s.cv_m.lock();
     if *pending {
         *pending = false;
         return;
@@ -519,8 +516,8 @@ fn idle_wait(ctx: &mut ProcCtx) {
     let timeout = nearest
         .map(|dl| dl.saturating_duration_since(Instant::now()))
         .unwrap_or(Duration::from_millis(100));
-    let (mut guard, _) = s.cv.wait_timeout(pending, timeout).unwrap();
-    *guard = false;
+    s.cv.wait_for(&mut pending, timeout);
+    *pending = false;
 }
 
 fn suspend_current(ctx: &mut ProcCtx) {
@@ -549,7 +546,7 @@ fn promote_term(ctx: &mut ProcCtx, t: u64) -> u64 {
         return t;
     }
     let global = ctx.global;
-    let mut old = global.old.lock().unwrap();
+    let mut old = global.old.lock();
     let root = promote_copy(ctx, &mut old, t);
     let mut scan: Vec<u64> = vec![root];
     while let Some(nt) = scan.pop() {
@@ -647,7 +644,8 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
             saved_roots: 0,
             saved_exc_class: 0,
             saved_exc_reason: 0,
-            mailbox: Mutex::new(Vec::new()),
+            ingress: SegQueue::new(),
+            private: Vec::new(),
             cursor: 0,
             state: Mutex::new(PState::Runnable),
             pending_closure: closure,
@@ -656,8 +654,7 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
     if home == ctx.sched_id {
         ctx.run_q.push_back(pid);
     } else {
-        global.scheds[home].inject.lock().unwrap().push_back(pid);
-        global.inject_flags[home].store(true, Ordering::Release);
+        global.scheds[home].inject.push(pid);
         wake_sched(global, home);
     }
     make_pid(pid)
@@ -678,22 +675,22 @@ pub extern "C" fn mana_rt_send(ctx: *mut ProcCtx, pid: u64, msg: u64) {
     };
     let p = unsafe { &*cell.0.get() };
     // same-scheduler sends stay zero-copy even for young terms: the local
-    // minor scans local mailboxes. Only cross-scheduler payloads promote.
+    // minor drains + scans local ingress queues. Cross-scheduler payloads
+    // promote (so no scheduler ever sees another's nursery).
     let msg = if p.home == ctx.sched_id {
         msg
     } else {
         promote_term(ctx, msg)
     };
-    p.mailbox.lock().unwrap().push(msg);
-    let mut st = p.state.lock().unwrap();
+    p.ingress.push(msg);
+    let mut st = p.state.lock();
     if matches!(*st, PState::Waiting(_)) {
         *st = PState::Runnable;
         drop(st);
         if p.home == ctx.sched_id {
             ctx.run_q.push_back(id);
         } else {
-            global.scheds[p.home].inject.lock().unwrap().push_back(id);
-            global.inject_flags[p.home].store(true, Ordering::Release);
+            global.scheds[p.home].inject.push(id);
             wake_sched(global, p.home);
         }
     }
@@ -707,20 +704,29 @@ fn cur_proc(ctx: &ProcCtx) -> &mut Process {
     unsafe { proc_mut(&*(ctx.current_cell as *const ProcessCell)) }
 }
 
+/// Move everything from the ingress queue into the private list.
+fn drain_ingress(p: &mut Process) {
+    while let Some(m) = p.ingress.pop() {
+        p.private.push(m);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn mana_rt_recv_ready(ctx: *mut ProcCtx) -> u64 {
     let ctx = unsafe { &*ctx };
     let p = cur_proc(ctx);
-    (p.mailbox.lock().unwrap().len() > p.cursor) as u64
+    if p.private.len() <= p.cursor {
+        drain_ingress(p);
+    }
+    (p.private.len() > p.cursor) as u64
 }
 
 #[no_mangle]
 pub extern "C" fn mana_rt_recv_peek(ctx: *mut ProcCtx) -> u64 {
     let ctx = unsafe { &*ctx };
     let p = cur_proc(ctx);
-    let mb = p.mailbox.lock().unwrap();
-    if mb.len() > p.cursor {
-        mb[p.cursor]
+    if p.private.len() > p.cursor {
+        p.private[p.cursor]
     } else {
         NIL
     }
@@ -737,7 +743,7 @@ pub extern "C" fn mana_rt_recv_remove(ctx: *mut ProcCtx) {
     let ctx = unsafe { &*ctx };
     let p = cur_proc(ctx);
     let c = p.cursor;
-    p.mailbox.lock().unwrap().remove(c);
+    p.private.remove(c);
     p.cursor = 0;
 }
 
@@ -750,7 +756,8 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
         let ms = (timeout as i64) >> 3;
         if ms <= 0 {
             let p = cur_proc(ctx);
-            return (p.mailbox.lock().unwrap().len() <= p.cursor) as u64;
+            drain_ingress(p);
+            return (p.private.len() <= p.cursor) as u64;
         }
         Some(Instant::now() + Duration::from_millis(ms as u64))
     } else {
@@ -759,7 +766,8 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
     loop {
         {
             let p = cur_proc(ctx);
-            if p.mailbox.lock().unwrap().len() > p.cursor {
+            drain_ingress(p);
+            if p.private.len() > p.cursor {
                 return 0;
             }
             if let Some(dl) = deadline {
@@ -767,7 +775,7 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
                     return 1;
                 }
             }
-            *p.state.lock().unwrap() = PState::Waiting(deadline);
+            *p.state.lock() = PState::Waiting(deadline);
         }
         suspend_current(ctx);
     }
@@ -815,11 +823,7 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
 pub extern "C" fn mana_rt_alloc_eternal(ctx: *mut ProcCtx, words: u64, is_cons: u64) -> *mut u64 {
     let ctx = unsafe { &*ctx };
     let p = alloc_space(words as usize);
-    ctx.global
-        .eternal
-        .lock()
-        .unwrap()
-        .push((p as usize, is_cons != 0));
+    ctx.global.eternal.lock().push((p as usize, is_cons != 0));
     p
 }
 
@@ -848,7 +852,7 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
     let g = ctx.global;
     let used_before = g.old_used.load(Ordering::Relaxed);
     let mut worklist: Vec<u64> = Vec::new();
-    let mut old = g.old.lock().unwrap();
+    let mut old = g.old.lock();
 
     unsafe {
         // current process: live chain is in ctx
@@ -864,9 +868,12 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
         ctx.exc_class = forward_minor(ctx, &mut old, ctx.exc_class, &mut worklist);
         ctx.exc_reason = forward_minor(ctx, &mut old, ctx.exc_reason, &mut worklist);
 
-        // suspended processes pinned to this scheduler
+        // suspended processes pinned to this scheduler. Messages: drain
+        // ingress into private first, then scan private. Anything arriving
+        // concurrently from another scheduler is old (send promotes), so it
+        // is safe to leave in ingress unscanned.
         {
-            let tab = g.procs.lock().unwrap();
+            let tab = g.procs.read();
             for (id, slot) in tab.iter().enumerate() {
                 let Some(cell) = slot else { continue };
                 let p = proc_mut(cell);
@@ -878,8 +885,8 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
                         *s = forward_minor(ctx, &mut old, *s, &mut worklist);
                     });
                 }
-                let mut mb = p.mailbox.lock().unwrap();
-                for m in mb.iter_mut() {
+                drain_ingress(p);
+                for m in p.private.iter_mut() {
                     *m = forward_minor(ctx, &mut old, *m, &mut worklist);
                 }
             }
@@ -887,7 +894,7 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
 
         // eternal objects (exception reasons) may reference this nursery
         {
-            let eternal = g.eternal.lock().unwrap();
+            let eternal = g.eternal.lock();
             for (pa, is_cons) in eternal.iter() {
                 scan_fields(*pa as *mut u64, *is_cons, &mut |s| {
                     *s = forward_minor(ctx, &mut old, *s, &mut worklist);
@@ -1005,13 +1012,13 @@ fn park_if_stw(ctx: &mut ProcCtx) {
     if !g.stw_flag.load(Ordering::Acquire) {
         return;
     }
-    let mut stw = g.stw.lock().unwrap();
+    let mut stw = g.stw.lock();
     while stw.collecting {
         stw.parked += 1;
         g.stw_cv.notify_all();
         let gen = stw.gen;
         while stw.collecting && stw.gen == gen {
-            stw = g.stw_cv.wait(stw).unwrap();
+            g.stw_cv.wait(&mut stw);
         }
         stw.parked -= 1;
     }
@@ -1022,7 +1029,7 @@ fn park_if_stw(ctx: &mut ProcCtx) {
 fn stw_major(ctx: &mut ProcCtx) {
     let g = ctx.global;
     {
-        let mut stw = g.stw.lock().unwrap();
+        let mut stw = g.stw.lock();
         if stw.collecting {
             drop(stw);
             park_if_stw(ctx); // someone else is collecting: follow
@@ -1036,13 +1043,13 @@ fn stw_major(ctx: &mut ProcCtx) {
             }
         }
         while stw.parked < g.n_scheds - 1 {
-            stw = g.stw_cv.wait(stw).unwrap();
+            g.stw_cv.wait(&mut stw);
         }
     }
 
     major_collect_stw(ctx);
 
-    let mut stw = g.stw.lock().unwrap();
+    let mut stw = g.stw.lock();
     stw.collecting = false;
     g.stw_flag.store(false, Ordering::Release);
     stw.gen += 1;
@@ -1065,7 +1072,7 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
     }
 
     // 2. full copy of the old space, single-threaded
-    let mut old = g.old.lock().unwrap();
+    let mut old = g.old.lock();
     let live_bound = g.old_used.load(Ordering::Relaxed);
     let to_words = usize::max(live_bound, OLD_CHUNK_WORDS);
     let to_space = alloc_space(to_words);
@@ -1092,21 +1099,21 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
             octx.exc_reason = forward_major(octx.exc_reason, &mut top, &mut worklist);
         }
         {
-            let tab = g.procs.lock().unwrap();
+            let tab = g.procs.read();
             for slot in tab.iter() {
                 let Some(cell) = slot else { continue };
                 let p = proc_mut(cell);
                 walk_proc_roots(p, |s| {
                     *s = forward_major(*s, &mut top, &mut worklist);
                 });
-                let mut mb = p.mailbox.lock().unwrap();
-                for m in mb.iter_mut() {
+                drain_ingress(p); // everyone is parked: no concurrent pushes
+                for m in p.private.iter_mut() {
                     *m = forward_major(*m, &mut top, &mut worklist);
                 }
             }
         }
         {
-            let eternal = g.eternal.lock().unwrap();
+            let eternal = g.eternal.lock();
             for (pa, is_cons) in eternal.iter() {
                 scan_fields(*pa as *mut u64, *is_cons, &mut |s| {
                     *s = forward_major(*s, &mut top, &mut worklist);
