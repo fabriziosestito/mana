@@ -70,6 +70,7 @@ const KIND_TUPLE: u64 = 0;
 const KIND_FLOAT: u64 = 1;
 const KIND_FUN: u64 = 2;
 const KIND_MAP: u64 = 4;
+const KIND_BIN: u64 = 5;
 
 /// ctx word offsets (ProcCtx contract).
 const CTX_ROOTS: u64 = 2;
@@ -199,6 +200,8 @@ struct Cg<'ctx, 'p> {
     cur_frame: Cell<Option<PointerValue<'ctx>>>,
     /// raise-path compilation: allocations go to the eternal allocator
     eternal_alloc: Cell<bool>,
+    /// unique-name counter for static byte arrays (wide segment constants)
+    static_bytes_count: Cell<usize>,
     /// innermost enclosing try handler blocks (current function)
     handlers: RefCell<Vec<BasicBlock<'ctx>>>,
     /// lazily created per-function "pop frame; return sentinel" block
@@ -252,6 +255,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             cur_ctx: Cell::new(None),
             cur_frame: Cell::new(None),
             eternal_alloc: Cell::new(false),
+            static_bytes_count: Cell::new(0),
             handlers: RefCell::new(Vec::new()),
             propagate_bb: Cell::new(None),
             var_slots: Default::default(),
@@ -434,12 +438,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.i64t.const_int(NIL, false)
     }
 
-    fn atom_term(&self, name: &str) -> CgResult<IntValue<'ctx>> {
-        let global = {
-            let mut atoms = self.atoms.borrow_mut();
-            if let Some(g) = atoms.get(name) {
-                *g
-            } else {
+    /// The (deduped, linkonce_odr) atom struct global for `name`. Creating it
+    /// also puts the atom into the program's closed-world atom table.
+    fn atom_global(&self, name: &str) -> GlobalValue<'ctx> {
+        let mut atoms = self.atoms.borrow_mut();
+        match atoms.get(name) {
+            Some(g) => *g,
+            None => {
                 let bytes = name.as_bytes();
                 let data = self.ctx.const_string(bytes, false);
                 let len = self.i64t.const_int(bytes.len() as u64, false);
@@ -458,7 +463,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 atoms.insert(name.to_string(), g);
                 g
             }
-        };
+        }
+    }
+
+    fn atom_term(&self, name: &str) -> CgResult<IntValue<'ctx>> {
+        let global = self.atom_global(name);
         let as_int = self
             .builder
             .build_ptr_to_int(global.as_pointer_value(), self.i64t, "atom.addr")
@@ -714,6 +723,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         include: &HashSet<FunName>,
         entry: Option<&FunName>,
     ) -> CgResult<()> {
+        // module and function names are atoms on BEAM (so they satisfy
+        // binary_to_existing_atom, and S4's export table will need them)
+        self.atom_global(&ast.name);
+        for (fname, _) in &ast.definitions {
+            if include.contains(fname) {
+                self.atom_global(&fname.name);
+            }
+        }
         for (fname, fun) in &ast.definitions {
             if !include.contains(fname) {
                 continue;
@@ -1213,7 +1230,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 Ok(phi.as_basic_value().into_int_value())
             }
             Expr::Values(_) => Err("multi-value expression outside let/case".into()),
-            Expr::Binary(_) => Err("bitstring construction is not supported yet".into()),
+            Expr::Binary(segs) => self.compile_binary_construct(f, segs, scope),
             Expr::Map { pairs, update } => {
                 match update {
                     None => {
@@ -1788,6 +1805,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn compile_literal(&self, l: &Literal) -> CgResult<IntValue<'ctx>> {
         match l {
             Literal::Int(n) => Ok(self.small_int(*n)),
+            Literal::Big(_) => {
+                Err("TODO(bignum): integer literal exceeds 61 bits outside a bitstring segment"
+                    .into())
+            }
             Literal::Atom(a) => self.atom_term(a),
             Literal::Nil => Ok(self.nil()),
             Literal::Float(x) => {
@@ -1882,7 +1903,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             other => vec![other],
         };
         let any_guard_gc = clauses.iter().any(|c| self.expr_gc(&c.guard));
-        if any_guard_gc && self.framed() {
+        let any_pat_gc = clauses
+            .iter()
+            .any(|c| c.patterns.iter().any(pattern_may_gc));
+        if (any_guard_gc || any_pat_gc) && self.framed() {
             let slots = exprs
                 .iter()
                 .map(|e| {
@@ -1915,23 +1939,26 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             } else {
                 fail_bb
             };
-            let vs: Vec<IntValue<'ctx>> = match vals {
-                CaseVals::Ssa(vs) => vs.clone(),
-                CaseVals::Slots(slots) => slots
-                    .iter()
-                    .map(|s| self.reload(*s))
-                    .collect::<CgResult<_>>()?,
+            let nvals = match vals {
+                CaseVals::Ssa(vs) => vs.len(),
+                CaseVals::Slots(slots) => slots.len(),
             };
-            if clause.patterns.len() != vs.len() {
+            if clause.patterns.len() != nvals {
                 return Err(format!(
                     "clause has {} patterns but case argument has {} values",
                     clause.patterns.len(),
-                    vs.len()
+                    nvals
                 ));
             }
             let mut cscope = scope.clone();
-            for (v, p) in vs.iter().zip(&clause.patterns) {
-                self.match_pattern(f, *v, p, &mut cscope, next)?;
+            for (i, p) in clause.patterns.iter().enumerate() {
+                // reload lazily: an allocating binary pattern earlier in
+                // this clause invalidates SSA copies of later subjects
+                let v = match vals {
+                    CaseVals::Ssa(vs) => vs[i],
+                    CaseVals::Slots(slots) => self.reload(slots[i])?,
+                };
+                self.match_pattern(f, v, p, &mut cscope, next)?;
             }
             if !is_true_atom(&clause.guard) {
                 let g = self.compile_value(f, &clause.guard, &mut cscope)?;
@@ -1980,7 +2007,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// Emit tests for `pat` against `val`, branching to `fail` on mismatch.
-    /// No allocation happens inside a pattern, so SSA subterm loads are safe.
+    /// Patterns don't allocate — EXCEPT binary patterns with binary-type
+    /// segments, which build sub-binaries (GC points). Wherever a sub-pattern
+    /// may allocate, the enclosing arm keeps its subject in a frame slot and
+    /// re-derives pointers after the sub-match, so no stale SSA pointer is
+    /// ever used across a collection (functions containing such patterns are
+    /// framed by effect analysis; bound vars are already slot-backed).
     fn match_pattern(
         &self,
         f: FunctionValue<'ctx>,
@@ -1996,17 +2028,20 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.match_pattern(f, val, inner, scope, fail)
             }
             Pattern::Lit(Literal::Float(_)) => Err("float patterns not supported yet".into()),
-            Pattern::Binary(_) => Err("bitstring patterns are not supported yet".into()),
+            Pattern::Binary(segs) => self.match_binary(f, val, segs, scope, fail),
             Pattern::Map(pairs) => {
-                // no allocation inside a pattern: keys must be literals or
-                // vars; the lookup helper is non-allocating
+                let slot = self.pattern_subject_slot(pat, val)?;
                 for (k, sub) in pairs {
+                    let subject = match slot {
+                        Some(s) => self.reload(s)?,
+                        None => val,
+                    };
                     let key = self.compile_value(f, k, scope)?;
                     let call = self
                         .builder
                         .build_call(
                             self.rt_tt_i64("mana_rt_map_pat_get"),
-                            &[val.into(), key.into()],
+                            &[subject.into(), key.into()],
                             "mpat",
                         )
                         .map_err(be)?;
@@ -2053,7 +2088,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .build_int_compare(IntPredicate::EQ, header, want, "hdr.ok")
                     .map_err(be)?;
                 self.branch_test(f, hdr_ok, fail)?;
+                let slot = self.pattern_subject_slot(pat, val)?;
                 for (i, sub) in ps.iter().enumerate() {
+                    let p = match slot {
+                        Some(s) => {
+                            let subject = self.reload(s)?;
+                            self.builder
+                                .build_int_to_ptr(subject, self.ptrt, "tuple.ptr")
+                                .map_err(be)?
+                        }
+                        None => p,
+                    };
                     let elem = self.load_word(p, 1 + i as u64)?;
                     self.match_pattern(f, elem, sub, scope, fail)?;
                 }
@@ -2079,12 +2124,235 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .builder
                     .build_int_to_ptr(addr, self.ptrt, "cons.ptr")
                     .map_err(be)?;
+                let slot = self.pattern_subject_slot(pat, val)?;
                 let head = self.load_word(p, 0)?;
                 self.match_pattern(f, head, h, scope, fail)?;
+                let p = match slot {
+                    Some(s) => {
+                        let subject = self.reload(s)?;
+                        let addr = self
+                            .builder
+                            .build_and(
+                                subject,
+                                self.i64t.const_int(!TAG_MASK, false),
+                                "cons.addr",
+                            )
+                            .map_err(be)?;
+                        self.builder
+                            .build_int_to_ptr(addr, self.ptrt, "cons.ptr")
+                            .map_err(be)?
+                    }
+                    None => p,
+                };
                 let tail = self.load_word(p, 1)?;
                 self.match_pattern(f, tail, t, scope, fail)
             }
         }
+    }
+
+    /// If this pattern's sub-matches contain a GC point, park the subject in
+    /// a frame slot so the caller can re-derive pointers after each one.
+    fn pattern_subject_slot(&self, pat: &Pattern, val: IntValue<'ctx>) -> CgResult<Option<u64>> {
+        if !pattern_may_gc(pat) {
+            return Ok(None);
+        }
+        if !self.framed() {
+            return Err("internal: allocating pattern in frameless function".into());
+        }
+        Ok(Some(self.spill(val)?))
+    }
+
+    /// Match a bitstring pattern: per-segment extraction with a running
+    /// (constant) byte offset. Binary-type segments allocate sub-binaries;
+    /// the subject is kept in a frame slot across those (see match_pattern).
+    fn match_binary(
+        &self,
+        f: FunctionValue<'ctx>,
+        val: IntValue<'ctx>,
+        segs: &[mana_syntax::BinSegment<Box<Pattern>>],
+        scope: &mut Scope<'ctx>,
+        fail: BasicBlock<'ctx>,
+    ) -> CgResult<()> {
+        let specs = segs
+            .iter()
+            .map(|s| parse_seg_spec(&s.spec))
+            .collect::<Result<Vec<_>, _>>()?;
+        if specs.iter().any(|s| matches!(s.kind, SegKind::Utf8)) {
+            return Err("TODO(utf8): utf8 segments in patterns".into());
+        }
+        let slot = if specs.iter().any(|s| s.kind.allocates()) {
+            if !self.framed() {
+                return Err("internal: allocating binary pattern in frameless function".into());
+            }
+            Some(self.spill(val)?)
+        } else {
+            None
+        };
+        // fast preflight: is-binary + length (exact when there is no rest)
+        let const_total: u64 = specs
+            .iter()
+            .map(|s| match s.kind {
+                SegKind::Int { nbytes } | SegKind::BinFixed { nbytes } => nbytes,
+                _ => 0,
+            })
+            .sum();
+        let rest = specs
+            .iter()
+            .any(|s| matches!(s.kind, SegKind::BinAll));
+        let call = self
+            .builder
+            .build_call(
+                self.rt_fn("mana_rt_bin_len_check", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                }),
+                &[
+                    val.into(),
+                    self.i64t.const_int(const_total, false).into(),
+                    self.i64t.const_int(rest as u64, false).into(),
+                ],
+                "blen",
+            )
+            .map_err(be)?;
+        let ok = call_result(call)?.into_int_value();
+        let ok = self
+            .builder
+            .build_int_compare(IntPredicate::NE, ok, self.i64t.const_zero(), "blen.ok")
+            .map_err(be)?;
+        self.branch_test(f, ok, fail)?;
+        let mut off: u64 = 0;
+        for (spec, seg) in specs.iter().zip(segs) {
+            let subject = match slot {
+                Some(s) => self.reload(s)?,
+                None => val,
+            };
+            // constant integer sub-patterns (incl. erlc's wide folded string
+            // literals) compare against a static byte array in one call
+            if let SegKind::Int { nbytes } = spec.kind {
+                let lit_bytes = match seg.value.as_ref() {
+                    Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_))) => {
+                        seg_const_bytes(&Expr::Lit(l.clone()), nbytes, spec.little)?
+                    }
+                    _ => None,
+                };
+                if let Some(bytes) = lit_bytes {
+                    let ptr = self.static_bytes(&bytes)?;
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_fn("mana_rt_bin_match_bytes", || {
+                                self.i64t.fn_type(
+                                    &[
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                    ],
+                                    false,
+                                )
+                            }),
+                            &[
+                                subject.into(),
+                                self.i64t.const_int(off, false).into(),
+                                ptr.into(),
+                                self.i64t.const_int(bytes.len() as u64, false).into(),
+                            ],
+                            "bmb",
+                        )
+                        .map_err(be)?;
+                    let ok = call_result(call)?.into_int_value();
+                    let ok = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            ok,
+                            self.i64t.const_zero(),
+                            "bmb.ok",
+                        )
+                        .map_err(be)?;
+                    self.branch_test(f, ok, fail)?;
+                    off += nbytes;
+                    continue;
+                }
+                if nbytes > 8 {
+                    return Err(
+                        "TODO(bignum): binding integer segments over 64 bits".into()
+                    );
+                }
+            }
+            match spec.kind {
+                SegKind::Int { nbytes } => {
+                    let flags = (spec.little as u64) | ((spec.signed as u64) << 1);
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_fn("mana_rt_bin_read_int", || {
+                                self.i64t.fn_type(
+                                    &[
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                    ],
+                                    false,
+                                )
+                            }),
+                            &[
+                                subject.into(),
+                                self.i64t.const_int(off, false).into(),
+                                self.i64t.const_int(nbytes, false).into(),
+                                self.i64t.const_int(flags, false).into(),
+                            ],
+                            "bri",
+                        )
+                        .map_err(be)?;
+                    let v = call_result(call)?.into_int_value();
+                    // bounds were prechecked; no sentinel test needed
+                    self.match_pattern(f, v, &seg.value, scope, fail)?;
+                    off += nbytes;
+                }
+                SegKind::BinAll | SegKind::BinFixed { .. } => {
+                    let (len, adv): (i64, u64) = match spec.kind {
+                        SegKind::BinFixed { nbytes } => (nbytes as i64, nbytes),
+                        _ => (-1, 0),
+                    };
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_fn("mana_rt_bin_slice", || {
+                                self.i64t.fn_type(
+                                    &[
+                                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                    ],
+                                    false,
+                                )
+                            }),
+                            &[
+                                self.ctx_val().into(),
+                                subject.into(),
+                                self.i64t.const_int(off, false).into(),
+                                self.i64t.const_int(len as u64, false).into(),
+                            ],
+                            "brs",
+                        )
+                        .map_err(be)?;
+                    let v = call_result(call)?.into_int_value();
+                    self.match_pattern(f, v, &seg.value, scope, fail)?;
+                    off += adv;
+                }
+                SegKind::Utf8 => unreachable!(),
+            }
+        }
+        Ok(())
     }
 
     fn branch_test(
@@ -2574,9 +2842,116 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let c = self.builder.build_or(small, isf, "isnum").map_err(be)?;
                 self.bool_term(c)
             }
-            ("is_binary", 1) | ("is_bitstring", 1) | ("is_port", 1) => {
-                // no such terms yet (S3)
-                self.atom_term("false")
+            ("is_port", 1) => self.atom_term("false"),
+            ("is_binary", 1) | ("is_bitstring", 1) => {
+                // byte-aligned only: binary <=> bitstring
+                let c = self.kind_test(f, argv[0], |s, header| {
+                    let k = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xff, false), "k")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(KIND_BIN, false),
+                            "k.b",
+                        )
+                        .map_err(be)
+                })?;
+                self.bool_term(c)
+            }
+            ("byte_size", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_byte_size"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "bsz",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("bit_size", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_byte_size"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "bsz",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                let v = self.check_exc(f, v)?;
+                let raw = self
+                    .builder
+                    .build_right_shift(v, self.i64t.const_int(3, false), true, "bits.raw")
+                    .map_err(be)?;
+                let bits = self
+                    .builder
+                    .build_int_mul(raw, self.i64t.const_int(8, false), "bits")
+                    .map_err(be)?;
+                self.retag_int(bits)
+            }
+            ("binary_part", 3) => {
+                let callee = self.rt_fn("mana_rt_binary_part", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "bpart",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("binary_to_list", 1)
+            | ("list_to_binary", 1)
+            | ("iolist_to_binary", 1)
+            | ("integer_to_binary", 1)
+            | ("atom_to_binary", 1)
+            | ("atom_to_binary", 2)
+            | ("binary_to_atom", 1)
+            | ("binary_to_atom", 2)
+            | ("binary_to_existing_atom", 1)
+            | ("binary_to_existing_atom", 2) => {
+                // encoding args (latin1/utf8) are irrelevant: atom names are
+                // ascii; closed world makes to_atom = to_existing_atom
+                let helper = match name {
+                    "binary_to_list" => "mana_rt_binary_to_list",
+                    "list_to_binary" => "mana_rt_list_to_binary",
+                    "iolist_to_binary" => "mana_rt_iolist_to_binary",
+                    "integer_to_binary" => "mana_rt_integer_to_binary",
+                    "atom_to_binary" => "mana_rt_atom_to_binary",
+                    _ => "mana_rt_binary_to_atom",
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64(helper),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "bconv",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
             }
             ("is_map", 1) => {
                 let c = self.kind_test(f, argv[0], |s, header| {
@@ -2857,6 +3232,241 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 false,
             )
         })
+    }
+
+    /// An internal constant byte array; returns its pointer.
+    fn static_bytes(&self, bytes: &[u8]) -> CgResult<PointerValue<'ctx>> {
+        let data = self.ctx.const_string(bytes, false);
+        let n = self.static_bytes_count.get();
+        self.static_bytes_count.set(n + 1);
+        let g = self
+            .module
+            .add_global(data.get_type(), None, &format!("mana_bytes.{}", n));
+        g.set_initializer(&data);
+        g.set_constant(true);
+        g.set_linkage(Linkage::Internal);
+        Ok(g.as_pointer_value())
+    }
+
+    /// Bitstring construction: evaluate all segment values (rooted), compute
+    /// the total byte size (consts + byte_size of spliced binaries), allocate
+    /// once, then fill with non-allocating writers.
+    fn compile_binary_construct(
+        &self,
+        f: FunctionValue<'ctx>,
+        segs: &[mana_syntax::BinSegment<Box<Expr>>],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let specs = segs
+            .iter()
+            .map(|s| parse_seg_spec(&s.spec))
+            .collect::<Result<Vec<_>, _>>()?;
+        // segments whose bytes are known at compile time (integer literals —
+        // including erlc's wide folded string constants — and utf8 code
+        // points) become static byte arrays written with one memcpy
+        let mut const_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(specs.len());
+        for (spec, seg) in specs.iter().zip(segs) {
+            const_bytes.push(match spec.kind {
+                SegKind::Utf8 => match seg.value.as_ref() {
+                    Expr::Lit(Literal::Int(cp)) => {
+                        let c = char::from_u32(*cp as u32)
+                            .ok_or("invalid utf8 code point in bitstring")?;
+                        let mut buf = [0u8; 4];
+                        Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+                    }
+                    _ => return Err("TODO(utf8): dynamic utf8 bitstring segments".into()),
+                },
+                SegKind::Int { nbytes } => {
+                    let cb = seg_const_bytes(seg.value.as_ref(), nbytes, spec.little)?;
+                    if cb.is_none() && nbytes > 8 {
+                        return Err(
+                            "TODO(bignum): dynamic integer segments over 64 bits".into()
+                        );
+                    }
+                    cb
+                }
+                SegKind::BinFixed { .. } => {
+                    return Err(
+                        "TODO(bitstring): fixed-size binary segments in construction".into(),
+                    )
+                }
+                SegKind::BinAll => None,
+            });
+        }
+        // constant segments are not evaluated (their exprs may be Big
+        // literals, which have no term representation)
+        let nil_expr = Expr::Lit(Literal::Nil);
+        let values: Vec<&Expr> = segs
+            .iter()
+            .zip(&const_bytes)
+            .map(|(s, cb)| if cb.is_some() { &nil_expr } else { s.value.as_ref() })
+            .collect();
+        let rooted = self.eval_all_rooted(f, &values, scope)?;
+        // total size: const part + dynamic byte_size() per spliced binary
+        let mut const_total: u64 = 0;
+        for (i, spec) in specs.iter().enumerate() {
+            match (&const_bytes[i], &spec.kind) {
+                (Some(bytes), _) => const_total += bytes.len() as u64,
+                (None, SegKind::Int { nbytes }) => const_total += nbytes,
+                _ => {}
+            }
+        }
+        let mut total = self.i64t.const_int(const_total, false);
+        let mut splice_sizes: Vec<Option<IntValue<'ctx>>> = vec![None; specs.len()];
+        for (i, spec) in specs.iter().enumerate() {
+            if matches!(spec.kind, SegKind::BinAll) {
+                let v = self.rooted_get(&rooted[i])?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_byte_size"),
+                        &[self.ctx_val().into(), v.into()],
+                        "bsz",
+                    )
+                    .map_err(be)?;
+                let szt = call_result(call)?.into_int_value();
+                let szt = self.check_exc(f, szt)?;
+                let raw = self
+                    .builder
+                    .build_right_shift(szt, self.i64t.const_int(3, false), true, "bsz.raw")
+                    .map_err(be)?;
+                splice_sizes[i] = Some(raw);
+                total = self.builder.build_int_add(total, raw, "btot").map_err(be)?;
+            }
+        }
+        // single GC point: values are rooted, sizes are raw ints
+        let alloc_fn = if self.eternal_alloc.get() {
+            self.rt_fn("mana_rt_bin_alloc_eternal", || {
+                self.i64t.fn_type(
+                    &[
+                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                    ],
+                    false,
+                )
+            })
+        } else {
+            self.rt_fn("mana_rt_bin_alloc", || {
+                self.i64t.fn_type(
+                    &[
+                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                    ],
+                    false,
+                )
+            })
+        };
+        let call = self
+            .builder
+            .build_call(alloc_fn, &[self.ctx_val().into(), total.into()], "bin")
+            .map_err(be)?;
+        let bin = call_result(call)?.into_int_value();
+        // fill (writers never allocate)
+        let mut off = self.i64t.const_zero();
+        for (i, spec) in specs.iter().enumerate() {
+            if let Some(bytes) = &const_bytes[i] {
+                let ptr = self.static_bytes(bytes)?;
+                self.builder
+                    .build_call(
+                        self.rt_fn("mana_rt_bin_write_bytes", || {
+                            self.ctx.void_type().fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[
+                            bin.into(),
+                            off.into(),
+                            ptr.into(),
+                            self.i64t.const_int(bytes.len() as u64, false).into(),
+                        ],
+                        "",
+                    )
+                    .map_err(be)?;
+                off = self
+                    .builder
+                    .build_int_add(
+                        off,
+                        self.i64t.const_int(bytes.len() as u64, false),
+                        "boff",
+                    )
+                    .map_err(be)?;
+                continue;
+            }
+            match &spec.kind {
+                SegKind::Int { nbytes } => {
+                    let v = self.rooted_get(&rooted[i])?;
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_fn("mana_rt_bin_write_int", || {
+                                self.i64t.fn_type(
+                                    &[
+                                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                    ],
+                                    false,
+                                )
+                            }),
+                            &[
+                                self.ctx_val().into(),
+                                bin.into(),
+                                off.into(),
+                                v.into(),
+                                self.i64t.const_int(*nbytes, false).into(),
+                                self.i64t.const_int(spec.little as u64, false).into(),
+                            ],
+                            "bwi",
+                        )
+                        .map_err(be)?;
+                    let r = call_result(call)?.into_int_value();
+                    self.check_exc(f, r)?;
+                    off = self
+                        .builder
+                        .build_int_add(off, self.i64t.const_int(*nbytes, false), "boff")
+                        .map_err(be)?;
+                }
+                SegKind::Utf8 => unreachable!("const_bytes covers utf8"),
+                SegKind::BinAll => {
+                    let v = self.rooted_get(&rooted[i])?;
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_fn("mana_rt_bin_write_bin", || {
+                                self.i64t.fn_type(
+                                    &[
+                                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                        BasicMetadataTypeEnum::IntType(self.i64t),
+                                    ],
+                                    false,
+                                )
+                            }),
+                            &[self.ctx_val().into(), bin.into(), off.into(), v.into()],
+                            "bwb",
+                        )
+                        .map_err(be)?;
+                    let r = call_result(call)?.into_int_value();
+                    self.check_exc(f, r)?;
+                    off = self
+                        .builder
+                        .build_int_add(off, splice_sizes[i].unwrap(), "boff")
+                        .map_err(be)?;
+                }
+                SegKind::BinFixed { .. } => unreachable!(),
+            }
+        }
+        Ok(bin)
     }
 
     fn compile_maps_bif(
@@ -3319,7 +3929,39 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
 
     // ---- output ----
 
+    /// Closed-world atom table: one pointer per atom static in the
+    /// `mana_atoms` ELF section (linkonce_odr → linker-deduped program-wide,
+    /// like the atoms themselves). Pinned via llvm.used so O2 can't discard
+    /// the otherwise-unreferenced globals. The runtime walks
+    /// __start_mana_atoms..__stop_mana_atoms for binary_to_atom.
+    fn emit_atom_table(&self) {
+        let atoms = self.atoms.borrow();
+        if atoms.is_empty() {
+            return;
+        }
+        let mut used: Vec<PointerValue<'ctx>> = Vec::with_capacity(atoms.len());
+        for (name, g) in atoms.iter() {
+            let r = self.module.add_global(
+                self.ptrt,
+                None,
+                &format!("mana_atomref.{}", sanitize(name)),
+            );
+            r.set_initializer(&g.as_pointer_value());
+            r.set_constant(true);
+            r.set_alignment(8);
+            r.set_section(Some("mana_atoms"));
+            r.set_linkage(Linkage::LinkOnceODR);
+            used.push(r.as_pointer_value());
+        }
+        let arr = self.ptrt.const_array(&used);
+        let lu = self.module.add_global(arr.get_type(), None, "llvm.used");
+        lu.set_initializer(&arr);
+        lu.set_linkage(Linkage::Appending);
+        lu.set_section(Some("llvm.metadata"));
+    }
+
     fn emit_object(&self, out: &Path) -> CgResult<()> {
+        self.emit_atom_table();
         Target::initialize_native(&InitializationConfig::default())
             .map_err(|e| format!("target init: {}", e))?;
         let triple = TargetMachine::get_default_triple();
@@ -3356,6 +3998,168 @@ enum Rooted<'ctx> {
 enum CaseVals<'ctx> {
     Ssa(Vec<IntValue<'ctx>>),
     Slots(Vec<u64>),
+}
+
+/// A parsed bitstring segment spec `(size, unit, type, flags)`. Byte-aligned
+/// subset only; sub-byte sizes are TODO(bitstring).
+struct SegSpec {
+    little: bool,
+    signed: bool,
+    kind: SegKind,
+}
+
+enum SegKind {
+    Int { nbytes: u64 },
+    /// `Rest/binary` — size 'all'
+    BinAll,
+    /// fixed-size binary extraction/splice
+    BinFixed { nbytes: u64 },
+    Utf8,
+}
+
+impl SegKind {
+    fn allocates(&self) -> bool {
+        matches!(self, SegKind::BinAll | SegKind::BinFixed { .. })
+    }
+}
+
+fn atom_list(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Lit(Literal::Atom(a)) => out.push(a.clone()),
+        Expr::Cons(h, t) => {
+            atom_list(h, out);
+            atom_list(t, out);
+        }
+        _ => {}
+    }
+}
+
+fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {
+    if spec.len() != 4 {
+        return Err(format!("bitstring segment spec has {} args, want 4", spec.len()));
+    }
+    let ty = match &spec[2] {
+        Expr::Lit(Literal::Atom(a)) => a.as_str(),
+        other => return Err(format!("bitstring segment type is not an atom: {:?}", other)),
+    };
+    let unit = match &spec[1] {
+        Expr::Lit(Literal::Int(u)) => *u,
+        _ => return Err("bitstring segment unit is not a constant".into()),
+    };
+    let mut flags = Vec::new();
+    atom_list(&spec[3], &mut flags);
+    let little = flags.iter().any(|f| f == "little" || f == "native");
+    let signed = flags.iter().any(|f| f == "signed");
+    let kind = match (ty, &spec[0]) {
+        ("utf8", _) => SegKind::Utf8,
+        ("integer", Expr::Lit(Literal::Int(sz))) => {
+            let bits = sz * unit;
+            if bits % 8 != 0 || bits <= 0 {
+                return Err(format!(
+                    "TODO(bitstring): only byte-aligned integer segments are supported (got {} bits)",
+                    bits
+                ));
+            }
+            SegKind::Int { nbytes: (bits / 8) as u64 }
+        }
+        ("binary", Expr::Lit(Literal::Atom(a))) if a == "all" => SegKind::BinAll,
+        ("binary", Expr::Lit(Literal::Int(sz))) => {
+            let bits = sz * unit;
+            if bits % 8 != 0 || bits < 0 {
+                return Err("TODO(bitstring): sub-byte binary segment size".into());
+            }
+            SegKind::BinFixed { nbytes: (bits / 8) as u64 }
+        }
+        ("integer", _) | ("binary", _) => {
+            return Err("dynamic bitstring segment sizes are not supported yet".into())
+        }
+        ("float", _) => return Err("TODO: float bitstring segments".into()),
+        (other, _) => return Err(format!("unsupported bitstring segment type '{}'", other)),
+    };
+    Ok(SegSpec { little, signed, kind })
+}
+
+/// Does matching this pattern allocate? (binary patterns with binary-type
+/// segments build sub-binaries)
+fn pattern_may_gc(p: &Pattern) -> bool {
+    match p {
+        Pattern::Binary(segs) => segs
+            .iter()
+            .any(|s| matches!(parse_seg_spec(&s.spec), Ok(sp) if sp.kind.allocates())),
+        Pattern::Alias(_, inner) => pattern_may_gc(inner),
+        Pattern::Tuple(ps) => ps.iter().any(pattern_may_gc),
+        Pattern::Cons(h, t) => pattern_may_gc(h) || pattern_may_gc(t),
+        Pattern::Map(pairs) => pairs.iter().any(|(_, sub)| pattern_may_gc(sub)),
+        _ => false,
+    }
+}
+
+/// Decimal digits → big-endian bytes, truncated (mod 2^(8n)) or left-padded
+/// to exactly `nbytes` — BEAM's truncating construction semantics.
+fn big_to_bytes(dec: &str, nbytes: usize, little: bool) -> Result<Vec<u8>, String> {
+    let mut digits: Vec<u8> = Vec::with_capacity(dec.len());
+    for c in dec.bytes() {
+        if !c.is_ascii_digit() {
+            return Err(format!("bad big-integer literal '{}'", dec));
+        }
+        digits.push(c - b'0');
+    }
+    // repeated long division by 256, remainders = little-endian bytes
+    let mut le = Vec::new();
+    while digits.iter().any(|&d| d != 0) {
+        let mut rem: u32 = 0;
+        let mut q = Vec::with_capacity(digits.len());
+        for &d in &digits {
+            let cur = rem * 10 + d as u32;
+            q.push((cur / 256) as u8);
+            rem = cur % 256;
+        }
+        le.push(rem as u8);
+        while q.first() == Some(&0) {
+            q.remove(0);
+        }
+        digits = q;
+    }
+    le.resize(nbytes, 0);
+    le.truncate(nbytes);
+    if !little {
+        le.reverse();
+    }
+    Ok(le)
+}
+
+/// The constant bytes of an integer segment, when they can be computed at
+/// compile time. `None` = dynamic value.
+fn seg_const_bytes(value: &Expr, nbytes: u64, little: bool) -> Result<Option<Vec<u8>>, String> {
+    match value {
+        Expr::Lit(Literal::Int(n)) => {
+            let mut out = Vec::with_capacity(nbytes as usize);
+            let v = *n as u64;
+            for i in 0..nbytes {
+                let shift = 8 * if little { i } else { nbytes - 1 - i };
+                out.push(if shift < 64 { (v >> shift) as u8 } else {
+                    // sign-extension bytes beyond 64 bits
+                    if *n < 0 { 0xff } else { 0 }
+                });
+            }
+            Ok(Some(out))
+        }
+        Expr::Lit(Literal::Big(d)) => Ok(Some(big_to_bytes(d, nbytes as usize, little)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Frame slots the match compiler will spill for this pattern (subjects
+/// parked across allocating sub-matches; see pattern_subject_slot).
+fn pattern_spill_sites(p: &Pattern) -> usize {
+    let own = pattern_may_gc(p) as usize;
+    own + match p {
+        Pattern::Alias(_, inner) => pattern_spill_sites(inner),
+        Pattern::Tuple(ps) => ps.iter().map(pattern_spill_sites).sum(),
+        Pattern::Cons(h, t) => pattern_spill_sites(h) + pattern_spill_sites(t),
+        Pattern::Map(pairs) => pairs.iter().map(|(_, s)| pattern_spill_sites(s)).sum(),
+        _ => 0,
+    }
 }
 
 /// Modules implemented natively (never compiled from beams).
@@ -3512,6 +4316,19 @@ fn expr_may_raise(
                         | ("map_size", 1)
                         | ("map_get", 2)
                         | ("is_map_key", 2)
+                        | ("byte_size", 1)
+                        | ("bit_size", 1)
+                        | ("binary_part", 3)
+                        | ("binary_to_list", 1)
+                        | ("list_to_binary", 1)
+                        | ("iolist_to_binary", 1)
+                        | ("integer_to_binary", 1)
+                        | ("atom_to_binary", 1)
+                        | ("atom_to_binary", 2)
+                        | ("binary_to_atom", 1)
+                        | ("binary_to_atom", 2)
+                        | ("binary_to_existing_atom", 1)
+                        | ("binary_to_existing_atom", 2)
                 )
             } else {
                 raise_set.contains(&(
@@ -3545,7 +4362,8 @@ fn expr_may_raise(
             expr_may_raise(body, cur_mod, raise_set, letrec_bound)
                 || expr_may_raise(handler, cur_mod, raise_set, letrec_bound)
         }
-        Expr::Binary(_) => false, // rejected at codegen
+        // construction raises badarg on non-int values / non-binary splices
+        Expr::Binary(_) => true,
         // updates raise badmap/badkey; construction only via children
         Expr::Map { pairs, update } => {
             update.is_some()
@@ -3601,7 +4419,16 @@ fn expr_may_gc(
             if module == "erlang"
                 && matches!(
                     (name.as_str(), args.len()),
-                    ("setelement", 3) | ("++", 2) | ("--", 2)
+                    ("setelement", 3)
+                        | ("++", 2)
+                        | ("--", 2)
+                        | ("binary_part", 3)
+                        | ("binary_to_list", 1)
+                        | ("list_to_binary", 1)
+                        | ("iolist_to_binary", 1)
+                        | ("integer_to_binary", 1)
+                        | ("atom_to_binary", 1)
+                        | ("atom_to_binary", 2)
                 )
             {
                 return true;
@@ -3653,6 +4480,9 @@ fn expr_may_gc(
         }
         Expr::Case { arg, clauses } => {
             expr_may_gc(arg, cur_mod, gc_set, letrec_bound)
+                || clauses
+                    .iter()
+                    .any(|c| c.patterns.iter().any(pattern_may_gc))
                 || clauses.iter().any(|c| {
                     expr_may_gc(&c.guard, cur_mod, gc_set, letrec_bound)
                         || expr_may_gc(&c.body, cur_mod, gc_set, letrec_bound)
@@ -3731,6 +4561,10 @@ fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut usize) {
                 let mut pvars = Vec::new();
                 c.patterns.iter().for_each(|p| pattern_vars(p, &mut pvars));
                 vars.extend(pvars);
+                // allocating (binary) sub-patterns spill their subjects
+                c.patterns
+                    .iter()
+                    .for_each(|p| *nodes += pattern_spill_sites(p));
                 frame_prepass(&c.guard, vars, nodes);
                 frame_prepass(&c.body, vars, nodes);
             }

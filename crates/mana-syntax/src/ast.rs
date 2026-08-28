@@ -23,6 +23,8 @@ pub struct Fun {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
+    /// > i64: decimal digits; valid only as a bitstring segment constant
+    Big(String),
     Float(f64),
     Atom(String),
     Nil,

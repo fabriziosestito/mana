@@ -25,6 +25,9 @@ pub enum Tok {
     After,
     // literals & names
     Int(i64),
+    /// An integer literal too large for i64 (erlc folds long string
+    /// constants into single wide bitstring segments). Decimal digits.
+    BigInt(String),
     Float(f64),
     Atom(String),
     Var(String),
@@ -265,10 +268,12 @@ impl<'a> Lexer<'a> {
             return Ok(Tok::Float(if negative { -v } else { v }));
         }
         let text = String::from_utf8_lossy(&self.src[start..self.pos]);
-        let v: i64 = text
-            .parse()
-            .map_err(|e| format!("line {}: bad integer '{}': {}", self.line, text, e))?;
-        Ok(Tok::Int(if negative { -v } else { v }))
+        match text.parse::<i64>() {
+            Ok(v) => Ok(Tok::Int(if negative { -v } else { v })),
+            // wide constant bitstring segments; only meaningful there
+            Err(_) if !negative => Ok(Tok::BigInt(text.into_owned())),
+            Err(e) => Err(format!("line {}: bad integer '{}': {}", self.line, text, e)),
+        }
     }
 
     fn lex_quoted_atom(&mut self) -> LexResult<Tok> {

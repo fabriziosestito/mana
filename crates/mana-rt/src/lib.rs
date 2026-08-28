@@ -89,6 +89,7 @@ pub const KIND_FUN: u64 = 2;
 /// Flatmap: `[header(size<<8|4) | k1..kn | v1..vn]`, keys canonically
 /// sorted (term order with an exactness tiebreak: 1 before 1.0).
 pub const KIND_MAP: u64 = 4;
+pub const KIND_BIN: u64 = 5;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
@@ -130,6 +131,7 @@ fn payload_words(header: u64) -> usize {
         KIND_FLOAT => 1,
         KIND_FUN => 1 + (header >> 16) as usize,
         KIND_MAP => 2 * (header >> 8) as usize,
+        KIND_BIN => ((header >> 8) as usize + 7) / 8,
         _ => 0,
     }
 }
@@ -1636,6 +1638,7 @@ fn type_rank(t: u64) -> u8 {
                 KIND_FLOAT => 0,
                 KIND_FUN => 3,
                 KIND_MAP => 6,
+                KIND_BIN => 9,
                 _ => 5, // tuple
             }
         }
@@ -1725,6 +1728,15 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
             }
             0
         },
+        9 => {
+            // binaries: byte-lexicographic, prefix is smaller
+            let (xa, xb) = (bin_bytes(a), bin_bytes(b));
+            match xa.cmp(xb) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }
+        }
         8 => unsafe {
             // lists: heads recursively, tails iteratively
             let (mut x, mut y) = (a, b);
@@ -1805,6 +1817,7 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
                     }
                     1
                 }
+                KIND_BIN => (bin_bytes(a) == bin_bytes(b)) as i64,
                 _ => 0, // funs: identity only (raw-equal handled above)
             }
         },
@@ -2391,6 +2404,410 @@ pub extern "C" fn mana_rt_uncaught(ctx: *mut ProcCtx) -> ! {
     std::process::exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// binaries (byte-aligned; sub-byte bitstrings are TODO(bitstring))
+
+fn bin_parts(t: u64) -> Option<(*const u8, usize)> {
+    if t & TAG_MASK != TAG_BOXED || t == 0 {
+        return None;
+    }
+    let p = t as *const u64;
+    let header = unsafe { *p };
+    if header & 0xff != KIND_BIN {
+        return None;
+    }
+    Some((unsafe { p.add(1) } as *const u8, (header >> 8) as usize))
+}
+
+fn bin_bytes(t: u64) -> &'static [u8] {
+    match bin_parts(t) {
+        Some((p, n)) => unsafe { std::slice::from_raw_parts(p, n) },
+        None => &[],
+    }
+}
+
+/// Allocate an uninitialized binary of `bytes` in the nursery. Padding in
+/// the last data word is zeroed so word-granular copies stay deterministic.
+/// Caller must have rooted every live term (may GC).
+fn alloc_bin(ctx: &mut ProcCtx, bytes: usize) -> *mut u64 {
+    let words = 1 + (bytes + 7) / 8;
+    let p = alloc_nursery(ctx, words);
+    unsafe {
+        *p = ((bytes as u64) << 8) | KIND_BIN;
+        if bytes % 8 != 0 {
+            // zero the final data word's padding (never the header)
+            *p.add(words - 1) = 0;
+        }
+    }
+    p
+}
+
+/// Codegen entry: allocate a zero-padded binary; construction writers fill
+/// it in. All live terms must be rooted by the caller (may GC).
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_alloc(ctx: *mut ProcCtx, nbytes: u64) -> u64 {
+    alloc_bin(unsafe { &mut *ctx }, nbytes as usize) as u64
+}
+
+/// Raise-path construction: eternal (malloc) binary, registered so majors
+/// keep it alive; never moves, so no rooting needed.
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_alloc_eternal(ctx: *mut ProcCtx, nbytes: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let bytes = nbytes as usize;
+    let words = 1 + (bytes + 7) / 8;
+    let p = alloc_space(words);
+    ctx.global.eternal.lock().push((p as usize, false));
+    unsafe {
+        *p = ((bytes as u64) << 8) | KIND_BIN;
+        if words > 1 {
+            *p.add(words - 1) = 0;
+        }
+    }
+    p as u64
+}
+
+/// Pattern preflight: is `t` a binary of exactly `n` bytes (`at_least` = 0)
+/// or at least `n` bytes (`at_least` = 1)?
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_len_check(t: u64, n: u64, at_least: u64) -> u64 {
+    match bin_parts(t) {
+        Some((_, len)) => {
+            (if at_least != 0 { len >= n as usize } else { len == n as usize }) as u64
+        }
+        None => 0,
+    }
+}
+
+/// Pattern extraction of an integer segment. flags: bit0 little-endian,
+/// bit1 signed. Returns the sentinel for out-of-bounds / non-binary —
+/// pattern-match failure, NOT an exception. Non-allocating.
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u64) -> u64 {
+    let Some((p, len)) = bin_parts(bin) else {
+        return EXC_SENTINEL;
+    };
+    let (off, nbytes) = (off as usize, nbytes as usize);
+    if off + nbytes > len {
+        return EXC_SENTINEL;
+    }
+    let mut v: u64 = 0;
+    unsafe {
+        if flags & 1 != 0 {
+            for i in (0..nbytes).rev() {
+                v = (v << 8) | *p.add(off + i) as u64;
+            }
+        } else {
+            for i in 0..nbytes {
+                v = (v << 8) | *p.add(off + i) as u64;
+            }
+        }
+    }
+    let sv = if flags & 2 != 0 && nbytes > 0 {
+        let shift = 64 - 8 * nbytes.min(8) as u32;
+        if shift > 0 { ((v << shift) as i64) >> shift } else { v as i64 }
+    } else {
+        v as i64
+    };
+    // small ints hold 61 bits; 64-bit segments with larger values need
+    // bignums we don't have
+    if nbytes >= 8 && (sv >> 60 != 0 && sv >> 60 != -1) {
+        eprintln!("mana: TODO(bignum): 64-bit binary segment value out of small-int range");
+        std::process::abort();
+    }
+    ((sv << 3) as u64) | TAG_SMALL
+}
+
+/// Pattern extraction of a binary segment: `len < 0` means the whole rest.
+/// Sentinel = match failure. Allocates the sub-binary (roots `bin`).
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_slice(ctx: *mut ProcCtx, bin: u64, off: u64, len: i64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, total)) = bin_parts(bin) else {
+        return EXC_SENTINEL;
+    };
+    let off = off as usize;
+    if off > total {
+        return EXC_SENTINEL;
+    }
+    let len = if len < 0 { total - off } else { len as usize };
+    if off + len > total {
+        return EXC_SENTINEL;
+    }
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, bin];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let newp = alloc_bin(ctx, len);
+    ctx.roots_head = saved;
+    let (p, _) = bin_parts(fr[2]).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(p.add(off), newp.add(1) as *mut u8, len);
+    }
+    newp as u64
+}
+
+/// Construction writer: constant segment bytes from a static array.
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_write_bytes(bin: u64, off: u64, ptr: *const u8, len: u64) {
+    let (p, _) = bin_parts(bin).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(ptr, (p as *mut u8).add(off as usize), len as usize);
+    }
+}
+
+/// Pattern check: do the bytes at `off` equal a constant array? 0 for
+/// non-binary / out of bounds / mismatch. Non-allocating.
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_match_bytes(bin: u64, off: u64, ptr: *const u8, len: u64) -> u64 {
+    let Some((p, total)) = bin_parts(bin) else {
+        return 0;
+    };
+    let (off, len) = (off as usize, len as usize);
+    if off + len > total {
+        return 0;
+    }
+    let a = unsafe { std::slice::from_raw_parts(p.add(off), len) };
+    let b = unsafe { std::slice::from_raw_parts(ptr, len) };
+    (a == b) as u64
+}
+
+/// Construction writer: store an integer segment (truncating, like BEAM).
+/// Non-allocating; badarg if the value is not a small int.
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_write_int(
+    ctx: *mut ProcCtx,
+    bin: u64,
+    off: u64,
+    val: u64,
+    nbytes: u64,
+    little: u64,
+) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if val & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let v = (val as i64 >> 3) as u64;
+    let (p, _) = bin_parts(bin).unwrap();
+    let (off, nbytes) = (off as usize, nbytes as usize);
+    unsafe {
+        let p = p as *mut u8;
+        for i in 0..nbytes {
+            let byte = (v >> (8 * if little != 0 { i } else { nbytes - 1 - i })) as u8;
+            *p.add(off + i) = byte;
+        }
+    }
+    0
+}
+
+/// Construction writer: splice a whole binary. Non-allocating; the total
+/// size was computed from byte_size beforehand, so src is a valid binary.
+#[no_mangle]
+pub extern "C" fn mana_rt_bin_write_bin(ctx: *mut ProcCtx, bin: u64, off: u64, src: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((sp, sn)) = bin_parts(src) else {
+        return raise_badarg(ctx);
+    };
+    let (p, _) = bin_parts(bin).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(sp, (p as *mut u8).add(off as usize), sn);
+    }
+    0
+}
+
+/// erlang:byte_size/1 (raising convention).
+#[no_mangle]
+pub extern "C" fn mana_rt_byte_size(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    match bin_parts(t) {
+        Some((_, n)) => ((n as u64) << 3) | TAG_SMALL,
+        None => raise_badarg(ctx),
+    }
+}
+
+/// erlang:binary_part/3 — negative length reaches backwards (BEAM).
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_part(ctx: *mut ProcCtx, bin: u64, pos: u64, len: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, total)) = bin_parts(bin) else {
+        return raise_badarg(ctx);
+    };
+    if pos & TAG_MASK != TAG_SMALL || len & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let (pos, len) = (pos as i64 >> 3, len as i64 >> 3);
+    let (start, n) = if len < 0 { (pos + len, -len) } else { (pos, len) };
+    if start < 0 || n < 0 || (start + n) as usize > total || start as usize > total {
+        return raise_badarg(ctx);
+    }
+    let v = mana_rt_bin_slice(ctx, bin, start as u64, n);
+    if v == EXC_SENTINEL {
+        return raise_badarg(ctx);
+    }
+    v
+}
+
+/// erlang:binary_to_list/1.
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_to_list(ctx: *mut ProcCtx, bin: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((_, n)) = bin_parts(bin) else {
+        return raise_badarg(ctx);
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, bin, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for i in (0..n).rev() {
+        let cell = alloc_nursery(ctx, 2);
+        let (p, _) = bin_parts(fr[2]).unwrap();
+        unsafe {
+            *cell = ((*p.add(i) as u64) << 3) | TAG_SMALL;
+            *cell.add(1) = fr[3];
+        }
+        fr[3] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[3]
+}
+
+/// Flatten an iolist (nested lists of bytes and binaries, binary tails
+/// allowed) into `out`. Err = badarg.
+fn iolist_flatten(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
+    if let Some((p, n)) = bin_parts(t) {
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(p, n) });
+        return Ok(());
+    }
+    let mut cur = t;
+    loop {
+        if cur == NIL {
+            return Ok(());
+        }
+        if cur & TAG_MASK != TAG_CONS {
+            // a binary tail terminates an iolist
+            if bin_parts(cur).is_some() {
+                return iolist_flatten(cur, out);
+            }
+            return Err(());
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if h & TAG_MASK == TAG_SMALL {
+            let v = h as i64 >> 3;
+            if !(0..=255).contains(&v) {
+                return Err(());
+            }
+            out.push(v as u8);
+        } else {
+            iolist_flatten(h, out)?;
+        }
+        cur = unsafe { *p.add(1) };
+    }
+}
+
+fn bytes_to_new_bin(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+    // bytes are already copied out of the heap — nothing to root
+    let p = alloc_bin(ctx, bytes.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(1) as *mut u8, bytes.len());
+    }
+    p as u64
+}
+
+/// erlang:list_to_binary/1 (accepts iolists, like BEAM).
+#[no_mangle]
+pub extern "C" fn mana_rt_list_to_binary(ctx: *mut ProcCtx, l: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if l != NIL && l & TAG_MASK != TAG_CONS {
+        return raise_badarg(ctx);
+    }
+    let mut out = Vec::new();
+    match iolist_flatten(l, &mut out) {
+        Ok(()) => bytes_to_new_bin(ctx, &out),
+        Err(()) => raise_badarg(ctx),
+    }
+}
+
+/// erlang:iolist_to_binary/1 — also accepts a bare binary.
+#[no_mangle]
+pub extern "C" fn mana_rt_iolist_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut out = Vec::new();
+    match iolist_flatten(t, &mut out) {
+        Ok(()) => bytes_to_new_bin(ctx, &out),
+        Err(()) => raise_badarg(ctx),
+    }
+}
+
+/// erlang:integer_to_binary/1.
+#[no_mangle]
+pub extern "C" fn mana_rt_integer_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if t & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let s = (t as i64 >> 3).to_string();
+    bytes_to_new_bin(ctx, s.as_bytes())
+}
+
+/// erlang:atom_to_binary/1,2 (utf8 == latin1 for our ascii atom names).
+#[no_mangle]
+pub extern "C" fn mana_rt_atom_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if t & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let bytes: Vec<u8> = atom_bytes(t).to_vec();
+    bytes_to_new_bin(ctx, &bytes)
+}
+
+// Closed-world atom table: codegen plants one pointer per atom static in
+// the `mana_atoms` ELF section; the linker deduplicates (linkonce_odr) and
+// provides __start/__stop bounds. Every program registers well-known atoms,
+// so the section is never empty.
+extern "C" {
+    static __start_mana_atoms: u64;
+    static __stop_mana_atoms: u64;
+}
+
+fn atom_table() -> &'static std::collections::HashMap<&'static [u8], u64> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<&'static [u8], u64>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        unsafe {
+            let start = &raw const __start_mana_atoms;
+            let stop = &raw const __stop_mana_atoms;
+            let n = (stop as usize - start as usize) / 8;
+            for i in 0..n {
+                // entries are raw pointers to the atom structs
+                let p = *start.add(i);
+                if p != 0 {
+                    let atom = p | TAG_ATOM;
+                    map.insert(atom_bytes(atom), atom);
+                }
+            }
+        }
+        map
+    })
+}
+
+/// erlang:binary_to_atom/1,2 — closed world: only atoms that exist in the
+/// compiled program can be produced (binary_to_existing_atom semantics;
+/// unknown names are badarg, where BEAM would mint the atom).
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_to_atom(ctx: *mut ProcCtx, bin: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((p, n)) = bin_parts(bin) else {
+        return raise_badarg(ctx);
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(p, n) };
+    match atom_table().get(bytes) {
+        Some(a) => *a,
+        None => raise_badarg(ctx),
+    }
+}
+
 fn write_term(t: u64, out: &mut String) {
     match t & TAG_MASK {
         TAG_SMALL => {
@@ -2471,6 +2888,31 @@ fn write_term(t: u64, out: &mut String) {
                         write_term(*p.add(1 + n + i), out);
                     }
                     out.push('}');
+                }
+                KIND_BIN => {
+                    let bytes = std::slice::from_raw_parts(p.add(1) as *const u8, (header >> 8) as usize);
+                    out.push_str("<<");
+                    // all-printable-ascii binaries render as a string; unlike
+                    // char lists, control chars do NOT qualify
+                    if !bytes.is_empty() && bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+                        out.push('"');
+                        for &b in bytes {
+                            // only the quote is escaped (backslash prints raw)
+                            if b == b'"' {
+                                out.push('\\');
+                            }
+                            out.push(b as char);
+                        }
+                        out.push('"');
+                    } else {
+                        for (i, b) in bytes.iter().enumerate() {
+                            if i > 0 {
+                                out.push(',');
+                            }
+                            out.push_str(&b.to_string());
+                        }
+                    }
+                    out.push_str(">>");
                 }
                 _ => out.push_str("#<unknown-boxed>"),
             }

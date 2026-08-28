@@ -176,6 +176,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Lit(Literal::Int(n)))
             }
+            Tok::BigInt(d) => {
+                self.bump();
+                Ok(Expr::Lit(Literal::Big(d)))
+            }
             Tok::Float(f) => {
                 self.bump();
                 Ok(Expr::Lit(Literal::Float(f)))
@@ -501,11 +505,17 @@ impl Parser {
             return Ok(segs);
         }
         loop {
+            // segments may be annotation-wrapped: `( #<v>(spec) -| [...] )`
+            let wrapped = self.eat(&Tok::LParen);
             self.expect(Tok::SegOpen)?;
             let value = parse_value(self)?;
             self.expect(Tok::Gt)?;
             self.expect(Tok::LParen)?;
             let spec = self.parse_comma_exprs(Tok::RParen)?;
+            if wrapped {
+                self.skip_annotation()?;
+                self.expect(Tok::RParen)?;
+            }
             segs.push(BinSegment { value, spec });
             if !self.eat(&Tok::Comma) {
                 break;
@@ -607,6 +617,10 @@ impl Parser {
             Tok::Int(n) => {
                 self.bump();
                 Ok(Pattern::Lit(Literal::Int(n)))
+            }
+            Tok::BigInt(d) => {
+                self.bump();
+                Ok(Pattern::Lit(Literal::Big(d)))
             }
             Tok::Float(f) => {
                 self.bump();
