@@ -40,7 +40,8 @@ defmodule ConformanceTest do
       Mix.Task.rerun("mana.compile", ["--entry", "#{mod_str}.go/0", "--out", out_dir])
       app = Path.join(out_dir, "app")
       assert File.exists?(app), "manac did not produce #{app}"
-      {native, status} = System.cmd(app, [], stderr_to_stdout: true)
+      # stdout only — both sides may emit crash reports on stderr
+      {native, status} = System.cmd(app, [])
       assert status == 0, "native #{mod_str} crashed (exit #{status}):\n#{native}"
 
       # oracle: same module, fresh BEAM OS process
