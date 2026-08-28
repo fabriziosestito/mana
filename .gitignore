@@ -1,0 +1,7 @@
+/target
+*.beam
+examples/*.core
+examples/fib
+*.o
+examples/demo
+examples/bench

@@ -1,0 +1,9 @@
+[package]
+name = "manac"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mana-syntax = { path = "../mana-syntax" }
+mana-codegen = { path = "../mana-codegen" }
