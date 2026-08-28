@@ -10,4 +10,5 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 corosensei = "0.3"
 crossbeam-queue = "0.3.13"
+mmtk = "0.33"
 parking_lot = "0.12.5"

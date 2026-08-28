@@ -62,6 +62,8 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::SegQueue;
 use parking_lot::{Condvar, Mutex, RwLock};
 
+mod mmtk_gc;
+
 use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 
@@ -91,7 +93,8 @@ pub const CONS_HEADER: u64 = (2 << 8) | KIND_CONS;
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
 const OLD_LIMIT_INIT: usize = 4 * OLD_CHUNK_WORDS;
-const STACK_BYTES: usize = 1024 * 1024;
+/// Reservation only — anonymous pages commit lazily on first touch.
+const STACK_BYTES: usize = 8 * 1024 * 1024;
 const ROOT_STACK_BYTES: usize = 32 * 1024 * 1024;
 const REDUCTIONS_PER_SLICE: i64 = 4000;
 
@@ -121,7 +124,7 @@ unsafe fn free_space(p: *mut u64, words: usize) {
     unsafe { std::alloc::dealloc(p as *mut u8, layout) };
 }
 
-fn payload_words(header: u64) -> usize {
+pub(crate) fn payload_words(header: u64) -> usize {
     match header & 0xff {
         KIND_TUPLE => (header >> 8) as usize,
         KIND_FLOAT => 1,
@@ -177,7 +180,7 @@ enum PState {
 
 type ProcCoro = Coroutine<(), (), u64, DefaultStack>;
 
-struct Process {
+pub(crate) struct Process {
     home: usize,
     coro: Option<ProcCoro>,
     yielder: *const Yielder<(), ()>,
@@ -189,7 +192,7 @@ struct Process {
     /// be young (local minors drain + scan).
     ingress: SegQueue<u64>,
     /// receiver-private message list — home scheduler only, no lock
-    private: Vec<u64>,
+    pub(crate) private: Vec<u64>,
     /// receive cursor into `private` — home scheduler only
     cursor: usize,
     state: Mutex<PState>,
@@ -199,18 +202,18 @@ struct Process {
 
 /// Home-scheduler pinning makes the interior safe: only the home thread (or
 /// the STW requester while everyone is parked) touches non-Mutex fields.
-struct ProcessCell(UnsafeCell<Process>);
+pub(crate) struct ProcessCell(UnsafeCell<Process>);
 unsafe impl Send for ProcessCell {}
 unsafe impl Sync for ProcessCell {}
 
-struct SchedShared {
+pub(crate) struct SchedShared {
     /// pids made runnable by other threads (lock-free)
     inject: SegQueue<usize>,
     /// wake signal for an idle scheduler; the bool defeats lost wakeups
     cv: Condvar,
     cv_m: Mutex<bool>,
     /// registered ProcCtx pointer (for the STW requester)
-    ctx_addr: AtomicUsize,
+    pub(crate) ctx_addr: AtomicUsize,
 }
 
 struct StwState {
@@ -219,16 +222,23 @@ struct StwState {
     gen: u64,
 }
 
-struct Global {
-    n_scheds: usize,
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum GcMode {
+    Native,
+    Mmtk,
+}
+
+pub(crate) struct Global {
+    pub(crate) gc_mode: GcMode,
+    pub(crate) n_scheds: usize,
     /// fast-path flag mirroring StwState.collecting
     stw_flag: AtomicBool,
-    scheds: Vec<SchedShared>,
-    procs: RwLock<Vec<Option<&'static ProcessCell>>>,
+    pub(crate) scheds: Vec<SchedShared>,
+    pub(crate) procs: RwLock<Vec<Option<&'static ProcessCell>>>,
     old: Mutex<OldSpace>,
     old_used: AtomicUsize,
     old_limit: AtomicUsize,
-    eternal: Mutex<Vec<(usize, bool)>>,
+    pub(crate) eternal: Mutex<Vec<(usize, bool)>>,
     stw: Mutex<StwState>,
     stw_cv: Condvar,
     spawn_rr: AtomicUsize,
@@ -247,9 +257,9 @@ pub struct ProcCtx {
     nursery_start: *mut u64,
     nursery_words: usize,
     global: &'static Global,
-    sched_id: usize,
+    pub(crate) sched_id: usize,
     run_q: VecDeque<usize>,
-    current: usize,
+    pub(crate) current: usize,
     /// cached &ProcessCell of the running process (hot path: recv primops)
     current_cell: usize,
 }
@@ -260,7 +270,7 @@ fn proc_ref(g: &Global, pid: usize) -> Option<&'static ProcessCell> {
 
 /// Home-thread (or STW-requester) access to a process's interior.
 #[allow(clippy::mut_from_ref)]
-unsafe fn proc_mut(cell: &ProcessCell) -> &mut Process {
+pub(crate) unsafe fn proc_mut(cell: &ProcessCell) -> &mut Process {
     unsafe { &mut *cell.0.get() }
 }
 
@@ -283,7 +293,12 @@ pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
         .and_then(|s| s.parse().ok())
         .filter(|&n| (1..=1024).contains(&n))
         .unwrap_or(1);
+    let gc_mode = match std::env::var("MANA_GC").as_deref() {
+        Ok("mmtk") => GcMode::Mmtk,
+        _ => GcMode::Native,
+    };
     let global: &'static Global = Box::leak(Box::new(Global {
+        gc_mode,
         n_scheds: n,
         stw_flag: AtomicBool::new(false),
         scheds: (0..n)
@@ -332,6 +347,15 @@ fn new_sched_ctx(global: &'static Global, sched_id: usize) -> *mut ProcCtx {
     global.scheds[sched_id]
         .ctx_addr
         .store(ctx as usize, Ordering::Release);
+    if global.gc_mode == GcMode::Mmtk {
+        mmtk_gc::init_scheduler(global, sched_id, global.n_scheds);
+        // force the first allocation through the slow path to sync the
+        // MMTk bump window into ctx words 0/1
+        unsafe {
+            (*ctx).heap_top = 8 as *mut u64;
+            (*ctx).heap_end = std::ptr::null_mut();
+        }
+    }
     ctx
 }
 
@@ -544,7 +568,7 @@ fn term_in_nursery(ctx: &ProcCtx, t: u64) -> bool {
 /// the same trade BEAM's copying send makes. Iterative: payloads can be
 /// arbitrarily deep and this runs on a small coroutine stack.
 fn promote_term(ctx: &mut ProcCtx, t: u64) -> u64 {
-    if !term_in_nursery(ctx, t) {
+    if ctx.global.gc_mode == GcMode::Mmtk || !term_in_nursery(ctx, t) {
         return t;
     }
     let global = ctx.global;
@@ -700,7 +724,7 @@ fn cur_proc(ctx: &ProcCtx) -> &mut Process {
 }
 
 /// Move everything from the ingress queue into the private list.
-fn drain_ingress(p: &mut Process) {
+pub(crate) fn drain_ingress(p: &mut Process) {
     while let Some(m) = p.ingress.pop() {
         p.private.push(m);
     }
@@ -785,6 +809,9 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
     let ctx = unsafe { &mut *ctx };
     let words = words as usize;
     park_if_stw(ctx);
+    if ctx.global.gc_mode == GcMode::Mmtk {
+        return mmtk_gc::alloc_slow(ctx, words);
+    }
     let promoted = minor_collect(ctx);
     let g = ctx.global;
     if g.old_used.load(Ordering::Relaxed) > g.old_limit.load(Ordering::Relaxed) {
@@ -823,7 +850,7 @@ pub extern "C" fn mana_rt_alloc_eternal(ctx: *mut ProcCtx, words: u64, is_cons: 
 }
 
 /// Walk one process's saved GC root slots with `f`.
-unsafe fn walk_proc_roots(p: &mut Process, mut f: impl FnMut(*mut u64)) {
+pub(crate) unsafe fn walk_proc_roots(p: &mut Process, mut f: impl FnMut(*mut u64)) {
     unsafe {
         let mut frame = p.saved_roots as *mut u64;
         while !frame.is_null() {
@@ -997,6 +1024,42 @@ fn park_if_stw(ctx: &mut ProcCtx) {
         }
         stw.parked -= 1;
     }
+}
+
+/// MMTk worker: raise the STW flag and wait until every scheduler parked
+/// (via park_if_stw at safepoints, or block_current_for_mmtk on the
+/// triggering thread).
+pub(crate) fn stw_begin_for_mmtk(g: &Global) {
+    let mut stw = g.stw.lock();
+    stw.collecting = true;
+    g.stw_flag.store(true, Ordering::Release);
+    for id in 0..g.n_scheds {
+        wake_sched(g, id);
+    }
+    while stw.parked < g.n_scheds {
+        g.stw_cv.wait(&mut stw);
+    }
+}
+
+pub(crate) fn stw_end_for_mmtk(g: &Global) {
+    let mut stw = g.stw.lock();
+    stw.collecting = false;
+    g.stw_flag.store(false, Ordering::Release);
+    stw.gen += 1;
+    g.stw_cv.notify_all();
+}
+
+/// The scheduler thread whose allocation triggered an MMTk collection:
+/// park until the collection epoch advances.
+pub(crate) fn block_current_for_mmtk(g: &Global) {
+    let mut stw = g.stw.lock();
+    stw.parked += 1;
+    g.stw_cv.notify_all();
+    let gen = stw.gen;
+    while stw.gen == gen {
+        g.stw_cv.wait(&mut stw);
+    }
+    stw.parked -= 1;
 }
 
 /// Request a stop-the-world major collection; runs once every other
