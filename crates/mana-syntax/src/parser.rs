@@ -207,6 +207,29 @@ impl Parser {
                 let segs = self.parse_binary(|p| Ok(Box::new(p.parse_expr()?)))?;
                 Ok(Expr::Binary(segs))
             }
+            Tok::MapOpen => {
+                self.bump();
+                let mut pairs = Vec::new();
+                let mut update = None;
+                if !self.eat(&Tok::MapClose) {
+                    loop {
+                        let key = self.parse_expr()?;
+                        if !self.eat(&Tok::Assoc) {
+                            self.expect(Tok::ExactAssoc)?;
+                        }
+                        let val = self.parse_expr()?;
+                        pairs.push((key, val));
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    if self.eat(&Tok::Bar) {
+                        update = Some(Box::new(self.parse_expr()?));
+                    }
+                    self.expect(Tok::MapClose)?;
+                }
+                Ok(Expr::Map { pairs, update })
+            }
             Tok::Lt => {
                 self.bump();
                 let items = self.parse_comma_exprs(Tok::Gt)?;
@@ -578,6 +601,25 @@ impl Parser {
                 let segs = self.parse_binary(|p| Ok(Box::new(p.parse_pattern()?)))?;
                 Ok(Pattern::Binary(segs))
             }
+            Tok::MapOpen => {
+                self.bump();
+                let mut pairs = Vec::new();
+                if !self.eat(&Tok::MapClose) {
+                    loop {
+                        let key = self.parse_expr()?;
+                        if !self.eat(&Tok::ExactAssoc) {
+                            self.expect(Tok::Assoc)?;
+                        }
+                        let val = self.parse_pattern()?;
+                        pairs.push((key, val));
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::MapClose)?;
+                }
+                Ok(Pattern::Map(pairs))
+            }
             other => Err(format!(
                 "line {}: unsupported token in pattern: {}",
                 self.line(),
@@ -611,6 +653,23 @@ end
         assert_eq!(m.name, "m");
         assert_eq!(m.definitions.len(), 1);
         assert_eq!(m.definitions[0].0, FunName { name: "f".into(), arity: 1 });
+    }
+
+    #[test]
+    fn parses_map_literals() {
+        let src = r#"
+module 'm' ['f'/1]
+    attributes []
+'f'/1 =
+    fun (_0) ->
+        case _0 of
+          <~{'k' := V}~> when 'true' -> ~{'k' => V, 'x' => 1}~
+          <M> when 'true' -> ~{'k' => 2 | M}~
+        end
+end
+"#;
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.definitions.len(), 1);
     }
 
     #[test]

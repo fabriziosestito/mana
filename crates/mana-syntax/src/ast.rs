@@ -77,6 +77,12 @@ pub enum Expr {
     },
     /// `#{ seg, ... }#` bitstring construction
     Binary(Vec<BinSegment<Box<Expr>>>),
+    /// `~{ k => v, ... }~` or `~{ k => v | M }~` map construction/update.
+    /// Parse-only for now — codegen rejects maps.
+    Map {
+        pairs: Vec<(Expr, Expr)>,
+        update: Option<Box<Expr>>,
+    },
     /// `do e1 e2` — sequence
     Do(Box<Expr>, Box<Expr>),
 }
@@ -104,4 +110,6 @@ pub enum Pattern {
     Alias(String, Box<Pattern>),
     /// `#{ seg, ... }#` bitstring pattern
     Binary(Vec<BinSegment<Box<Pattern>>>),
+    /// `~{ k := p, ... }~` map pattern (keys are expressions)
+    Map(Vec<(Expr, Pattern)>),
 }

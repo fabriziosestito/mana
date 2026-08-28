@@ -37,9 +37,13 @@ pub enum Tok {
     RBrace,
     LBracket,
     RBracket,
-    BinOpen,  // #{
-    BinClose, // }#
-    SegOpen,  // #<
+    BinOpen,    // #{
+    BinClose,   // }#
+    SegOpen,    // #<
+    MapOpen,    // ~{
+    MapClose,   // }~
+    Assoc,      // =>
+    ExactAssoc, // :=
     Lt,
     Gt,
     Comma,
@@ -119,16 +123,24 @@ impl<'a> Lexer<'a> {
             b'(' => Ok(Tok::LParen),
             b')' => Ok(Tok::RParen),
             b'{' => Ok(Tok::LBrace),
-            // `}` followed by `#` closes a bitstring; a plain tuple-close is
-            // always followed by `,`/`)`/... in valid Core Erlang, never `#`.
-            b'}' => {
-                if self.peek() == Some(b'#') {
+            // `}` followed by `#`/`~` closes a bitstring/map; a plain
+            // tuple-close is always followed by `,`/`)`/... in valid Core
+            // Erlang, never `#` or `~`.
+            b'}' => match self.peek() {
+                Some(b'#') => {
                     self.bump();
                     Ok(Tok::BinClose)
-                } else {
-                    Ok(Tok::RBrace)
                 }
-            }
+                Some(b'~') => {
+                    self.bump();
+                    Ok(Tok::MapClose)
+                }
+                _ => Ok(Tok::RBrace),
+            },
+            b'~' => match self.bump() {
+                Some(b'{') => Ok(Tok::MapOpen),
+                other => Err(format!("line {}: unexpected '~{:?}'", self.line, other)),
+            },
             b'#' => match self.bump() {
                 Some(b'{') => Ok(Tok::BinOpen),
                 Some(b'<') => Ok(Tok::SegOpen),
@@ -139,10 +151,24 @@ impl<'a> Lexer<'a> {
             b'<' => Ok(Tok::Lt),
             b'>' => Ok(Tok::Gt),
             b',' => Ok(Tok::Comma),
-            b'=' => Ok(Tok::Eq),
+            b'=' => {
+                if self.peek() == Some(b'>') {
+                    self.bump();
+                    Ok(Tok::Assoc)
+                } else {
+                    Ok(Tok::Eq)
+                }
+            }
             b'|' => Ok(Tok::Bar),
             b'/' => Ok(Tok::Slash),
-            b':' => Ok(Tok::Colon),
+            b':' => {
+                if self.peek() == Some(b'=') {
+                    self.bump();
+                    Ok(Tok::ExactAssoc)
+                } else {
+                    Ok(Tok::Colon)
+                }
+            }
             b'-' => match self.peek() {
                 Some(b'>') => {
                     self.bump();
