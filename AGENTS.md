@@ -28,8 +28,8 @@ Design pillars (do not violate them casually):
   needs system LLVM 22). Tagged-term constants, pattern-match compilation,
   BIF lowering, object-file emission.
 - `crates/mana-rt/` — the runtime, built as a `staticlib` every binary links
-  against. **Its crate docs define the term representation contract**; read
-  them before touching either side.
+  against. **Its crate docs define the term representation and the
+  ProcCtx/GC contract**; read them before touching either side.
 - `crates/manac/` — CLI driver: takes one or more `.erl`/`.core` files
   (`.erl` goes through `erlc +to_core`), compiles code reachable from
   `--entry [MODULE:]FUN/ARITY` (default `main/0` in the first file's
@@ -148,9 +148,20 @@ When asked to open a PR:
 - **No dynamic atoms.** Atoms exist only as compile-time statics;
   `list_to_atom` and friends are unsupported until a runtime atom table
   exists.
-- **There is no GC.** `mana_rt_alloc` is malloc and leaks by design. Don't
-  "fix" the leak with `free` — terms have no ownership discipline; the fix
-  is the planned per-process copying collector.
+- **There IS a GC now — respect the root discipline.** Each process has a
+  heap with a Cheney copying collector (`mana-rt`). Any call into compiled
+  code that may allocate is a *GC point*; a term held in an SSA register
+  across a GC point is a stale pointer after collection. Codegen enforces
+  this via may-GC effect analysis + root frames + structural spills (see
+  `mana-codegen` crate docs). When adding codegen features: route sibling
+  evaluations through `eval_siblings`/`eval_all_rooted`, never cache a term
+  value across an allocation. Functions proven non-allocating are frameless
+  — don't break the effect analysis's conservatism.
+- **ProcCtx word offsets 0/1/2** (`heap_top`, `heap_end`, `roots_head`) are
+  a fixed contract between `mana-rt` and `mana-codegen`; tag `0b111` is the
+  GC forwarding marker. Change either only in lockstep, and run the GC
+  stress conformance program (`Conf.Gc`). `MANA_GC_LOG=1` prints
+  collections.
 - **Tail calls are hints, not guarantees.** Calls in tail position get the
   LLVM `tail` marker under the C calling convention. Deep non-self recursion
   can still overflow the stack. The planned fix is `tailcc` + `musttail`
