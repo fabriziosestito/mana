@@ -38,8 +38,8 @@ Design pillars (do not violate them casually):
   (`Mana.CoreDump`: `backend.debug_info(:core_v1, ...)` + `:core_pp.format/1`),
   and invokes `manac`. Locates the compiler via `--bin` /
   `config :mana, :bin` / `MANA_BIN` / PATH.
-- `examples/` — `.erl` programs used as end-to-end tests;
-  `examples/elixir/` holds Mix-project examples built via `mix mana.compile`.
+- `examples/erlang/` — single-file `.erl` programs used as end-to-end tests;
+  `examples/elixir/` — Mix-project examples built via `mix mana.compile`.
 - `test/conformance/` — the correctness gate (see below).
 
 ## Term representation (the one contract that must never drift)
@@ -66,9 +66,9 @@ make test                   # cargo test — unit tests (parser, etc.)
 make test-conformance       # THE correctness gate (see below)
 
 # Quick end-to-end smoke checks:
-./target/debug/manac -o /tmp/demo examples/demo.erl && /tmp/demo
-./target/debug/manac -o /tmp/fib  examples/fib.erl  && /tmp/fib   # expect 832040
-make example-elixir                                               # expect 832040
+./target/debug/manac -o /tmp/demo examples/erlang/demo.erl && /tmp/demo
+./target/debug/manac -o /tmp/fib  examples/erlang/fib.erl  && /tmp/fib  # expect 832040
+make example-elixir                                                     # expect 832040
 ```
 
 **Conformance is the gate.** `test/conformance/` holds `Conf.*` Elixir
@@ -157,5 +157,6 @@ When asked to open a PR:
   practice: codegen only compiles functions reachable from the entry point.
   Don't remove the reachability pruning — those generated functions use
   constructs codegen rejects (binaries, unsupported BIFs).
-- `examples/*.core`, `*.beam`, `_mana/`, `_build/`, `deps/`, and compiled
-  example binaries are gitignored build artifacts — never commit them.
+- `examples/erlang/*.core`, `*.beam`, `_mana/`, `_build/`, `deps/`, and
+  compiled example binaries are gitignored build artifacts — never commit
+  them.

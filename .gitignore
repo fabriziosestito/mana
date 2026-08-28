@@ -1,11 +1,12 @@
 /target
 *.beam
-examples/*.core
-examples/fib
+*.core
 *.o
-examples/demo
-examples/bench
 _mana/
 _build/
 deps/
 erl_crash.dump
+# compiled example binaries
+examples/erlang/fib
+examples/erlang/demo
+examples/erlang/bench
