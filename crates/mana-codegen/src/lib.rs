@@ -64,11 +64,12 @@ use mana_syntax::{ApplyTarget, Clause, Expr, Fun, FunName, Literal, Module, Patt
 const TAG_SMALL: u64 = 0b001;
 const TAG_ATOM: u64 = 0b010;
 const NIL: u64 = 0b011;
-const TAG_CONS: u64 = 0b100;
 const TAG_MASK: u64 = 0b111;
 const KIND_TUPLE: u64 = 0;
 const KIND_FLOAT: u64 = 1;
 const KIND_FUN: u64 = 2;
+const KIND_CONS: u64 = 3;
+const CONS_HEADER: u64 = (2 << 8) | KIND_CONS;
 
 /// ctx word offset of `roots_head` (ProcCtx contract).
 const CTX_ROOTS: u64 = 2;
@@ -695,17 +696,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             Expr::Cons(h, t) => {
                 let slots = self.eval_all_rooted(f, &[h.as_ref(), t.as_ref()], scope)?;
-                let p = self.alloc_words(2)?;
+                let p = self.alloc_words(3)?;
+                self.store_word(p, 0, self.i64t.const_int(CONS_HEADER, false))?;
                 for (i, s) in slots.iter().enumerate() {
                     let v = self.reload(*s)?;
-                    self.store_word(p, i as u64, v)?;
+                    self.store_word(p, 1 + i as u64, v)?;
                 }
-                let as_int = self
-                    .builder
-                    .build_ptr_to_int(p, self.i64t, "cons.addr")
-                    .map_err(be)?;
                 self.builder
-                    .build_or(as_int, self.i64t.const_int(TAG_CONS, false), "cons")
+                    .build_ptr_to_int(p, self.i64t, "cons")
                     .map_err(be)
             }
             Expr::Fun(fun) => {
@@ -1302,27 +1300,34 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             Pattern::Cons(h, t) => {
                 let tag = self.tag_of(val)?;
-                let is_cons = self
+                let is_boxed = self
                     .builder
                     .build_int_compare(
                         IntPredicate::EQ,
                         tag,
-                        self.i64t.const_int(TAG_CONS, false),
+                        self.i64t.const_zero(),
+                        "is.boxed",
+                    )
+                    .map_err(be)?;
+                self.branch_test(f, is_boxed, fail)?;
+                let p = self
+                    .builder
+                    .build_int_to_ptr(val, self.ptrt, "cons.ptr")
+                    .map_err(be)?;
+                let header = self.load_word(p, 0)?;
+                let is_cons = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        header,
+                        self.i64t.const_int(CONS_HEADER, false),
                         "is.cons",
                     )
                     .map_err(be)?;
                 self.branch_test(f, is_cons, fail)?;
-                let addr = self
-                    .builder
-                    .build_and(val, self.i64t.const_int(!TAG_MASK, false), "cons.addr")
-                    .map_err(be)?;
-                let p = self
-                    .builder
-                    .build_int_to_ptr(addr, self.ptrt, "cons.ptr")
-                    .map_err(be)?;
-                let head = self.load_word(p, 0)?;
+                let head = self.load_word(p, 1)?;
                 self.match_pattern(f, head, h, scope, fail)?;
-                let tail = self.load_word(p, 1)?;
+                let tail = self.load_word(p, 2)?;
                 self.match_pattern(f, tail, t, scope, fail)
             }
         }

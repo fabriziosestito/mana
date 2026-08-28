@@ -65,6 +65,10 @@ pub const KIND_FLOAT: u64 = 1;
 /// Fun object: `[header | code_ptr | captured terms...]`.
 /// Header: bits 0-7 kind, bits 8-15 arity, bits 16+ number of captures.
 pub const KIND_FUN: u64 = 2;
+/// Cons cell as a boxed object: `[header | head | tail]` (mmtk-spike: every
+/// heap object carries a header so its size is derivable from a reference).
+pub const KIND_CONS: u64 = 3;
+pub const CONS_HEADER: u64 = (2 << 8) | KIND_CONS;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
@@ -229,23 +233,6 @@ unsafe fn forward_minor(ctx: &mut ProcCtx, t: u64, worklist: &mut Vec<u64>) -> u
     match t & TAG_MASK {
         TAG_SMALL | TAG_ATOM => t,
         _ if t == NIL => t,
-        TAG_CONS => unsafe {
-            let addr = t & !TAG_MASK;
-            if !in_nursery(ctx, addr) {
-                return t; // old — and everything it references is old
-            }
-            let p = addr as *mut u64;
-            if *p & TAG_MASK == TAG_FORWARD {
-                return (*p & !TAG_MASK) | TAG_CONS;
-            }
-            let new = old_alloc(ctx, 2);
-            *new = *p;
-            *new.add(1) = *p.add(1);
-            *p = new as u64 | TAG_FORWARD;
-            let nt = new as u64 | TAG_CONS;
-            worklist.push(nt);
-            nt
-        },
         TAG_BOXED => unsafe {
             if !in_nursery(ctx, t) {
                 return t;
@@ -272,11 +259,6 @@ unsafe fn forward_minor(ctx: &mut ProcCtx, t: u64, worklist: &mut Vec<u64>) -> u
 unsafe fn scan_minor(ctx: &mut ProcCtx, t: u64, worklist: &mut Vec<u64>) {
     unsafe {
         match t & TAG_MASK {
-            TAG_CONS => {
-                let p = (t & !TAG_MASK) as *mut u64;
-                *p = forward_minor(ctx, *p, worklist);
-                *p.add(1) = forward_minor(ctx, *p.add(1), worklist);
-            }
             TAG_BOXED => {
                 let p = t as *mut u64;
                 let header = *p;
@@ -292,6 +274,10 @@ unsafe fn scan_minor(ctx: &mut ProcCtx, t: u64, worklist: &mut Vec<u64>) {
                             let f = p.add(2 + i);
                             *f = forward_minor(ctx, *f, worklist);
                         }
+                    }
+                    KIND_CONS => {
+                        *p.add(1) = forward_minor(ctx, *p.add(1), worklist);
+                        *p.add(2) = forward_minor(ctx, *p.add(2), worklist);
                     }
                     _ => {}
                 }
@@ -354,20 +340,6 @@ unsafe fn forward_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) -> 
     match t & TAG_MASK {
         TAG_SMALL | TAG_ATOM => t,
         _ if t == NIL => t,
-        TAG_CONS => unsafe {
-            let p = (t & !TAG_MASK) as *mut u64;
-            if *p & TAG_MASK == TAG_FORWARD {
-                return (*p & !TAG_MASK) | TAG_CONS;
-            }
-            let new = *top;
-            *new = *p;
-            *new.add(1) = *p.add(1);
-            *top = top.add(2);
-            *p = new as u64 | TAG_FORWARD;
-            let nt = new as u64 | TAG_CONS;
-            worklist.push(nt);
-            nt
-        },
         TAG_BOXED => unsafe {
             let p = t as *mut u64;
             if *p & TAG_MASK == TAG_FORWARD {
@@ -392,11 +364,6 @@ unsafe fn forward_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) -> 
 unsafe fn scan_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) {
     unsafe {
         match t & TAG_MASK {
-            TAG_CONS => {
-                let p = (t & !TAG_MASK) as *mut u64;
-                *p = forward_major(*p, top, worklist);
-                *p.add(1) = forward_major(*p.add(1), top, worklist);
-            }
             TAG_BOXED => {
                 let p = t as *mut u64;
                 let header = *p;
@@ -413,6 +380,10 @@ unsafe fn scan_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) {
                             *f = forward_major(*f, top, worklist);
                         }
                     }
+                    KIND_CONS => {
+                        *p.add(1) = forward_major(*p.add(1), top, worklist);
+                        *p.add(2) = forward_major(*p.add(2), top, worklist);
+                    }
                     _ => {}
                 }
             }
@@ -426,6 +397,7 @@ fn payload_words(header: u64) -> usize {
         KIND_TUPLE => (header >> 8) as usize,
         KIND_FLOAT => 1,
         KIND_FUN => 1 + (header >> 16) as usize,
+        KIND_CONS => 2,
         _ => 0,
     }
 }
@@ -471,28 +443,6 @@ fn write_term(t: u64, out: &mut String) {
             out.push_str(&String::from_utf8_lossy(bytes));
         },
         _ if t == NIL => out.push_str("[]"),
-        TAG_CONS => {
-            out.push('[');
-            let mut cur = t;
-            loop {
-                unsafe {
-                    let p = (cur & !TAG_MASK) as *const u64;
-                    write_term(*p, out);
-                    let tail = *p.add(1);
-                    if tail == NIL {
-                        break;
-                    } else if tail & TAG_MASK == TAG_CONS {
-                        out.push(',');
-                        cur = tail;
-                    } else {
-                        out.push('|');
-                        write_term(tail, out);
-                        break;
-                    }
-                }
-            }
-            out.push(']');
-        }
         TAG_BOXED => unsafe {
             let p = t as *const u64;
             let header = *p;
@@ -514,6 +464,28 @@ fn write_term(t: u64, out: &mut String) {
                     out.push_str(&format!("{:?}", f));
                 }
                 KIND_FUN => out.push_str("#Fun<mana>"),
+                KIND_CONS => {
+                    out.push('[');
+                    let mut q = p;
+                    loop {
+                        write_term(*q.add(1), out);
+                        let tail = *q.add(2);
+                        if tail == NIL {
+                            break;
+                        } else if tail & TAG_MASK == TAG_BOXED
+                            && tail != 0
+                            && *(tail as *const u64) & 0xff == KIND_CONS
+                        {
+                            out.push(',');
+                            q = tail as *const u64;
+                        } else {
+                            out.push('|');
+                            write_term(tail, out);
+                            break;
+                        }
+                    }
+                    out.push(']');
+                }
                 _ => out.push_str("#<unknown-boxed>"),
             }
         },
