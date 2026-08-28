@@ -86,7 +86,8 @@ pub const KIND_FUN: u64 = 2;
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
 const OLD_LIMIT_INIT: usize = 4 * OLD_CHUNK_WORDS;
-const STACK_BYTES: usize = 1024 * 1024;
+/// Reservation only — anonymous pages commit lazily on first touch.
+const STACK_BYTES: usize = 8 * 1024 * 1024;
 const ROOT_STACK_BYTES: usize = 32 * 1024 * 1024;
 const REDUCTIONS_PER_SLICE: i64 = 4000;
 
