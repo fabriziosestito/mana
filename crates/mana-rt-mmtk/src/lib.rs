@@ -312,6 +312,20 @@ static GC_SYNC: std::sync::Mutex<GcSync> = std::sync::Mutex::new(GcSync {
 });
 static GC_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
 
+/// Byte offsets of the Default-semantics bump allocator's cursor/limit
+/// inside the Mutator, if the selected plan uses bump allocation. Compiled
+/// code bumps ctx words 0/1 inline; the slow path flushes/re-syncs.
+static BUMP_OFFSETS: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+
+unsafe fn bump_ptrs(mutator: *mut Mutator<Mana>) -> Option<(*mut usize, *mut usize)> {
+    BUMP_OFFSETS.get().copied().flatten().map(|(c, l)| unsafe {
+        (
+            (mutator as *mut u8).add(c) as *mut usize,
+            (mutator as *mut u8).add(l) as *mut usize,
+        )
+    })
+}
+
 fn mmtk_instance() -> &'static MMTK<Mana> {
     MMTK_SINGLETON.get().expect("mmtk not initialized")
 }
@@ -359,8 +373,27 @@ pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
     let mutator = mmtk::memory_manager::bind_mutator(mmtk, tls);
     let mutator = Box::into_raw(mutator);
     MUTATOR_PTR.store(mutator, std::sync::atomic::Ordering::Release);
+
+    // discover the bump-pointer fast path layout for Default allocations
+    let offsets = BUMP_OFFSETS.get_or_init(|| {
+        let selector =
+            mmtk::memory_manager::get_allocator_mapping(mmtk, AllocationSemantics::Default);
+        match mmtk::util::alloc::AllocatorInfo::new::<Mana>(selector) {
+            mmtk::util::alloc::AllocatorInfo::BumpPointer {
+                bump_pointer_offset,
+            } => {
+                // BumpPointer { cursor: Address, limit: Address }
+                Some((bump_pointer_offset, bump_pointer_offset + 8))
+            }
+            _ => None,
+        }
+    });
+    if std::env::var_os("MANA_GC_LOG").is_some() {
+        eprintln!("mana-mmtk: inline fast path: {:?}", offsets);
+    }
+
     let ctx = Box::into_raw(Box::new(ProcCtx {
-        heap_top: 8, // top > end: force slow path
+        heap_top: 8, // top > end: force slow path until first sync
         heap_end: 0,
         roots_head: 0,
         mutator,
@@ -374,9 +407,23 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
     let ctx = unsafe { &mut *ctx };
     let mutator = unsafe { &mut *ctx.mutator };
     let bytes = words as usize * 8;
+    let bump = unsafe { bump_ptrs(ctx.mutator) };
+    // flush: MMTk must see what the inline fast path consumed
+    if let Some((cursor, _)) = bump {
+        if ctx.heap_top as usize > 8 {
+            unsafe { *cursor = ctx.heap_top as usize };
+        }
+    }
     let addr = mmtk::memory_manager::alloc(mutator, bytes, 8, 0, AllocationSemantics::Default);
     let obj = unsafe { ObjectReference::from_raw_address_unchecked(addr) };
     mmtk::memory_manager::post_alloc(mutator, obj, bytes, AllocationSemantics::Default);
+    // re-sync: hand the remaining bump window to the inline fast path
+    if let Some((cursor, limit)) = bump {
+        unsafe {
+            ctx.heap_top = *cursor as u64;
+            ctx.heap_end = *limit as u64;
+        }
+    }
     addr.to_mut_ptr()
 }
 
