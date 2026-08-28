@@ -529,16 +529,24 @@ dependencies = [
 [[package]]
 name = "mana-rt"
 version = "0.1.0"
+dependencies = [
+ "mana-term",
+]
 
 [[package]]
 name = "mana-rt-mmtk"
 version = "0.1.0"
 dependencies = [
+ "mana-term",
  "mmtk",
 ]
 
 [[package]]
 name = "mana-syntax"
+version = "0.1.0"
+
+[[package]]
+name = "mana-term"
 version = "0.1.0"
 
 [[package]]

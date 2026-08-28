@@ -26,18 +26,10 @@ pub const KIND_FLOAT: u64 = 1;
 pub const KIND_FUN: u64 = 2;
 pub const KIND_CONS: u64 = 3;
 
-fn payload_words(header: u64) -> usize {
-    match header & 0xff {
-        KIND_TUPLE => (header >> 8) as usize,
-        KIND_FLOAT => 1,
-        KIND_FUN => 1 + (header >> 16) as usize,
-        KIND_CONS => 2,
-        _ => 0,
-    }
-}
+use mana_term::write_term;
 
 fn object_words(header: u64) -> usize {
-    1 + payload_words(header)
+    1 + mana_term::payload_words(header)
 }
 
 #[derive(Default)]
@@ -270,9 +262,16 @@ pub struct ProcCtx {
 
 #[no_mangle]
 pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
-    let builder = MMTKBuilder::new();
+    let mut builder = MMTKBuilder::new();
+    // Spike milestone 1: NoGC plan with a large fixed heap — allocation
+    // through MMTk end-to-end, collection never triggers.
+    builder.options.plan.set(mmtk::util::options::PlanSelector::NoGC);
+    builder.options.gc_trigger.set(
+        mmtk::util::options::GCTriggerSelector::FixedHeapSize(2 << 30),
+    );
     let mmtk = MMTK_SINGLETON.get_or_init(|| builder.build());
     let tls = VMMutatorThread(VMThread::UNINITIALIZED);
+    mmtk::memory_manager::initialize_collection(mmtk, VMThread::UNINITIALIZED);
     let mutator = mmtk::memory_manager::bind_mutator(mmtk, tls);
     let mutator = Box::into_raw(mutator);
     MUTATOR.with(|m| *m.borrow_mut() = mutator);
@@ -288,29 +287,35 @@ pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
 pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 {
     let ctx = unsafe { &mut *ctx };
     let mutator = unsafe { &mut *ctx.mutator };
-    let addr = mmtk::memory_manager::alloc(
-        mutator,
-        words as usize * 8,
-        8,
-        0,
-        AllocationSemantics::Default,
-    );
+    let bytes = words as usize * 8;
+    let addr = mmtk::memory_manager::alloc(mutator, bytes, 8, 0, AllocationSemantics::Default);
+    let obj = unsafe { ObjectReference::from_raw_address_unchecked(addr) };
+    mmtk::memory_manager::post_alloc(mutator, obj, bytes, AllocationSemantics::Default);
     addr.to_mut_ptr()
 }
 
-// TODO(spike): display/match_fail/badfun duplicated from mana-rt for now —
-// factor a shared mana-term crate when the spike graduates.
+/// `erlang:display/1` — print a term followed by newline.
 #[no_mangle]
-pub extern "C" fn mana_rt_display(_term: u64) {
-    unimplemented!("spike: link mana-rt's display or factor mana-term");
+pub extern "C" fn mana_rt_display(term: u64) {
+    use std::io::Write;
+    let mut out = String::new();
+    unsafe { write_term(term, &mut out) };
+    out.push('\n');
+    let _ = std::io::stdout().write_all(out.as_bytes());
 }
 
 #[no_mangle]
-pub extern "C" fn mana_rt_match_fail(_reason: u64) -> ! {
-    std::process::exit(1)
+pub extern "C" fn mana_rt_match_fail(reason: u64) -> ! {
+    let mut out = String::new();
+    unsafe { write_term(reason, &mut out) };
+    eprintln!("mana: no matching clause / exception: {}", out);
+    std::process::exit(1);
 }
 
 #[no_mangle]
-pub extern "C" fn mana_rt_badfun(_term: u64) -> ! {
-    std::process::exit(1)
+pub extern "C" fn mana_rt_badfun(term: u64) -> ! {
+    let mut out = String::new();
+    unsafe { write_term(term, &mut out) };
+    eprintln!("mana: bad fun application: {}", out);
+    std::process::exit(1);
 }

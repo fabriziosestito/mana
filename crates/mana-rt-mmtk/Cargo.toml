@@ -9,3 +9,4 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 mmtk = "0.33"
+mana-term = { path = "../mana-term" }

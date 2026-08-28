@@ -52,23 +52,11 @@
 
 use std::io::Write;
 
-pub const TAG_MASK: u64 = 0b111;
-pub const TAG_BOXED: u64 = 0b000;
-pub const TAG_SMALL: u64 = 0b001;
-pub const TAG_ATOM: u64 = 0b010;
-pub const NIL: u64 = 0b011;
-pub const TAG_CONS: u64 = 0b100;
-pub const TAG_FORWARD: u64 = 0b111;
-
-pub const KIND_TUPLE: u64 = 0;
-pub const KIND_FLOAT: u64 = 1;
-/// Fun object: `[header | code_ptr | captured terms...]`.
-/// Header: bits 0-7 kind, bits 8-15 arity, bits 16+ number of captures.
-pub const KIND_FUN: u64 = 2;
-/// Cons cell as a boxed object: `[header | head | tail]` (mmtk-spike: every
-/// heap object carries a header so its size is derivable from a reference).
-pub const KIND_CONS: u64 = 3;
-pub const CONS_HEADER: u64 = (2 << 8) | KIND_CONS;
+pub use mana_term::{
+    payload_words, CONS_HEADER, KIND_CONS, KIND_FLOAT, KIND_FUN, KIND_TUPLE, NIL, TAG_ATOM,
+    TAG_BOXED, TAG_FORWARD, TAG_MASK, TAG_SMALL,
+};
+use mana_term::write_term;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
@@ -392,21 +380,11 @@ unsafe fn scan_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) {
     }
 }
 
-fn payload_words(header: u64) -> usize {
-    match header & 0xff {
-        KIND_TUPLE => (header >> 8) as usize,
-        KIND_FLOAT => 1,
-        KIND_FUN => 1 + (header >> 16) as usize,
-        KIND_CONS => 2,
-        _ => 0,
-    }
-}
-
 /// `erlang:display/1` — print a term followed by newline.
 #[no_mangle]
 pub extern "C" fn mana_rt_display(term: u64) {
     let mut out = String::new();
-    write_term(term, &mut out);
+    unsafe { write_term(term, &mut out) };
     out.push('\n');
     let _ = std::io::stdout().write_all(out.as_bytes());
 }
@@ -416,7 +394,7 @@ pub extern "C" fn mana_rt_display(term: u64) {
 #[no_mangle]
 pub extern "C" fn mana_rt_match_fail(reason: u64) -> ! {
     let mut out = String::new();
-    write_term(reason, &mut out);
+    unsafe { write_term(reason, &mut out) };
     eprintln!("mana: no matching clause / exception: {}", out);
     std::process::exit(1);
 }
@@ -426,69 +404,7 @@ pub extern "C" fn mana_rt_match_fail(reason: u64) -> ! {
 #[no_mangle]
 pub extern "C" fn mana_rt_badfun(term: u64) -> ! {
     let mut out = String::new();
-    write_term(term, &mut out);
+    unsafe { write_term(term, &mut out) };
     eprintln!("mana: bad fun application: {}", out);
     std::process::exit(1);
-}
-
-fn write_term(t: u64, out: &mut String) {
-    match t & TAG_MASK {
-        TAG_SMALL => {
-            out.push_str(&((t as i64) >> 3).to_string());
-        }
-        TAG_ATOM => unsafe {
-            let p = (t & !TAG_MASK) as *const u64;
-            let len = *p as usize;
-            let bytes = std::slice::from_raw_parts(p.add(1) as *const u8, len);
-            out.push_str(&String::from_utf8_lossy(bytes));
-        },
-        _ if t == NIL => out.push_str("[]"),
-        TAG_BOXED => unsafe {
-            let p = t as *const u64;
-            let header = *p;
-            let kind = header & 0xff;
-            match kind {
-                KIND_TUPLE => {
-                    let arity = (header >> 8) as usize;
-                    out.push('{');
-                    for i in 0..arity {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        write_term(*p.add(1 + i), out);
-                    }
-                    out.push('}');
-                }
-                KIND_FLOAT => {
-                    let f = f64::from_bits(*p.add(1));
-                    out.push_str(&format!("{:?}", f));
-                }
-                KIND_FUN => out.push_str("#Fun<mana>"),
-                KIND_CONS => {
-                    out.push('[');
-                    let mut q = p;
-                    loop {
-                        write_term(*q.add(1), out);
-                        let tail = *q.add(2);
-                        if tail == NIL {
-                            break;
-                        } else if tail & TAG_MASK == TAG_BOXED
-                            && tail != 0
-                            && *(tail as *const u64) & 0xff == KIND_CONS
-                        {
-                            out.push(',');
-                            q = tail as *const u64;
-                        } else {
-                            out.push('|');
-                            write_term(tail, out);
-                            break;
-                        }
-                    }
-                    out.push(']');
-                }
-                _ => out.push_str("#<unknown-boxed>"),
-            }
-        },
-        _ => out.push_str("#<unknown>"),
-    }
 }

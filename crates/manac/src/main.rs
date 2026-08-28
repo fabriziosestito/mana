@@ -29,6 +29,7 @@ fn run() -> Result<(), String> {
     let mut output: Option<PathBuf> = None;
     let mut entry_spec: Option<String> = None;
     let mut emit_ir = false;
+    let mut runtime = String::from("native");
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -41,10 +42,16 @@ fn run() -> Result<(), String> {
             "--entry" => {
                 entry_spec = Some(args.next().ok_or("--entry requires [MODULE:]FUN/ARITY")?)
             }
+            "--rt" => {
+                runtime = args.next().ok_or("--rt requires 'native' or 'mmtk'")?;
+                if runtime != "native" && runtime != "mmtk" {
+                    return Err(format!("unknown runtime '{}' (native|mmtk)", runtime));
+                }
+            }
             "--emit-ir" => emit_ir = true,
             "-h" | "--help" => {
                 println!(
-                    "usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES..."
+                    "usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--rt native|mmtk] [--emit-ir] FILES..."
                 );
                 return Ok(());
             }
@@ -95,7 +102,7 @@ fn run() -> Result<(), String> {
     let objs =
         mana_codegen::compile_program(&modules, &entry_mod, &entry, &obj_dir, emit_ir, &poisoned)?;
 
-    let link_result = link(&objs, &out);
+    let link_result = link(&objs, &out, &runtime);
     let _ = std::fs::remove_dir_all(&obj_dir);
     link_result?;
     println!("{}", out.display());
@@ -146,8 +153,8 @@ fn erl_to_core(input: &Path) -> Result<PathBuf, String> {
     Ok(input.with_extension("core"))
 }
 
-fn link(objs: &[PathBuf], out: &Path) -> Result<(), String> {
-    let rt = runtime_lib()?;
+fn link(objs: &[PathBuf], out: &Path, runtime: &str) -> Result<(), String> {
+    let rt = runtime_lib(runtime)?;
     let status = Command::new("cc")
         .args(objs)
         .arg(&rt)
@@ -162,17 +169,21 @@ fn link(objs: &[PathBuf], out: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Find libmana_rt.a: $MANA_RT_LIB overrides; otherwise look next to manac
-/// (cargo puts both artifacts in the same target dir).
-fn runtime_lib() -> Result<PathBuf, String> {
+/// Find the runtime staticlib: $MANA_RT_LIB overrides; otherwise look next
+/// to manac (cargo puts all artifacts in the same target dir).
+fn runtime_lib(runtime: &str) -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("MANA_RT_LIB") {
         return Ok(PathBuf::from(p));
     }
+    let name = match runtime {
+        "mmtk" => "libmana_rt_mmtk.a",
+        _ => "libmana_rt.a",
+    };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let candidate = exe
         .parent()
         .ok_or("cannot locate manac directory")?
-        .join("libmana_rt.a");
+        .join(name);
     if candidate.exists() {
         Ok(candidate)
     } else {
