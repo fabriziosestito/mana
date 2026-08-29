@@ -319,6 +319,7 @@ struct KnownAtoms {
     nofile: u64,
     value: u64,
     undefined: u64,
+    badarith: u64,
 }
 static KNOWN: std::sync::OnceLock<KnownAtoms> = std::sync::OnceLock::new();
 
@@ -348,6 +349,7 @@ pub extern "C" fn mana_rt_register_atoms(
     nofile: u64,
     value: u64,
     undefined: u64,
+    badarith: u64,
 ) {
     let _ = KNOWN.set(KnownAtoms {
         normal,
@@ -369,6 +371,7 @@ pub extern "C" fn mana_rt_register_atoms(
         nofile,
         value,
         undefined,
+        badarith,
     });
 }
 
@@ -1221,6 +1224,333 @@ pub extern "C" fn mana_rt_spawn_opt_mfa(
         return shared_tuple(unsafe { &mut *ctx }, &[pid, r]);
     }
     pid
+}
+
+// ---------------------------------------------------------------------------
+// floats & arithmetic
+
+fn raise_badarith(ctx: &mut ProcCtx) -> u64 {
+    ctx.exc_class = atom_error();
+    ctx.exc_reason = known().badarith;
+    EXC_SENTINEL
+}
+
+/// Box an f64 WITHOUT ever triggering a collection: nursery bump if there
+/// is room, otherwise the shared old space (non-moving; majors only run at
+/// safepoints, which a BIF call is not). This keeps arithmetic out of the
+/// may-GC effect set — integer loops stay frameless. Cost: floats born
+/// while the nursery is full live until the next major.
+fn box_float(ctx: &mut ProcCtx, f: f64) -> u64 {
+    let p = unsafe {
+        if ctx.heap_top.add(2) <= ctx.heap_end {
+            let p = ctx.heap_top;
+            ctx.heap_top = ctx.heap_top.add(2);
+            p
+        } else {
+            let g = ctx.global;
+            let mut old = g.old.lock();
+            old.alloc(2, &g.old_used)
+        }
+    };
+    unsafe {
+        *p = (1 << 8) | KIND_FLOAT;
+        *p.add(1) = f.to_bits();
+    }
+    p as u64
+}
+
+/// Float literal pattern test: is `t` a float with exactly these bits?
+/// Non-allocating (safe inside match contexts).
+#[no_mangle]
+pub extern "C" fn mana_rt_float_pat(t: u64, bits: u64) -> u64 {
+    if t & TAG_MASK != TAG_BOXED || t == 0 {
+        return 0;
+    }
+    let p = t as *const u64;
+    unsafe { (*p & 0xff == KIND_FLOAT && *p.add(1) == bits) as u64 }
+}
+
+/// Numeric coercion for arithmetic; None = not a number → badarith.
+fn num_of(t: u64) -> Option<(f64, bool)> {
+    if t & TAG_MASK == TAG_SMALL {
+        return Some(((t as i64 >> 3) as f64, true));
+    }
+    if t & TAG_MASK == TAG_BOXED && t != 0 {
+        let p = t as *const u64;
+        if unsafe { *p } & 0xff == KIND_FLOAT {
+            return Some((f64::from_bits(unsafe { *p.add(1) }), false));
+        }
+    }
+    None
+}
+
+// arithmetic opcodes for mana_rt_arith
+pub const AR_ADD: u64 = 0;
+pub const AR_SUB: u64 = 1;
+pub const AR_MUL: u64 = 2;
+pub const AR_FDIV: u64 = 3;
+pub const AR_IDIV: u64 = 4;
+pub const AR_REM: u64 = 5;
+pub const AR_NEG: u64 = 6;
+pub const AR_ABS: u64 = 7;
+
+/// Arithmetic slow path: anything that isn't the inline both-small-int
+/// case. Mixed/float ops produce boxed floats (box_float — never GCs);
+/// non-numbers and integer ops on floats raise badarith like BEAM.
+#[no_mangle]
+pub extern "C" fn mana_rt_arith(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((x, xi)) = num_of(a) else {
+        return raise_badarith(ctx);
+    };
+    match op {
+        AR_NEG => {
+            if xi {
+                return (((-(a as i64 >> 3)) << 3) as u64) | TAG_SMALL;
+            }
+            return box_float(ctx, -x);
+        }
+        AR_ABS => {
+            if xi {
+                let v = a as i64 >> 3;
+                return (((v.abs()) << 3) as u64) | TAG_SMALL;
+            }
+            return box_float(ctx, x.abs());
+        }
+        _ => {}
+    }
+    let Some((y, yi)) = num_of(b) else {
+        return raise_badarith(ctx);
+    };
+    match op {
+        AR_ADD | AR_SUB | AR_MUL => {
+            if xi && yi {
+                // both small (inline fast path normally catches this)
+                let (p, q) = (a as i64 >> 3, b as i64 >> 3);
+                let r = match op {
+                    AR_ADD => p.wrapping_add(q),
+                    AR_SUB => p.wrapping_sub(q),
+                    _ => p.wrapping_mul(q),
+                };
+                return ((r << 3) as u64) | TAG_SMALL;
+            }
+            let r = match op {
+                AR_ADD => x + y,
+                AR_SUB => x - y,
+                _ => x * y,
+            };
+            box_float(ctx, r)
+        }
+        AR_FDIV => {
+            if y == 0.0 {
+                return raise_badarith(ctx);
+            }
+            box_float(ctx, x / y)
+        }
+        // div/rem are integer-only; the inline fast path handles both-small,
+        // so reaching here means at least one float → badarith (BEAM)
+        AR_IDIV | AR_REM => raise_badarith(ctx),
+        _ => raise_badarith(ctx),
+    }
+}
+
+/// math module (all f64; domain errors are badarith like BEAM).
+#[no_mangle]
+pub extern "C" fn mana_rt_math(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((x, _)) = num_of(a) else {
+        return raise_badarith(ctx);
+    };
+    let y = match num_of(b) {
+        Some((y, _)) => y,
+        None => 0.0, // unary ops pass a dummy small 0
+    };
+    let r = match op {
+        0 => x.sqrt(),
+        1 => x.powf(y),
+        2 => x.ln(),
+        3 => x.log2(),
+        4 => x.log10(),
+        5 => x.exp(),
+        6 => x.sin(),
+        7 => x.cos(),
+        8 => x.tan(),
+        9 => x.asin(),
+        10 => x.acos(),
+        11 => x.atan(),
+        12 => x.atan2(y),
+        13 => x % y,                     // fmod
+        14 => std::f64::consts::PI,     // pi/0
+        15 => x.floor(),
+        16 => x.ceil(),
+        _ => return raise_badarith(ctx),
+    };
+    if r.is_nan() || r.is_infinite() {
+        return raise_badarith(ctx);
+    }
+    box_float(ctx, r)
+}
+
+/// erlang:float/1.
+#[no_mangle]
+pub extern "C" fn mana_rt_to_float(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    match num_of(t) {
+        Some((x, true)) => box_float(ctx, x),
+        Some((_, false)) => t,
+        None => raise_badarg(ctx),
+    }
+}
+
+/// trunc/round/floor/ceil → integers (mode 0..3).
+#[no_mangle]
+pub extern "C" fn mana_rt_f2i(ctx: *mut ProcCtx, mode: u64, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((x, xi)) = num_of(t) else {
+        return raise_badarg(ctx);
+    };
+    if xi {
+        return t;
+    }
+    let r = match mode {
+        0 => x.trunc(),
+        1 => x.round(),
+        2 => x.floor(),
+        _ => x.ceil(),
+    };
+    let v = r as i64;
+    if v >> 60 != 0 && v >> 60 != -1 {
+        eprintln!("mana: TODO(bignum): float conversion out of small-int range");
+        std::process::exit(1);
+    }
+    ((v << 3) as u64) | TAG_SMALL
+}
+
+/// Elixir.Float round/ceil/floor with decimal precision (mode 0/1/2).
+/// Elixir operates on the shortest decimal representation of the float;
+/// formatting at the target precision reproduces that (half-to-even ties,
+/// matching Rust's formatter and Elixir's documented behavior).
+#[no_mangle]
+pub extern "C" fn mana_rt_float_prec(ctx: *mut ProcCtx, t: u64, prec: u64, mode: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((x, is_int)) = num_of(t) else {
+        return raise_badarg(ctx);
+    };
+    if is_int || prec & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let p = prec as i64 >> 3;
+    if !(0..=15).contains(&p) {
+        return raise_badarg(ctx);
+    }
+    let r = match mode {
+        0 => {
+            let s = format!("{:.*}", p as usize, x);
+            s.parse::<f64>().unwrap_or(x)
+        }
+        1 => {
+            let shift = 10f64.powi(p as i32);
+            (x * shift).ceil() / shift
+        }
+        _ => {
+            let shift = 10f64.powi(p as i32);
+            (x * shift).floor() / shift
+        }
+    };
+    box_float(ctx, r)
+}
+
+/// erlang:display's float format: C-style %e with 6 fractional digits and
+/// a signed two-digit exponent (1.000000e+00, 1.234568e+05, 1.000000e-05).
+fn display_float(f: f64) -> String {
+    let s = format!("{:.6e}", f); // Rust: "1.000000e0" / "1.234568e5"
+    match s.split_once('e') {
+        Some((mant, exp)) => {
+            let (sign, digits) = match exp.strip_prefix('-') {
+                Some(d) => ('-', d),
+                None => ('+', exp),
+            };
+            format!("{}e{}{:0>2}", mant, sign, digits)
+        }
+        None => s,
+    }
+}
+
+/// BEAM-parity float text: shortest round-trip with a mandatory decimal
+/// point, exponent form matching OTP's Ryu-based printer (1.0, 0.1,
+/// 1.0e20, 1.0e-5, -0.0).
+fn fmt_float(f: f64) -> String {
+    if f == f64::INFINITY || f == f64::NEG_INFINITY || f.is_nan() {
+        return "nan_or_inf".into(); // unreachable: terms never hold these
+    }
+    let s = format!("{:?}", f); // Rust shortest round-trip
+    if let Some(epos) = s.find(['e', 'E']) {
+        // Rust: "1e20"; Erlang: "1.0e20"
+        let (m, e) = s.split_at(epos);
+        let mant = if m.contains('.') { m.to_string() } else { format!("{}.0", m) };
+        return format!("{}{}", mant, e);
+    }
+    if !s.contains('.') {
+        return format!("{}.0", s);
+    }
+    s
+}
+
+/// erlang:float_to_binary/2 with [:short] (Elixir's default path) or /1.
+#[no_mangle]
+pub extern "C" fn mana_rt_float_to_binary(ctx: *mut ProcCtx, t: u64, as_list: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    match num_of(t) {
+        Some((x, false)) => {
+            let s = fmt_float(x);
+            if as_list != 0 {
+                bytes_to_charlist(ctx, s.as_bytes())
+            } else {
+                bytes_to_new_bin(ctx, s.as_bytes())
+            }
+        }
+        _ => raise_badarg(ctx),
+    }
+}
+
+/// erlang:binary_to_float/1 and list_to_float/1 (bytes pre-flattened).
+#[no_mangle]
+pub extern "C" fn mana_rt_parse_float(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let bytes: Vec<u8> = if bin_parts(t).is_some() {
+        bin_bytes(t).to_vec()
+    } else {
+        let mut out = Vec::new();
+        let mut cur = t;
+        loop {
+            if cur == NIL {
+                break;
+            }
+            if cur & TAG_MASK != TAG_CONS {
+                return raise_badarg(ctx);
+            }
+            let p = (cur & !TAG_MASK) as *const u64;
+            let h = unsafe { *p };
+            if h & TAG_MASK != TAG_SMALL {
+                return raise_badarg(ctx);
+            }
+            out.push((h as i64 >> 3) as u8);
+            cur = unsafe { *p.add(1) };
+        }
+        out
+    };
+    let s = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => return raise_badarg(ctx),
+    };
+    // BEAM requires a decimal point ("1" is badarg for binary_to_float)
+    if !s.contains('.') {
+        return raise_badarg(ctx);
+    }
+    match s.parse::<f64>() {
+        Ok(f) if f.is_finite() => box_float(ctx, f),
+        _ => raise_badarg(ctx),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4965,7 +5295,7 @@ fn write_term(t: u64, out: &mut String) {
                 }
                 KIND_FLOAT => {
                     let f = f64::from_bits(*p.add(1));
-                    out.push_str(&format!("{:?}", f));
+                    out.push_str(&display_float(f));
                 }
                 KIND_FUN => out.push_str("#Fun<mana>"),
                 KIND_MAP => {

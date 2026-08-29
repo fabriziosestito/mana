@@ -599,7 +599,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn rt_register_atoms(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_register_atoms", || {
             let params: Vec<BasicMetadataTypeEnum> =
-                (0..19).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
+                (0..20).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
             self.ctx.void_type().fn_type(&params, false)
         })
     }
@@ -1111,6 +1111,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 ("binary", "list_to_bin", 1) => ("mana_rt_list_to_binary", 0, &[]),
                 ("binary", "referenced_byte_size", 1) => ("mana_rt_byte_size", 0, &[]),
                 ("binary", "compile_pattern", 1) => ("", 0, &[]),
+                // Elixir.Float decomposes IEEE bits with sub-bit segments
+                // (TODO(bitstring)); precision ops go native instead
+                ("Elixir.Float", "round", 2) => ("mana_rt_float_prec", 0, &[0]),
+                ("Elixir.Float", "ceil", 2) => ("mana_rt_float_prec", 0, &[1]),
+                ("Elixir.Float", "floor", 2) => ("mana_rt_float_prec", 0, &[2]),
                 _ => return Ok(false),
             };
         let f = self.fns.borrow()[fname];
@@ -1303,7 +1308,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let names = [
             "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
             "badarg", "error", "badmap", "badkey", "undef", "ok", "module", "nofile",
-            "value", "undefined",
+            "value", "undefined", "badarith",
         ];
         let mut atom_args: Vec<BasicMetadataValueEnum> = Vec::new();
         for n in names {
@@ -2234,6 +2239,165 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .into_int_value())
     }
 
+    /// i1: is `a` (and `b`, when given) a small int?
+    fn small_test(
+        &self,
+        a: IntValue<'ctx>,
+        b: Option<IntValue<'ctx>>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let tag_of = |v: IntValue<'ctx>, n: &str| -> CgResult<IntValue<'ctx>> {
+            let t = self
+                .builder
+                .build_and(v, self.i64t.const_int(TAG_MASK, false), n)
+                .map_err(be)?;
+            self.builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    t,
+                    self.i64t.const_int(TAG_SMALL, false),
+                    n,
+                )
+                .map_err(be)
+        };
+        match b {
+            None => tag_of(a, "sm.a"),
+            Some(b) => {
+                // ((a^1) | (b^1)) & 7 == 0  ⇔  both tags are 001
+                let xa = self
+                    .builder
+                    .build_xor(a, self.i64t.const_int(TAG_SMALL, false), "sm.xa")
+                    .map_err(be)?;
+                let xb = self
+                    .builder
+                    .build_xor(b, self.i64t.const_int(TAG_SMALL, false), "sm.xb")
+                    .map_err(be)?;
+                let or = self.builder.build_or(xa, xb, "sm.or").map_err(be)?;
+                let m = self
+                    .builder
+                    .build_and(or, self.i64t.const_int(TAG_MASK, false), "sm.m")
+                    .map_err(be)?;
+                self.builder
+                    .build_int_compare(IntPredicate::EQ, m, self.i64t.const_zero(), "sm.ok")
+                    .map_err(be)
+            }
+        }
+    }
+
+    /// (ctx, op, a, b) -> term arithmetic slow path.
+    fn rt_arith(&self) -> FunctionValue<'ctx> {
+        self.rt_fn("mana_rt_arith", || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        })
+    }
+
+    /// Numeric op with a both-small inline path and the mana_rt_arith slow
+    /// path (floats / badarith). The slow path may raise but never GCs.
+    fn arith_fastslow(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        opcode: u64,
+        a: IntValue<'ctx>,
+        b: Option<IntValue<'ctx>>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let both = self.small_test(a, b)?;
+        let fast = self.ctx.append_basic_block(f, "ar.fast");
+        let slow = self.ctx.append_basic_block(f, "ar.slow");
+        let merge = self.ctx.append_basic_block(f, "ar.merge");
+        self.builder
+            .build_conditional_branch(both, fast, slow)
+            .map_err(be)?;
+
+        self.builder.position_at_end(fast);
+        let ua = self.untag_int(a)?;
+        let fv = match (name, b) {
+            ("+", Some(b)) => {
+                let ub = self.untag_int(b)?;
+                self.builder.build_int_add(ua, ub, "add").map_err(be)?
+            }
+            ("-", Some(b)) => {
+                let ub = self.untag_int(b)?;
+                self.builder.build_int_sub(ua, ub, "sub").map_err(be)?
+            }
+            ("*", Some(b)) => {
+                let ub = self.untag_int(b)?;
+                self.builder.build_int_mul(ua, ub, "mul").map_err(be)?
+            }
+            ("div", Some(b)) => {
+                let ub = self.untag_int(b)?;
+                self.builder
+                    .build_int_signed_div(ua, ub, "div")
+                    .map_err(be)?
+            }
+            ("rem", Some(b)) => {
+                let ub = self.untag_int(b)?;
+                self.builder
+                    .build_int_signed_rem(ua, ub, "rem")
+                    .map_err(be)?
+            }
+            ("neg", None) => self
+                .builder
+                .build_int_sub(self.i64t.const_zero(), ua, "neg")
+                .map_err(be)?,
+            ("abs", None) => {
+                let neg = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SLT,
+                        ua,
+                        self.i64t.const_zero(),
+                        "abs.n",
+                    )
+                    .map_err(be)?;
+                let nv = self
+                    .builder
+                    .build_int_sub(self.i64t.const_zero(), ua, "abs.neg")
+                    .map_err(be)?;
+                self.builder
+                    .build_select(neg, nv, ua, "abs")
+                    .map_err(be)?
+                    .into_int_value()
+            }
+            _ => return Err(format!("arith_fastslow: bad op {}", name)),
+        };
+        let fastv = self.retag_int(fv)?;
+        let fast_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge).map_err(be)?;
+
+        self.builder.position_at_end(slow);
+        let bb = b.unwrap_or(self.i64t.const_int(1, false)); // small 0 dummy
+        let call = self
+            .builder
+            .build_call(
+                self.rt_arith(),
+                &[
+                    self.ctx_val().into(),
+                    self.i64t.const_int(opcode, false).into(),
+                    a.into(),
+                    bb.into(),
+                ],
+                "ar",
+            )
+            .map_err(be)?;
+        let sv = call_result(call)?.into_int_value();
+        let sv = self.check_exc(f, sv)?;
+        let slow_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge).map_err(be)?;
+
+        self.builder.position_at_end(merge);
+        let phi = self.builder.build_phi(self.i64t, "ar.v").map_err(be)?;
+        phi.add_incoming(&[(&fastv, fast_end), (&sv, slow_end)]);
+        Ok(phi.as_basic_value().into_int_value())
+    }
+
     /// Branch to a fresh block that raises `error:badarg` unless `ok`.
     fn guard_badarg(
         &self,
@@ -2550,7 +2714,30 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.bind_var(scope, v, val)?;
                 self.match_pattern(f, val, inner, scope, fail)
             }
-            Pattern::Lit(Literal::Float(_)) => Err("float patterns not supported yet".into()),
+            Pattern::Lit(Literal::Float(x)) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_tt_i64("mana_rt_float_pat"),
+                        &[
+                            val.into(),
+                            self.i64t.const_int(x.to_bits(), false).into(),
+                        ],
+                        "fpat",
+                    )
+                    .map_err(be)?;
+                let ok = call_result(call)?.into_int_value();
+                let ok = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        ok,
+                        self.i64t.const_zero(),
+                        "fpat.ok",
+                    )
+                    .map_err(be)?;
+                self.branch_test(f, ok, fail)
+            }
             Pattern::Binary(segs) => self.match_binary(f, val, segs, scope, fail),
             Pattern::Map(pairs) => {
                 // a map pattern — even the empty `~{}~`, which requires no
@@ -3089,6 +3276,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if module == "io_lib" {
             return self.compile_io_lib_bif(f, name, args, scope);
         }
+        if module == "math" {
+            return self.compile_math_bif(f, name, args, scope);
+        }
         if module == "ets" {
             return self.compile_ets_bif(f, name, args, scope);
         }
@@ -3180,27 +3370,53 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 Ok(self.i64t.get_undef())
             }
             ("+", 2) | ("-", 2) | ("*", 2) | ("div", 2) | ("rem", 2) => {
-                let a = self.untag_int(argv[0])?;
-                let b = self.untag_int(argv[1])?;
-                let r = match name {
-                    "+" => self.builder.build_int_add(a, b, "add"),
-                    "-" => self.builder.build_int_sub(a, b, "sub"),
-                    "*" => self.builder.build_int_mul(a, b, "mul"),
-                    "div" => self.builder.build_int_signed_div(a, b, "div"),
-                    _ => self.builder.build_int_signed_rem(a, b, "rem"),
-                }
-                .map_err(be)?;
-                self.retag_int(r)
+                // both-small inline (no allocation, no raise); anything else
+                // takes the runtime slow path (floats box without triggering
+                // GC — see box_float — so this is NOT a may-gc site)
+                let opcode = match name {
+                    "+" => 0u64,   // AR_ADD
+                    "-" => 1,      // AR_SUB
+                    "*" => 2,      // AR_MUL
+                    "div" => 4,    // AR_IDIV (slow path = badarith)
+                    _ => 5,        // AR_REM
+                };
+                self.arith_fastslow(f, name, opcode, argv[0], Some(argv[1]))
             }
-            ("-", 1) => {
-                let a = self.untag_int(argv[0])?;
-                let r = self
-                    .builder
-                    .build_int_sub(self.i64t.const_zero(), a, "neg")
+            ("-", 1) => self.arith_fastslow(f, "neg", 6, argv[0], None),
+            ("+", 1) => {
+                // +X is a no-op for numbers; badarith otherwise
+                let both = self.small_test(argv[0], None)?;
+                let slow = self.ctx.append_basic_block(f, "pos.slow");
+                let merge = self.ctx.append_basic_block(f, "pos.merge");
+                let fast_bb = self.builder.get_insert_block().unwrap();
+                self.builder
+                    .build_conditional_branch(both, merge, slow)
                     .map_err(be)?;
-                self.retag_int(r)
+                self.builder.position_at_end(slow);
+                // float or junk: 0 + X coerces/validates
+                let zero = self.i64t.const_int(1, false); // small 0
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_arith(),
+                        &[
+                            self.ctx_val().into(),
+                            self.i64t.const_zero().into(),
+                            zero.into(),
+                            argv[0].into(),
+                        ],
+                        "pos",
+                    )
+                    .map_err(be)?;
+                let sv = call_result(call)?.into_int_value();
+                let sv = self.check_exc(f, sv)?;
+                let slow_end = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(merge).map_err(be)?;
+                self.builder.position_at_end(merge);
+                let phi = self.builder.build_phi(self.i64t, "pos.v").map_err(be)?;
+                phi.add_incoming(&[(&argv[0], fast_bb), (&sv, slow_end)]);
+                Ok(phi.as_basic_value().into_int_value())
             }
-            ("+", 1) => Ok(argv[0]),
             ("<", 2) | ("=<", 2) | (">", 2) | (">=", 2) | ("==", 2) | ("/=", 2)
             | ("=:=", 2) | ("=/=", 2) => {
                 // fast path: both small ints (tagging is order-preserving);
@@ -3445,6 +3661,90 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 let _ = call;
                 self.atom_term("true")
+            }
+            ("/", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_arith(),
+                        &[
+                            self.ctx_val().into(),
+                            self.i64t.const_int(3, false).into(), // AR_FDIV
+                            argv[0].into(),
+                            argv[1].into(),
+                        ],
+                        "fdiv",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("float", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_to_float"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "tofl",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("trunc", 1) | ("round", 1) | ("floor", 1) | ("ceil", 1) => {
+                let mode = match name {
+                    "trunc" => 0u64,
+                    "round" => 1,
+                    "floor" => 2,
+                    _ => 3,
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_f2i"),
+                        &[
+                            self.ctx_val().into(),
+                            self.i64t.const_int(mode, false).into(),
+                            argv[0].into(),
+                        ],
+                        "f2i",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("float_to_binary", 1) | ("float_to_binary", 2) | ("float_to_list", 1)
+            | ("float_to_list", 2) => {
+                // options ([:short] etc.) are evaluated and ignored — our
+                // only format IS shortest round-trip
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_float_to_binary"),
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            self.i64t
+                                .const_int(name.ends_with("list") as u64, false)
+                                .into(),
+                        ],
+                        "f2b",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("binary_to_float", 1) | ("list_to_float", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_parse_float"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "pf",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
             }
             ("!", 2) | ("send", 2) | ("send", 3) => {
                 // send/3's options (noconnect/nosuspend) are distribution
@@ -4337,39 +4637,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 self.load_word(p, if name == "hd" { 0 } else { 1 })
             }
-            ("abs", 1) => {
-                let tag = self.tag_of(argv[0])?;
-                let ok = self
-                    .builder
-                    .build_int_compare(
-                        IntPredicate::EQ,
-                        tag,
-                        self.i64t.const_int(1, false),
-                        "abs.i",
-                    )
-                    .map_err(be)?;
-                self.guard_badarg(f, ok)?;
-                let v = self.untag_int(argv[0])?;
-                let neg = self
-                    .builder
-                    .build_int_sub(self.i64t.const_zero(), v, "abs.n")
-                    .map_err(be)?;
-                let isneg = self
-                    .builder
-                    .build_int_compare(
-                        IntPredicate::SLT,
-                        v,
-                        self.i64t.const_zero(),
-                        "abs.c",
-                    )
-                    .map_err(be)?;
-                let r = self
-                    .builder
-                    .build_select(isneg, neg, v, "abs")
-                    .map_err(be)?
-                    .into_int_value();
-                self.retag_int(r)
-            }
+            ("abs", 1) => self.arith_fastslow(f, "abs", 7, argv[0], None),
             ("min", 2) | ("max", 2) => {
                 let call = self
                     .builder
@@ -4943,6 +5211,66 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .map_err(be)?,
             _ => return Err(format!("unsupported BIF io_lib:{}/{}", name, argv.len())),
         };
+        let v = call_result(call)?.into_int_value();
+        self.check_exc(f, v)
+    }
+
+    /// math module: f64 ops in the runtime (box_float never GCs).
+    fn compile_math_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let op: u64 = match (name, argv.len()) {
+            ("sqrt", 1) => 0,
+            ("pow", 2) => 1,
+            ("log", 1) => 2,
+            ("log2", 1) => 3,
+            ("log10", 1) => 4,
+            ("exp", 1) => 5,
+            ("sin", 1) => 6,
+            ("cos", 1) => 7,
+            ("tan", 1) => 8,
+            ("asin", 1) => 9,
+            ("acos", 1) => 10,
+            ("atan", 1) => 11,
+            ("atan2", 2) => 12,
+            ("fmod", 2) => 13,
+            ("pi", 0) => 14,
+            ("floor", 1) => 15,
+            ("ceil", 1) => 16,
+            _ => return Err(format!("unsupported BIF math:{}/{}", name, argv.len())),
+        };
+        let dummy = self.i64t.const_int(1, false); // small 0
+        let a = argv.first().copied().unwrap_or(dummy);
+        let b = argv.get(1).copied().unwrap_or(dummy);
+        let callee = self.rt_fn("mana_rt_math", || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        });
+        let call = self
+            .builder
+            .build_call(
+                callee,
+                &[
+                    self.ctx_val().into(),
+                    self.i64t.const_int(op, false).into(),
+                    a.into(),
+                    b.into(),
+                ],
+                "math",
+            )
+            .map_err(be)?;
         let v = call_result(call)?.into_int_value();
         self.check_exc(f, v)
     }
@@ -6104,7 +6432,7 @@ fn is_bif_module(m: &str) -> bool {
     matches!(
         m,
         "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
-            | "logger" | "ets" | "application" | "file" | "erts_internal"
+            | "logger" | "ets" | "application" | "file" | "math" | "erts_internal"
             | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
             | "net_kernel"
     )
@@ -6233,7 +6561,7 @@ fn expr_may_raise(
                 "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
                     | "logger" | "ets" | "application" | "file" | "erts_internal"
                     | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
-                    | "net_kernel"
+                    | "net_kernel" | "math"
             ) {
                 return true;
             }
@@ -6245,6 +6573,25 @@ fn expr_may_raise(
                         | ("error", 3)
                         | ("exit", 1)
                         | ("throw", 1)
+                        | ("+", 2)
+                        | ("-", 2)
+                        | ("*", 2)
+                        | ("/", 2)
+                        | ("div", 2)
+                        | ("rem", 2)
+                        | ("+", 1)
+                        | ("-", 1)
+                        | ("float", 1)
+                        | ("trunc", 1)
+                        | ("round", 1)
+                        | ("floor", 1)
+                        | ("ceil", 1)
+                        | ("float_to_binary", 1)
+                        | ("float_to_binary", 2)
+                        | ("float_to_list", 1)
+                        | ("float_to_list", 2)
+                        | ("binary_to_float", 1)
+                        | ("list_to_float", 1)
                         | ("spawn", 1)
                         | ("spawn", 3)
                         | ("spawn_link", 1)
@@ -6409,6 +6756,10 @@ fn expr_may_gc(
                         | ("atom_to_binary", 1)
                         | ("atom_to_binary", 2)
                         | ("atom_to_list", 1)
+                        | ("float_to_binary", 1)
+                        | ("float_to_binary", 2)
+                        | ("float_to_list", 1)
+                        | ("float_to_list", 2)
                         | ("apply", 2)
                         | ("apply", 3)
                         | ("raise", 3)
