@@ -742,6 +742,36 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)
     }
 
+    /// A fully-constant binary as a static term: [header | bytes], content-
+    /// addressed linkonce_odr symbol (deduped program-wide by the linker).
+    /// Never allocated, never copied — forward_major passes non-heap boxed
+    /// terms through.
+    fn static_binary(&self, bytes: &[u8]) -> CgResult<IntValue<'ctx>> {
+        let sym = format!(
+            "mana_bin.{}",
+            &blake3::hash(bytes).to_hex().as_str()[..16]
+        );
+        let g = match self.module.get_global(&sym) {
+            Some(g) => g,
+            None => {
+                let header = self
+                    .i64t
+                    .const_int(((bytes.len() as u64) << 8) | KIND_BIN, false);
+                let data = self.ctx.const_string(bytes, false);
+                let init = self.ctx.const_struct(&[header.into(), data.into()], false);
+                let g = self.module.add_global(init.get_type(), None, &sym);
+                g.set_initializer(&init);
+                g.set_constant(true);
+                g.set_alignment(8);
+                g.set_linkage(Linkage::LinkOnceODR);
+                g
+            }
+        };
+        self.builder
+            .build_ptr_to_int(g.as_pointer_value(), self.i64t, "bin.static")
+            .map_err(be)
+    }
+
     // ---- frames & slots ----
 
     /// Set up the root frame for the function whose entry block the builder
@@ -5335,6 +5365,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 SegKind::Bin { .. } => None,
             });
         }
+        // every segment constant (string literals, <<>>): a static term —
+        // no allocation, no writes
+        if const_bytes.iter().all(|c| c.is_some()) {
+            let all: Vec<u8> = const_bytes
+                .iter()
+                .flat_map(|c| c.as_ref().unwrap().iter().copied())
+                .collect();
+            return self.static_binary(&all);
+        }
         // evaluate values (skipping const segments) and dynamic sizes, all
         // rooted — sizes are small ints but their exprs may allocate
         let nil_expr = Expr::Lit(Literal::Nil);
@@ -5442,11 +5481,25 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_call(alloc_fn, &[self.ctx_val().into(), total.into()], "bin")
             .map_err(be)?;
         let bin = call_result(call)?.into_int_value();
-        // fill (writers never allocate)
+        // fill (writers never allocate); consecutive constant segments
+        // (erlc emits string literals byte-per-segment) coalesce into a
+        // single write
         let mut off = self.i64t.const_zero();
-        for (i, spec) in specs.iter().enumerate() {
-            if let Some(bytes) = &const_bytes[i] {
-                let ptr = self.static_bytes(bytes)?;
+        let mut i = 0usize;
+        while i < specs.len() {
+            let spec = &specs[i];
+            if const_bytes[i].is_some() {
+                let mut run: Vec<u8> = Vec::new();
+                while i < specs.len() {
+                    match &const_bytes[i] {
+                        Some(bytes) => {
+                            run.extend_from_slice(bytes);
+                            i += 1;
+                        }
+                        None => break,
+                    }
+                }
+                let ptr = self.static_bytes(&run)?;
                 self.builder
                     .build_call(
                         self.rt_fn("mana_rt_bin_write_bytes", || {
@@ -5464,14 +5517,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             bin.into(),
                             off.into(),
                             ptr.into(),
-                            self.i64t.const_int(bytes.len() as u64, false).into(),
+                            self.i64t.const_int(run.len() as u64, false).into(),
                         ],
                         "",
                     )
                     .map_err(be)?;
                 off = self
                     .builder
-                    .build_int_add(off, self.i64t.const_int(bytes.len() as u64, false), "boff")
+                    .build_int_add(off, self.i64t.const_int(run.len() as u64, false), "boff")
                     .map_err(be)?;
                 continue;
             }
@@ -5579,6 +5632,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     off = self.builder.build_int_add(off, w, "boff").map_err(be)?;
                 }
             }
+            i += 1;
         }
         Ok(bin)
     }
@@ -5639,52 +5693,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         bytes: &[u8],
         _scope: &mut Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
-        let alloc_fn = self.rt_fn("mana_rt_bin_alloc", || {
-            self.i64t.fn_type(
-                &[
-                    BasicMetadataTypeEnum::PointerType(self.ptrt),
-                    BasicMetadataTypeEnum::IntType(self.i64t),
-                ],
-                false,
-            )
-        });
-        let call = self
-            .builder
-            .build_call(
-                alloc_fn,
-                &[
-                    self.ctx_val().into(),
-                    self.i64t.const_int(bytes.len() as u64, false).into(),
-                ],
-                "cbin",
-            )
-            .map_err(be)?;
-        let bin = call_result(call)?.into_int_value();
-        let ptr = self.static_bytes(bytes)?;
-        self.builder
-            .build_call(
-                self.rt_fn("mana_rt_bin_write_bytes", || {
-                    self.ctx.void_type().fn_type(
-                        &[
-                            BasicMetadataTypeEnum::IntType(self.i64t),
-                            BasicMetadataTypeEnum::IntType(self.i64t),
-                            BasicMetadataTypeEnum::PointerType(self.ptrt),
-                            BasicMetadataTypeEnum::IntType(self.i64t),
-                        ],
-                        false,
-                    )
-                }),
-                &[
-                    bin.into(),
-                    self.i64t.const_zero().into(),
-                    ptr.into(),
-                    self.i64t.const_int(bytes.len() as u64, false).into(),
-                ],
-                "",
-            )
-            .map_err(be)?;
         let _ = f;
-        Ok(bin)
+        self.static_binary(bytes)
     }
 
     /// io_lib cut: format engine in the runtime, charlists out.
@@ -7178,6 +7188,25 @@ fn seg_const_bytes(value: &Expr, nbytes: u64, little: bool) -> Result<Option<Vec
     }
 }
 
+/// Every segment's bytes are known at compile time (mirrors the const
+/// extraction in compile_binary_construct) — such binaries compile to
+/// static terms: no allocation, no raise.
+fn binary_all_const(segs: &[mana_syntax::BinSegment<Box<Expr>>]) -> bool {
+    segs.iter().all(|s| match parse_seg_spec(&s.spec) {
+        Ok(spec) => match spec.kind {
+            SegKind::Utf8 => matches!(
+                s.value.as_ref(),
+                Expr::Lit(Literal::Int(cp)) if char::from_u32(*cp as u32).is_some()
+            ),
+            SegKind::Int { size: SegSize::Bytes(n) } => {
+                matches!(seg_const_bytes(s.value.as_ref(), n, spec.little), Ok(Some(_)))
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    })
+}
+
 /// Frame slots the match compiler will spill for this pattern (subjects
 /// parked across allocating sub-matches; see pattern_subject_slot).
 fn pattern_spill_sites(p: &Pattern) -> usize {
@@ -7463,8 +7492,9 @@ fn expr_may_raise(
             expr_may_raise(body, cur_mod, raise_set, letrec_bound)
                 || expr_may_raise(handler, cur_mod, raise_set, letrec_bound)
         }
-        // construction raises badarg on non-int values / non-binary splices
-        Expr::Binary(_) => true,
+        // construction raises badarg on non-int values / non-binary splices;
+        // fully-constant literals compile to static terms (no raise)
+        Expr::Binary(segs) => !binary_all_const(segs),
         // updates raise badmap/badkey; construction only via children
         Expr::Map { pairs, update } => {
             update.is_some()
@@ -7491,8 +7521,10 @@ fn expr_may_gc(
         Expr::Lit(_) => false,
         // allocation sites (CallDyn builds its args list + callee unknown)
         Expr::Tuple(_) | Expr::Cons(..) | Expr::Fun(_) | Expr::FunRef { .. }
-        | Expr::LetRec { .. } | Expr::Binary(_) | Expr::Map { .. }
+        | Expr::LetRec { .. } | Expr::Map { .. }
         | Expr::CallDyn { .. } => true,
+        // fully-constant binaries are static terms — no allocation
+        Expr::Binary(segs) => !binary_all_const(segs),
         Expr::Apply { target, args } => {
             let target_gc = match target {
                 ApplyTarget::Var(_) => true,

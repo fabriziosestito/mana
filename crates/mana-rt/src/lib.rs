@@ -3393,6 +3393,14 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
     let to_space = alloc_space(to_words);
     let mut top = to_space;
     let mut worklist: Vec<u64> = Vec::new();
+    // from-space extents: only terms inside these move; everything else
+    // (eternals, compiler statics) passes through untouched
+    let from: Vec<(usize, usize)> = old
+        .chunks
+        .iter()
+        .map(|c| (c.start as usize, c.top as usize))
+        .collect();
+    let from = &from[..];
 
     // pids currently swapped into a scheduler: their LIVE state is in the
     // ctx (walked below); their saved_* fields are stale from the last
@@ -3414,12 +3422,12 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
                 let len = *frame.add(1) as usize;
                 for i in 0..len {
                     let s = frame.add(2 + i);
-                    *s = forward_major(*s, &mut top, &mut worklist);
+                    *s = forward_major(*s, from, &mut top, &mut worklist);
                 }
                 frame = *frame as *mut u64;
             }
-            octx.exc_class = forward_major(octx.exc_class, &mut top, &mut worklist);
-            octx.exc_reason = forward_major(octx.exc_reason, &mut top, &mut worklist);
+            octx.exc_class = forward_major(octx.exc_class, from, &mut top, &mut worklist);
+            octx.exc_reason = forward_major(octx.exc_reason, from, &mut top, &mut worklist);
         }
         {
             let tab = g.procs.read();
@@ -3428,12 +3436,12 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
                 let p = proc_mut(cell);
                 if !running.contains(&id) {
                     walk_proc_roots(p, |s| {
-                        *s = forward_major(*s, &mut top, &mut worklist);
+                        *s = forward_major(*s, from, &mut top, &mut worklist);
                     });
                 }
                 drain_ingress(p); // everyone is parked: no concurrent pushes
                 for m in p.private.iter_mut() {
-                    *m = forward_major(*m, &mut top, &mut worklist);
+                    *m = forward_major(*m, from, &mut top, &mut worklist);
                 }
             }
         }
@@ -3441,7 +3449,7 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
             let eternal = g.eternal.lock();
             for (pa, is_cons) in eternal.iter() {
                 scan_fields(*pa as *mut u64, *is_cons, &mut |s| {
-                    *s = forward_major(*s, &mut top, &mut worklist);
+                    *s = forward_major(*s, from, &mut top, &mut worklist);
                 });
             }
         }
@@ -3449,7 +3457,7 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
             let is_cons = t & TAG_MASK == TAG_CONS;
             let p = (t & !TAG_MASK) as *mut u64;
             scan_fields(p, is_cons, &mut |s| {
-                *s = forward_major(*s, &mut top, &mut worklist);
+                *s = forward_major(*s, from, &mut top, &mut worklist);
             });
         }
         for chunk in old.chunks.iter() {
@@ -3477,15 +3485,32 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
     }
 }
 
-unsafe fn forward_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) -> u64 {
+/// Boxed/cons terms outside the from-space chunks — eternal mallocs and
+/// compiler statics (binaries, funs) — are never moved and never get a
+/// forwarding header written into them: writes to `.rodata` fault, and the
+/// eternal registry scan must keep seeing real headers. Their fields are
+/// updated via the eternal registry walk instead.
+unsafe fn forward_major(
+    t: u64,
+    from: &[(usize, usize)],
+    top: &mut *mut u64,
+    worklist: &mut Vec<u64>,
+) -> u64 {
     if t == 0 {
         return 0;
     }
+    let in_from = |p: u64| {
+        let a = p as usize;
+        from.iter().any(|&(s, e)| a >= s && a < e)
+    };
     match t & TAG_MASK {
         TAG_SMALL | TAG_ATOM | TAG_PID => t,
         _ if t == NIL => t,
         TAG_CONS => unsafe {
             let p = (t & !TAG_MASK) as *mut u64;
+            if !in_from(p as u64) {
+                return t;
+            }
             if *p & TAG_MASK == TAG_FORWARD {
                 return (*p & !TAG_MASK) | TAG_CONS;
             }
@@ -3500,6 +3525,9 @@ unsafe fn forward_major(t: u64, top: &mut *mut u64, worklist: &mut Vec<u64>) -> 
         },
         TAG_BOXED => unsafe {
             let p = t as *mut u64;
+            if !in_from(p as u64) {
+                return t;
+            }
             if *p & TAG_MASK == TAG_FORWARD {
                 return *p & !TAG_MASK;
             }
