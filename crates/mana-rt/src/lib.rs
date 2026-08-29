@@ -4000,6 +4000,16 @@ fn map_parts(m: u64) -> Option<(*mut u64, usize)> {
 /// Find a key (exact match) via binary search; returns the pair index.
 fn map_index(p: *const u64, n: usize, key: u64) -> Result<usize, usize> {
     let keys = unsafe { std::slice::from_raw_parts(p.add(1), n) };
+    // Equal atoms are pointer-identical (linkonce_odr globals) and equal
+    // smalls bit-identical, so for the small maps that dominate (struct
+    // fields, changesets) a raw-u64 scan resolves the hit without any
+    // generic compares. Misses (and boxed keys) fall to binary search,
+    // which also supplies the insertion position for put.
+    if n <= 16 {
+        if let Some(i) = keys.iter().position(|&k| k == key) {
+            return Ok(i);
+        }
+    }
     keys.binary_search_by(|&k| map_key_cmp(k, key))
 }
 

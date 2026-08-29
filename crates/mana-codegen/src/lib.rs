@@ -1731,6 +1731,50 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Expr::Map { pairs, update } => {
                 match update {
                     None => {
+                        // all-literal immediate keys (the struct/record case):
+                        // term order is known at compile time — emit the map
+                        // already sorted/deduped and skip mana_rt_map_norm.
+                        // Values still evaluate in source order (effects).
+                        let lit_keys: Option<Vec<&Literal>> = pairs
+                            .iter()
+                            .map(|(k, _, _)| match k {
+                                Expr::Lit(
+                                    l @ (Literal::Int(_) | Literal::Atom(_) | Literal::Nil),
+                                ) => Some(l),
+                                _ => None,
+                            })
+                            .collect();
+                        if let Some(keys) = lit_keys {
+                            let mut sorted: Vec<&Literal> = keys.clone();
+                            sorted.sort_by(|a, b| lit_key_ord(a, b));
+                            sorted.dedup();
+                            let m2 = sorted.len();
+                            let children: Vec<&Expr> =
+                                pairs.iter().map(|(_, _, v)| v).collect();
+                            let slots = self.eval_all_rooted(f, &children, scope)?;
+                            let p = self.alloc_words(1 + 2 * m2 as u64)?;
+                            let header =
+                                self.i64t.const_int(((m2 as u64) << 8) | KIND_MAP, false);
+                            self.store_word(p, 0, header)?;
+                            for (i, l) in sorted.iter().enumerate() {
+                                let k = self.compile_literal(l)?;
+                                self.store_word(p, 1 + i as u64, k)?;
+                            }
+                            // original order: a duplicate key's later value
+                            // overwrites the earlier store (last write wins)
+                            for (i, l) in keys.iter().enumerate() {
+                                let at = sorted
+                                    .binary_search_by(|s| lit_key_ord(s, l))
+                                    .expect("literal key in sorted set");
+                                let v = self.rooted_get(&slots[i])?;
+                                self.store_word(p, 1 + (m2 + at) as u64, v)?;
+                            }
+                            let raw = self
+                                .builder
+                                .build_ptr_to_int(p, self.i64t, "map.raw")
+                                .map_err(be)?;
+                            return Ok(raw);
+                        }
                         // build unsorted, then normalize (pre-publication
                         // mutation: the term hasn't escaped yet)
                         let n = pairs.len();
@@ -6861,6 +6905,26 @@ impl SegKind {
                 | SegKind::Int { size: SegSize::Dyn { .. } }
                 | SegKind::Bin { size: SegSize::Dyn { .. } | SegSize::All }
         )
+    }
+}
+
+/// Erlang term order for the literal keys the presorted-map-literal path
+/// accepts: numbers < atoms < nil (nil is the empty list, which sorts after
+/// maps). Atoms compare by name bytes — same as the runtime's atom_bytes
+/// memcmp in mana_rt_compare.
+fn lit_key_ord(a: &Literal, b: &Literal) -> std::cmp::Ordering {
+    fn rank(l: &Literal) -> u8 {
+        match l {
+            Literal::Int(_) => 0,
+            Literal::Atom(_) => 1,
+            Literal::Nil => 2,
+            _ => unreachable!("non-immediate literal map key"),
+        }
+    }
+    match (a, b) {
+        (Literal::Int(x), Literal::Int(y)) => x.cmp(y),
+        (Literal::Atom(x), Literal::Atom(y)) => x.as_bytes().cmp(y.as_bytes()),
+        _ => rank(a).cmp(&rank(b)),
     }
 }
 
