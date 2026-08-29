@@ -11,3 +11,4 @@ crate-type = ["staticlib", "rlib"]
 corosensei = "0.3"
 crossbeam-queue = "0.3.13"
 parking_lot = "0.12.5"
+regex = "1.13.1"

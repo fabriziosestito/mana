@@ -3279,6 +3279,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if module == "math" {
             return self.compile_math_bif(f, name, args, scope);
         }
+        if module == "re" {
+            return self.compile_re_bif(f, name, args, scope);
+        }
         if module == "ets" {
             return self.compile_ets_bif(f, name, args, scope);
         }
@@ -4254,6 +4257,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 Ok(call_result(call)?.into_int_value())
             }
+            ("system_info", 1) => {
+                // the subset reached so far; extend as callers appear
+                if let Expr::Lit(Literal::Atom(a)) = &args[0] {
+                    return match a.as_str() {
+                        "endian" => self.atom_term("little"),
+                        "otp_release" => self.compile_binary_const_term(f, b"26", scope),
+                        _ => Err(format!("unsupported system_info({})", a)),
+                    };
+                }
+                Err("unsupported dynamic system_info/1".into())
+            }
             ("is_port", 1) => self.atom_term("false"),
             // no distribution: everything lives on nonode@nohost
             ("node", 0) | ("node", 1) => self.atom_term("nonode@nohost"),
@@ -4383,6 +4397,23 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         self.rt_ptt_i64(helper),
                         &[self.ctx_val().into(), argv[0].into(), base.into()],
                         "i2x",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("list_to_tuple", 1) | ("tuple_to_list", 1) => {
+                let helper = if name == "list_to_tuple" {
+                    "mana_rt_list_to_tuple"
+                } else {
+                    "mana_rt_tuple_to_list"
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64(helper),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "t2l",
                     )
                     .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
@@ -5210,6 +5241,87 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 )
                 .map_err(be)?,
             _ => return Err(format!("unsupported BIF io_lib:{}/{}", name, argv.len())),
+        };
+        let v = call_result(call)?.into_int_value();
+        self.check_exc(f, v)
+    }
+
+    /// :re on the Rust regex crate; version() is "mana" so Elixir's Regex
+    /// recompiles from source instead of trusting sigil-baked PCRE blobs.
+    fn compile_re_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let trip = |helper: &str| {
+            self.rt_fn(helper, || {
+                self.i64t.fn_type(
+                    &[
+                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                    ],
+                    false,
+                )
+            })
+        };
+        let call = match (name, argv.len()) {
+            ("version", 0) => return self.compile_binary_const_term(f, b"mana", scope),
+            ("run", 2) => self
+                .builder
+                .build_call(
+                    trip("mana_rt_re_run"),
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(),
+                        argv[1].into(),
+                        self.nil().into(),
+                    ],
+                    "rerun",
+                )
+                .map_err(be)?,
+            ("run", 3) => self
+                .builder
+                .build_call(
+                    trip("mana_rt_re_run"),
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(),
+                        argv[1].into(),
+                        argv[2].into(),
+                    ],
+                    "rerun",
+                )
+                .map_err(be)?,
+            ("compile", 1) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_re_compile"),
+                    &[self.ctx_val().into(), argv[0].into(), self.nil().into()],
+                    "rec",
+                )
+                .map_err(be)?,
+            ("compile", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_re_compile"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "rec",
+                )
+                .map_err(be)?,
+            ("inspect", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_re_inspect"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "rei",
+                )
+                .map_err(be)?,
+            _ => return Err(format!("unsupported BIF re:{}/{}", name, argv.len())),
         };
         let v = call_result(call)?.into_int_value();
         self.check_exc(f, v)
@@ -6432,7 +6544,7 @@ fn is_bif_module(m: &str) -> bool {
     matches!(
         m,
         "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
-            | "logger" | "ets" | "application" | "file" | "math" | "erts_internal"
+            | "logger" | "ets" | "application" | "file" | "math" | "re" | "erts_internal"
             | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
             | "net_kernel"
     )
@@ -6561,7 +6673,7 @@ fn expr_may_raise(
                 "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
                     | "logger" | "ets" | "application" | "file" | "erts_internal"
                     | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
-                    | "net_kernel" | "math"
+                    | "net_kernel" | "math" | "re"
             ) {
                 return true;
             }
@@ -6627,6 +6739,8 @@ fn expr_may_raise(
                         | ("bit_size", 1)
                         | ("binary_part", 3)
                         | ("split_binary", 2)
+                        | ("list_to_tuple", 1)
+                        | ("tuple_to_list", 1)
                         | ("binary_to_list", 1)
                         | ("list_to_binary", 1)
                         | ("iolist_to_binary", 1)
@@ -6749,6 +6863,8 @@ fn expr_may_gc(
                         | ("--", 2)
                         | ("binary_part", 3)
                         | ("split_binary", 2)
+                        | ("list_to_tuple", 1)
+                        | ("tuple_to_list", 1)
                         | ("binary_to_list", 1)
                         | ("list_to_binary", 1)
                         | ("iolist_to_binary", 1)
@@ -6778,8 +6894,8 @@ fn expr_may_gc(
             {
                 return true;
             }
-            // io:nl allocates its newline binary; unicode conversions allocate
-            if module == "io" || module == "unicode" {
+            // io:nl allocates its newline binary; unicode/re allocate results
+            if matches!(module.as_str(), "io" | "unicode" | "re") {
                 return true;
             }
             let callee_gc = module != "erlang"
