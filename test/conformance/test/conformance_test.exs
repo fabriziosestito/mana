@@ -33,9 +33,12 @@ defmodule ConformanceTest do
     test "#{mod_str} native output matches BEAM" do
       mod_str = @mod_str
 
-      # subject: compile with mana and run the native binary
+      # subject: compile with mana and run the native binary. The out dir
+      # (and its core-cache of dumped stdlib beams, mtime-keyed) survives
+      # across runs — a cold stdlib chase costs minutes, a warm one is a
+      # single manac invocation. Only the binary must be fresh.
       out_dir = Path.join(System.tmp_dir!(), "mana_conf_#{mod_str}")
-      File.rm_rf!(out_dir)
+      File.rm(Path.join(out_dir, "app"))
       # rerun, not run: run/1 caches per task name and would no-op for the
       # second program in the suite
       Mix.Task.rerun("mana.compile", ["--entry", "#{mod_str}.go/0", "--out", out_dir])

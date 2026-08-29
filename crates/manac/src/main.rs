@@ -15,7 +15,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
-    match run() {
+    // AST walkers recurse per list cell; stdlib modules carry list literals
+    // thousands of elements deep — give the compiler a deep stack
+    let child = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(run)
+        .expect("spawning compiler thread");
+    match child.join().expect("compiler thread panicked") {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("manac: {}", e);

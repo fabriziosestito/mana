@@ -55,18 +55,14 @@ defmodule Mix.Tasks.Mana.Compile do
 
     manac = Mana.compiler_path(bin: opts[:bin])
     app = Path.join(out, "app")
-    # warm start: previously chased stdlib cores (unreached ones are free —
-    # manac only compiles what the entry needs)
-    #
-    # TODO(xdg-cache): make this cache cross-project. The stdlib cores (and
-    # ideally manac's per-module OBJECT files, keyed by core content hash +
-    # manac version + target) belong under $XDG_CACHE_HOME/mana (fallback
-    # ~/.cache/mana), keyed by the Elixir/OTP version pair — every project
-    # on the same toolchain re-dumps and recompiles the identical ~200
-    # stdlib modules today (~50s of sequential per-module LLVM O2 in manac;
-    # object caching turns warm builds into link-only, and per-module
-    # codegen is embarrassingly parallel on top).
-    cached = Path.wildcard(Path.join([out, "core-cache", "*.core"]))
+    # warm start: previously chased cores. Toolchain modules (Elixir/OTP
+    # stdlib, deps outside this project's build) live in the shared
+    # $XDG_CACHE_HOME/mana cache keyed by the toolchain versions — every
+    # project reuses them; project-local chased modules stay under out/.
+    # Unreached cores are free: manac only compiles what the entry needs.
+    cached =
+      Path.wildcard(Path.join(shared_cache_dir(), "*.core")) ++
+        Path.wildcard(Path.join([out, "core-cache", "*.core"]))
     compile_loop(manac, mod, fun, arity, app, cached ++ cores, out, MapSet.new(), 400)
   end
 
@@ -89,7 +85,8 @@ defmodule Mix.Tasks.Mana.Compile do
         # (consolidated protocol impls) it could not see; pull the ones a
         # beam exists for and rebuild
         candidates =
-          Regex.scan(~r/dynamic module candidate '([^']+)'/, output)
+          (Regex.scan(~r/dynamic module candidate '([^']+)'/, output) ++
+             Regex.scan(~r/module '([^']+)' \(required by [^)]+\) is not among/, output))
           |> Enum.map(fn [_, m] -> m end)
           |> Enum.uniq()
           |> Enum.reject(&MapSet.member?(tried, &1))
@@ -122,24 +119,18 @@ defmodule Mix.Tasks.Mana.Compile do
         IO.write(output)
         Mix.raise("manac failed (exit #{status}); dependency chase gave up")
 
-      (missing = missing_modules(output)) != [] ->
-        if Enum.any?(missing, &MapSet.member?(tried, &1)) do
-          IO.write(output)
-          Mix.raise("manac failed (exit #{status}): module loop in #{inspect(missing)}")
-        end
-
+      (missing = missing_modules(output) |> Enum.reject(&MapSet.member?(tried, &1))) != [] ->
         pulled =
-          for m <- missing do
-            case locate_and_dump(m, out) do
-              {:ok, core} ->
-                Mix.shell().info("mana: pulling in #{m}")
-                core
-
-              :error ->
-                IO.write(output)
-                Mix.raise("manac failed (exit #{status}): cannot locate module '#{m}'")
-            end
+          for m <- missing,
+              {:ok, core} <- [locate_and_dump(m, out)] do
+            Mix.shell().info("mana: pulling in #{m}")
+            core
           end
+
+        if pulled == [] do
+          IO.write(output)
+          Mix.raise("manac failed (exit #{status}) — see output above")
+        end
 
         compile_loop(
           manac,
@@ -172,10 +163,6 @@ defmodule Mix.Tasks.Mana.Compile do
   end
 
   defp do_locate_and_dump(module, out) do
-    cache = Path.join(out, "core-cache")
-    File.mkdir_p!(cache)
-    core = Path.join(cache, module <> ".core")
-
     case :code.which(String.to_atom(module)) do
       beam_path when is_list(beam_path) ->
         beam = List.to_string(beam_path)
@@ -185,6 +172,18 @@ defmodule Mix.Tasks.Mana.Compile do
         if beam =~ ~r{/(mix|ex_unit|iex|eex)(-[\d.]+)?/ebin/} do
           throw(:build_tool)
         end
+
+        # toolchain beams (outside this project's build) → shared cache;
+        # project-local ones (consolidated protocols etc.) → out dir
+        cache =
+          if String.starts_with?(beam, Mix.Project.build_path()) do
+            Path.join(out, "core-cache")
+          else
+            shared_cache_dir()
+          end
+
+        File.mkdir_p!(cache)
+        core = Path.join(cache, module <> ".core")
 
         fresh? =
           case {File.stat(core, time: :posix), File.stat(beam, time: :posix)} do
@@ -198,6 +197,16 @@ defmodule Mix.Tasks.Mana.Compile do
       _ ->
         :error
     end
+  end
+
+  # $XDG_CACHE_HOME/mana/cores/<elixir>-otp<otp>: core dumps are pure
+  # functions of the beam, so one cache per toolchain serves every project.
+  defp shared_cache_dir do
+    base =
+      System.get_env("XDG_CACHE_HOME") ||
+        Path.join(System.user_home!(), ".cache")
+
+    Path.join([base, "mana", "cores", "#{System.version()}-otp#{System.otp_release()}"])
   end
 
   defp resolve_entry!(nil) do

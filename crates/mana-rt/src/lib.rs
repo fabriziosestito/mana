@@ -202,6 +202,9 @@ struct Process {
     pending_closure: u64,
     /// links/monitors/trap flag — mutated cross-thread under this lock
     lstate: Mutex<LinkState>,
+    /// process dictionary. Values are promoted at put, so cross-thread
+    /// readers (process_info) only ever see old-space/immediate terms.
+    pdict: Mutex<Vec<(u64, u64)>>,
 }
 
 #[derive(Default)]
@@ -315,6 +318,7 @@ struct KnownAtoms {
     module: u64,
     nofile: u64,
     value: u64,
+    undefined: u64,
 }
 static KNOWN: std::sync::OnceLock<KnownAtoms> = std::sync::OnceLock::new();
 
@@ -343,6 +347,7 @@ pub extern "C" fn mana_rt_register_atoms(
     module: u64,
     nofile: u64,
     value: u64,
+    undefined: u64,
 ) {
     let _ = KNOWN.set(KnownAtoms {
         normal,
@@ -363,6 +368,7 @@ pub extern "C" fn mana_rt_register_atoms(
         module,
         nofile,
         value,
+        undefined,
     });
 }
 
@@ -462,10 +468,18 @@ fn make_coroutine(global: &'static Global, home: usize) -> ProcCoro {
         // reload at start: a major may have moved the closure since spawn
         let cl = p.pending_closure;
         p.pending_closure = 0;
-        unsafe {
-            let code = *((cl & !TAG_MASK) as *const u64).add(1);
-            let f: extern "C" fn(*mut ProcCtx, u64) -> u64 = std::mem::transmute(code);
-            f(ctx, cl)
+        let header = unsafe { *((cl & !TAG_MASK) as *const u64) };
+        if header & 0xff == KIND_TUPLE {
+            // MFA spawn (spawn_opt/proc_lib): {M, F, Args}
+            let tp = cl as *const u64;
+            let (m, f, a) = unsafe { (*tp.add(1), *tp.add(2), *tp.add(3)) };
+            mana_rt_apply3(ctx, m, f, a)
+        } else {
+            unsafe {
+                let code = *((cl & !TAG_MASK) as *const u64).add(1);
+                let f: extern "C" fn(*mut ProcCtx, u64) -> u64 = std::mem::transmute(code);
+                f(ctx, cl)
+            }
         }
     })
 }
@@ -503,6 +517,7 @@ pub extern "C" fn mana_rt_run(
                 state: Mutex::new(PState::Runnable),
                 pending_closure: 0,
                 lstate: Mutex::new(LinkState::default()),
+                pdict: Mutex::new(Vec::new()),
             },
         );
         debug_assert_eq!(pid, 0);
@@ -588,7 +603,13 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
             }
             CoroutineResult::Return(v) => {
                 let reason = if v == EXC_SENTINEL {
-                    if pid != 0 {
+                    // an uncaught exit with reason normal/shutdown is an
+                    // orderly termination (gen_server stop path) — silent,
+                    // like BEAM
+                    let quiet = ctx.exc_class == find_atom("exit").unwrap_or(0)
+                        && (ctx.exc_reason == known().normal
+                            || atom_bytes(ctx.exc_reason) == b"shutdown");
+                    if pid != 0 && !quiet {
                         let mut class = String::new();
                         let mut reason = String::new();
                         write_term(ctx.exc_class, &mut class);
@@ -819,6 +840,9 @@ fn process_death(ctx: &mut ProcCtx, pid: usize, reason: u64) {
     let Some(cell) = proc_ref(g, pid) else {
         return;
     };
+    if let Some(map) = NAME_REGISTRY.lock().unwrap().as_mut() {
+        map.retain(|_, &mut p| p != pid);
+    }
     let ls = {
         let p = unsafe { proc_mut(cell) };
         std::mem::take(&mut *p.lstate.lock())
@@ -935,6 +959,7 @@ pub extern "C" fn mana_rt_demonitor(ctx: *mut ProcCtx, r: u64) -> u64 {
     if r & 0xF != REF_TAG4 {
         return 0;
     }
+    drop_alias(r);
     let ref_id = r >> 4;
     let me = ctx.current;
     let target = {
@@ -955,6 +980,98 @@ pub extern "C" fn mana_rt_demonitor(ctx: *mut ProcCtx, r: u64) -> u64 {
         }
     }
     1
+}
+
+/// Reply aliases (OTP 24 monitor opts): ref word → target pid. A send to
+/// a ref consults this table; absent aliases drop silently (BEAM parity).
+static ALIASES: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// erlang:monitor/3 — monitor/2 plus options. Supported: {alias, _} (all
+/// deactivation flavors behave like demonitor — TODO(alias-modes)); other
+/// options are ignored.
+#[no_mangle]
+pub extern "C" fn mana_rt_monitor3(ctx: *mut ProcCtx, pid: u64, opts: u64) -> u64 {
+    let r = mana_rt_monitor(ctx, pid);
+    let ctxr = unsafe { &mut *ctx };
+    let mut cur = opts;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctxr);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let opt = unsafe { *p };
+        if opt & TAG_MASK == TAG_BOXED && opt != 0 {
+            let hp = opt as *const u64;
+            let h = unsafe { *hp };
+            if h & 0xff == KIND_TUPLE
+                && h >> 8 == 2
+                && atom_bytes(unsafe { *hp.add(1) }) == b"alias"
+            {
+                let mut guard = ALIASES.lock().unwrap();
+                guard
+                    .get_or_insert_with(Default::default)
+                    .insert(r, ctxr.current);
+            }
+        }
+        cur = unsafe { *p.add(1) };
+    }
+    r
+}
+
+fn drop_alias(r: u64) {
+    if let Some(map) = ALIASES.lock().unwrap().as_mut() {
+        map.remove(&r);
+    }
+}
+
+/// demonitor/2 with the flush option: also drop any already-delivered
+/// {'DOWN', Ref, ...} message. The info option (return false if the DOWN
+/// already fired) is approximated by whether a message was flushed.
+#[no_mangle]
+pub extern "C" fn mana_rt_demonitor_flush(ctx: *mut ProcCtx, r: u64) -> u64 {
+    let res = mana_rt_demonitor(ctx, r);
+    let ctx = unsafe { &mut *ctx };
+    if res == 0 {
+        return 0;
+    }
+    let me = ctx.current;
+    let cell = proc_ref(ctx.global, me).unwrap();
+    let p = unsafe { proc_mut(cell) };
+    while let Some(m) = p.ingress.pop() {
+        p.private.push(m);
+    }
+    let is_down_for = |msg: u64| -> bool {
+        if msg & TAG_MASK != TAG_BOXED || msg == 0 {
+            return false;
+        }
+        let tp = msg as *const u64;
+        let h = unsafe { *tp };
+        h & 0xff == KIND_TUPLE
+            && h >> 8 == 5
+            && unsafe { *tp.add(1) } == known().down_up
+            && unsafe { *tp.add(2) } == r
+    };
+    let before = p.private.len();
+    // removing before the cursor shifts it; adjust so the receive scan
+    // position stays on the same message
+    let mut removed_before_cursor = 0;
+    let cursor = p.cursor;
+    let mut i = 0;
+    p.private.retain(|&m| {
+        let keep = !is_down_for(m);
+        if !keep && i < cursor {
+            removed_before_cursor += 1;
+        }
+        i += 1;
+        keep
+    });
+    p.cursor -= removed_before_cursor;
+    if p.private.len() != before {
+        2 // flushed
+    } else {
+        1
+    }
 }
 
 /// erlang:exit/2 — kill is untrappable and propagates as killed.
@@ -1010,6 +1127,448 @@ pub extern "C" fn mana_rt_spawn_monitor(ctx: *mut ProcCtx, closure: u64) -> u64 
     shared_tuple(ctxr, &[pid, r])
 }
 
+/// Shared spawn machinery for MFA-shaped spawns: builds the {M, F, Args}
+/// pending tuple in the shared old space and registers the process.
+fn spawn_mfa_inner(ctx: &mut ProcCtx, m: u64, f: u64, args: u64) -> u64 {
+    let global = ctx.global;
+    // root the inputs while allocating the pending tuple
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 3, m, f, args];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let tup = shared_tuple(ctx, &[fr[2], fr[3], fr[4]]);
+    ctx.roots_head = saved;
+    let pending = promote_term(ctx, tup);
+    let home = if global.n_scheds == 1 {
+        0
+    } else {
+        global.spawn_rr.fetch_add(1, Ordering::Relaxed) % global.n_scheds
+    };
+    let pid = register_process(
+        global,
+        Process {
+            home,
+            coro: Some(make_coroutine(global, home)),
+            yielder: std::ptr::null(),
+            saved_roots: 0,
+            saved_exc_class: 0,
+            saved_exc_reason: 0,
+            ingress: SegQueue::new(),
+            private: Vec::new(),
+            cursor: 0,
+            state: Mutex::new(PState::Runnable),
+            pending_closure: pending,
+            lstate: Mutex::new(LinkState::default()),
+            pdict: Mutex::new(Vec::new()),
+        },
+    );
+    if home == ctx.sched_id {
+        ctx.run_q.push_back(pid);
+    } else {
+        global.scheds[home].inject.push(pid);
+        wake_sched(global, home);
+    }
+    make_pid(pid)
+}
+
+/// erlang:spawn_opt/4 (and spawn/3, spawn_link/3 with fixed opts).
+/// Understood options: link, monitor, {monitor, _}; sizing/priority hints
+/// are ignored. Returns pid, or {Pid, Ref} when monitoring.
+#[no_mangle]
+pub extern "C" fn mana_rt_spawn_opt_mfa(
+    ctx: *mut ProcCtx,
+    m: u64,
+    f: u64,
+    args: u64,
+    opts: u64,
+) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    if m & TAG_MASK != TAG_ATOM || f & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctxr);
+    }
+    let (mut link, mut monitor) = (false, false);
+    let mut cur = opts;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctxr);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let opt = unsafe { *p };
+        if opt & TAG_MASK == TAG_ATOM {
+            match atom_bytes(opt) {
+                b"link" => link = true,
+                b"monitor" => monitor = true,
+                _ => {} // priority etc. — hints we ignore
+            }
+        } else if opt & TAG_MASK == TAG_BOXED && opt != 0 {
+            let hp = opt as *const u64;
+            let h = unsafe { *hp };
+            if h & 0xff == KIND_TUPLE && h >> 8 == 2 {
+                let tag = unsafe { *hp.add(1) };
+                if tag & TAG_MASK == TAG_ATOM && atom_bytes(tag) == b"monitor" {
+                    monitor = true;
+                }
+            }
+        }
+        cur = unsafe { *p.add(1) };
+    }
+    let pid = spawn_mfa_inner(ctxr, m, f, args);
+    if link {
+        mana_rt_link(ctx, pid);
+    }
+    if monitor {
+        let r = mana_rt_monitor(ctx, pid);
+        return shared_tuple(unsafe { &mut *ctx }, &[pid, r]);
+    }
+    pid
+}
+
+// ---------------------------------------------------------------------------
+// time
+
+fn monotonic_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Convert nanoseconds to the requested unit term (atom or integer hertz).
+fn in_time_unit(ctx: &mut ProcCtx, nanos: i128, unit: u64) -> u64 {
+    let v: i128 = if unit & TAG_MASK == TAG_SMALL {
+        let hz = unit as i64 >> 3;
+        if hz <= 0 {
+            return raise_badarg(ctx);
+        }
+        nanos * hz as i128 / 1_000_000_000
+    } else if unit & TAG_MASK == TAG_ATOM {
+        match atom_bytes(unit) {
+            b"native" | b"nanosecond" | b"nano_seconds" => nanos,
+            b"microsecond" | b"micro_seconds" => nanos / 1_000,
+            b"millisecond" | b"milli_seconds" => nanos / 1_000_000,
+            b"second" | b"seconds" => nanos / 1_000_000_000,
+            b"perf_counter" => nanos,
+            _ => return raise_badarg(ctx),
+        }
+    } else {
+        return raise_badarg(ctx);
+    };
+    let v = v as i64;
+    if v >> 60 != 0 && v >> 60 != -1 {
+        eprintln!("mana: TODO(bignum): time value out of small-int range");
+        std::process::exit(1);
+    }
+    ((v << 3) as u64) | TAG_SMALL
+}
+
+/// erlang:fun_info/2 — closures carry no module/name metadata; arity and
+/// env answer truthfully, the rest is undefined (callers only thread the
+/// {Item, Value} shape through — Agent's initial_call bookkeeping).
+#[no_mangle]
+pub extern "C" fn mana_rt_fun_info(ctx: *mut ProcCtx, fun: u64, item: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if fun & TAG_MASK != TAG_BOXED || fun == 0 || item & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let header = unsafe { *(fun as *const u64) };
+    if header & 0xff != KIND_FUN {
+        return raise_badarg(ctx);
+    }
+    let value = match atom_bytes(item) {
+        b"arity" => ((((header >> 8) & 0xff) << 3) as u64) | TAG_SMALL,
+        b"env" => NIL,
+        _ => known().undefined,
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, item, value];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let t = alloc_nursery(ctx, 3);
+    ctx.roots_head = saved;
+    unsafe {
+        *t = (2 << 8) | KIND_TUPLE;
+        *t.add(1) = fr[2];
+        *t.add(2) = fr[3];
+    }
+    t as u64
+}
+
+/// erlang:is_process_alive/1.
+#[no_mangle]
+pub extern "C" fn mana_rt_is_process_alive(ctx: *mut ProcCtx, pid: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if pid & 0xF != PID_TAG4 {
+        return raise_badarg(ctx);
+    }
+    if proc_ref(ctx.global, (pid >> 4) as usize).is_some() {
+        known().true_a
+    } else {
+        known().false_a
+    }
+}
+
+/// erlang:monotonic_time/1 (unit 'native' == nanosecond here).
+#[no_mangle]
+pub extern "C" fn mana_rt_monotonic_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let nanos = monotonic_epoch().elapsed().as_nanos() as i128;
+    in_time_unit(ctx, nanos, unit)
+}
+
+/// erlang:system_time/1.
+#[no_mangle]
+pub extern "C" fn mana_rt_system_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    in_time_unit(ctx, nanos, unit)
+}
+
+/// erlang:convert_time_unit/3 — from/to as unit terms.
+#[no_mangle]
+pub extern "C" fn mana_rt_convert_time_unit(
+    ctx: *mut ProcCtx,
+    t: u64,
+    from: u64,
+    to: u64,
+) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if t & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let v = (t as i64 >> 3) as i128;
+    let nanos: i128 = if from & TAG_MASK == TAG_SMALL {
+        let hz = from as i64 >> 3;
+        if hz <= 0 {
+            return raise_badarg(ctx);
+        }
+        v * 1_000_000_000 / hz as i128
+    } else {
+        match atom_bytes(from) {
+            b"native" | b"nanosecond" | b"nano_seconds" => v,
+            b"microsecond" | b"micro_seconds" => v * 1_000,
+            b"millisecond" | b"milli_seconds" => v * 1_000_000,
+            b"second" | b"seconds" => v * 1_000_000_000,
+            _ => return raise_badarg(ctx),
+        }
+    };
+    in_time_unit(ctx, nanos, to)
+}
+
+// ---------------------------------------------------------------------------
+// process dictionary + name registry
+
+/// put/2 — returns the previous value or undefined. Both key and value are
+/// promoted so the entry is safe for cross-thread readers and minors.
+#[no_mangle]
+pub extern "C" fn mana_rt_pd_put(ctx: *mut ProcCtx, k: u64, v: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, k, v];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let k = promote_term(ctx, fr[2]);
+    fr[2] = k;
+    let v = promote_term(ctx, fr[3]);
+    ctx.roots_head = saved;
+    let cell = proc_ref(ctx.global, ctx.current).expect("live current process");
+    let p = unsafe { proc_mut(cell) };
+    let mut pd = p.pdict.lock();
+    match pd.iter_mut().find(|(ek, _)| mana_rt_eq_exact(*ek, k) == 1) {
+        Some(e) => std::mem::replace(&mut e.1, v),
+        None => {
+            pd.push((k, v));
+            known().undefined
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_pd_get(ctx: *mut ProcCtx, k: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let cell = proc_ref(ctx.global, ctx.current).expect("live current process");
+    let p = unsafe { proc_mut(cell) };
+    let pd = p.pdict.lock();
+    pd.iter()
+        .find(|(ek, _)| mana_rt_eq_exact(*ek, k) == 1)
+        .map(|&(_, v)| v)
+        .unwrap_or(known().undefined)
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_pd_erase(ctx: *mut ProcCtx, k: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let cell = proc_ref(ctx.global, ctx.current).expect("live current process");
+    let p = unsafe { proc_mut(cell) };
+    let mut pd = p.pdict.lock();
+    match pd.iter().position(|(ek, _)| mana_rt_eq_exact(*ek, k) == 1) {
+        Some(i) => pd.remove(i).1,
+        None => known().undefined,
+    }
+}
+
+/// The whole dictionary as [{K, V}] — for get/0 and process_info.
+fn pdict_to_list(ctx: &mut ProcCtx, pid: usize) -> u64 {
+    let entries: Vec<(u64, u64)> = match proc_ref(ctx.global, pid) {
+        Some(cell) => unsafe { proc_mut(cell) }.pdict.lock().clone(),
+        None => Vec::new(),
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, NIL, 0];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for &(k, v) in entries.iter().rev() {
+        // k/v are old-space — no rooting needed for them
+        let t = alloc_nursery(ctx, 3);
+        unsafe {
+            *t = (2 << 8) | KIND_TUPLE;
+            *t.add(1) = k;
+            *t.add(2) = v;
+        }
+        fr[3] = t as u64;
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = fr[3];
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[2]
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_pd_get_all(ctx: *mut ProcCtx) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    let cur = ctxr.current;
+    pdict_to_list(ctxr, cur)
+}
+
+/// Registered names: atom → pid id. Names are dropped at process death.
+static NAME_REGISTRY: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> =
+    std::sync::Mutex::new(None);
+
+#[no_mangle]
+pub extern "C" fn mana_rt_register(ctx: *mut ProcCtx, name: u64, pid: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if name & TAG_MASK != TAG_ATOM
+        || atom_bytes(name) == b"undefined"
+        || pid & 0xF != PID_TAG4
+    {
+        return raise_badarg(ctx);
+    }
+    let id = (pid >> 4) as usize;
+    if proc_ref(ctx.global, id).is_none() {
+        return raise_badarg(ctx);
+    }
+    let mut guard = NAME_REGISTRY.lock().unwrap();
+    let map = guard.get_or_insert_with(Default::default);
+    if map.contains_key(&name) || map.values().any(|&p| p == id) {
+        return raise_badarg(ctx);
+    }
+    map.insert(name, id);
+    known().true_a
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_whereis(ctx: *mut ProcCtx, name: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if name & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let guard = NAME_REGISTRY.lock().unwrap();
+    match guard.as_ref().and_then(|m| m.get(&name)) {
+        // a name may outlive its process between death and cleanup — treat
+        // dead as unregistered
+        Some(&id) if proc_ref(ctx.global, id).is_some() => make_pid(id),
+        _ => known().undefined,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_unregister(ctx: *mut ProcCtx, name: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut guard = NAME_REGISTRY.lock().unwrap();
+    match guard.as_mut().and_then(|m| m.remove(&name)) {
+        Some(_) => known().true_a,
+        None => raise_badarg(ctx),
+    }
+}
+
+/// process_info/2 — the closed-world subset: registered_name, dictionary,
+/// message_queue_len; everything else answers undefined.
+#[no_mangle]
+pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if pid & 0xF != PID_TAG4 || item & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let id = (pid >> 4) as usize;
+    if proc_ref(ctx.global, id).is_none() {
+        return known().undefined;
+    }
+    match atom_bytes(item) {
+        b"registered_name" => {
+            let guard = NAME_REGISTRY.lock().unwrap();
+            let name = guard
+                .as_ref()
+                .and_then(|m| m.iter().find(|&(_, &p)| p == id).map(|(&n, _)| n));
+            drop(guard);
+            match name {
+                Some(n) => {
+                    let t = alloc_nursery(ctx, 3);
+                    unsafe {
+                        *t = (2 << 8) | KIND_TUPLE;
+                        *t.add(1) = item;
+                        *t.add(2) = n;
+                    }
+                    t as u64
+                }
+                None => NIL, // BEAM: [] for an unnamed live process
+            }
+        }
+        b"dictionary" => {
+            let saved = ctx.roots_head;
+            let mut fr = [0u64, 1, 0];
+            fr[0] = saved;
+            ctx.roots_head = fr.as_ptr() as u64;
+            fr[2] = pdict_to_list(ctx, id);
+            let t = alloc_nursery(ctx, 3);
+            unsafe {
+                *t = (2 << 8) | KIND_TUPLE;
+                *t.add(1) = item;
+                *t.add(2) = fr[2];
+            }
+            ctx.roots_head = saved;
+            t as u64
+        }
+        b"current_stacktrace" => {
+            // stacktraces are not built — TODO(stacktraces)
+            let t = alloc_nursery(ctx, 3);
+            unsafe {
+                *t = (2 << 8) | KIND_TUPLE;
+                *t.add(1) = item;
+                *t.add(2) = NIL;
+            }
+            t as u64
+        }
+        b"message_queue_len" => {
+            // ingress length is approximate cross-thread; good enough
+            let cell = proc_ref(ctx.global, id).unwrap();
+            let p = unsafe { proc_mut(cell) };
+            let n = (p.private.len() - p.cursor.min(p.private.len())) + p.ingress.len();
+            let t = alloc_nursery(ctx, 3);
+            unsafe {
+                *t = (2 << 8) | KIND_TUPLE;
+                *t.add(1) = item;
+                *t.add(2) = ((n as u64) << 3) | TAG_SMALL;
+            }
+            t as u64
+        }
+        _ => known().undefined,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // process BIF surface
 
@@ -1060,6 +1619,7 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
             state: Mutex::new(PState::Runnable),
             pending_closure: closure,
             lstate: Mutex::new(LinkState::default()),
+            pdict: Mutex::new(Vec::new()),
         },
     );
     if home == ctx.sched_id {
@@ -1075,6 +1635,25 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
 /// pass zero-copy. Sends to dead/unknown pids succeed silently.
 #[no_mangle]
 pub extern "C" fn mana_rt_send(ctx: *mut ProcCtx, pid: u64, msg: u64) {
+    let mut pid = pid;
+    if pid & 0xF == REF_TAG4 {
+        // reply alias: silently dropped when inactive
+        let target = ALIASES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&pid).copied());
+        match target {
+            Some(t) => pid = make_pid(t),
+            None => return,
+        }
+    } else if pid & TAG_MASK == TAG_ATOM {
+        let ctxr = unsafe { &mut *ctx };
+        match mana_rt_whereis(ctxr as *mut ProcCtx, pid) {
+            p if p & 0xF == PID_TAG4 => pid = p,
+            _ => return, // BEAM raises badarg; softened — TODO(send-name)
+        }
+    }
     let Some(id) = pid_id(pid) else { return };
     let ctx = unsafe { &mut *ctx };
     let global = ctx.global;
@@ -1249,6 +1828,13 @@ unsafe fn walk_proc_roots(p: &mut Process, mut f: impl FnMut(*mut u64)) {
         f(&mut p.saved_exc_class as *mut u64);
         f(&mut p.saved_exc_reason as *mut u64);
         f(&mut p.pending_closure as *mut u64);
+        {
+            let mut pd = p.pdict.lock();
+            for (k, v) in pd.iter_mut() {
+                f(k as *mut u64);
+                f(v as *mut u64);
+            }
+        }
         let mut ls = p.lstate.lock();
         if ls.pending_kill != 0 {
             f(&mut ls.pending_kill as *mut u64);
@@ -1840,6 +2426,15 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
     }
 }
 
+/// Inline badarg raise notifier (MANA_DEBUG_BADARG).
+#[no_mangle]
+pub extern "C" fn mana_rt_note_badarg(msg: *const u8, len: u64) {
+    if std::env::var_os("MANA_DEBUG_BADARG").is_some() {
+        let m = unsafe { std::slice::from_raw_parts(msg, len as usize) };
+        eprintln!("mana: badarg raised in {}", String::from_utf8_lossy(m));
+    }
+}
+
 /// A stubbed (unsupported-construct) function was actually called.
 #[no_mangle]
 pub extern "C" fn mana_rt_unsupported(msg: *const u8, len: u64) -> ! {
@@ -1854,6 +2449,12 @@ pub extern "C" fn mana_rt_unsupported(msg: *const u8, len: u64) -> ! {
 /// Set exc and return the sentinel — the raising-BIF convention: codegen
 /// treats these helpers exactly like may-raise calls.
 fn raise_badarg(ctx: &mut ProcCtx) -> u64 {
+    if std::env::var_os("MANA_DEBUG_BADARG").is_some() {
+        eprintln!(
+            "mana: badarg raised at:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
     ctx.exc_class = atom_error();
     ctx.exc_reason = known().badarg;
     EXC_SENTINEL
@@ -2984,6 +3585,17 @@ pub extern "C" fn mana_rt_list_to_integer(ctx: *mut ProcCtx, l: u64, base: u64) 
     }
 }
 
+/// erlang:atom_to_list/1.
+#[no_mangle]
+pub extern "C" fn mana_rt_atom_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if t & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let bytes: Vec<u8> = atom_bytes(t).to_vec();
+    bytes_to_charlist(ctx, &bytes)
+}
+
 /// erlang:atom_to_binary/1,2 (utf8 == latin1 for our ascii atom names).
 #[no_mangle]
 pub extern "C" fn mana_rt_atom_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
@@ -3004,9 +3616,10 @@ extern "C" {
     static __stop_mana_atoms: u64;
 }
 
-fn atom_table() -> &'static std::collections::HashMap<&'static [u8], u64> {
-    static TABLE: std::sync::OnceLock<std::collections::HashMap<&'static [u8], u64>> =
-        std::sync::OnceLock::new();
+type AtomTable = std::sync::RwLock<std::collections::HashMap<&'static [u8], u64>>;
+
+fn atom_table_lock() -> &'static AtomTable {
+    static TABLE: std::sync::OnceLock<AtomTable> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let mut map = std::collections::HashMap::new();
         unsafe {
@@ -3022,8 +3635,40 @@ fn atom_table() -> &'static std::collections::HashMap<&'static [u8], u64> {
                 }
             }
         }
-        map
+        std::sync::RwLock::new(map)
     })
+}
+
+/// Look up an existing atom by name bytes.
+fn atom_lookup(bytes: &[u8]) -> Option<u64> {
+    atom_table_lock().read().unwrap().get(bytes).copied()
+}
+
+/// Get-or-mint an atom. Minted atoms are eternal {len, bytes} structs in
+/// the SAME table, so pointer identity (raw =:=) holds program-wide. BEAM
+/// parity for list_to_atom/binary_to_atom; the table can grow at runtime
+/// but never shrinks — same as BEAM.
+fn atom_intern(bytes: &[u8]) -> u64 {
+    if let Some(a) = atom_lookup(bytes) {
+        return a;
+    }
+    let mut map = atom_table_lock().write().unwrap();
+    if let Some(&a) = map.get(bytes) {
+        return a;
+    }
+    let words = 1 + (bytes.len() + 7) / 8;
+    let p = alloc_space(words);
+    unsafe {
+        *p = bytes.len() as u64;
+        if bytes.len() % 8 != 0 {
+            *p.add(words - 1) = 0;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(1) as *mut u8, bytes.len());
+    }
+    let atom = (p as u64) | TAG_ATOM;
+    let key: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+    map.insert(key, atom);
+    atom
 }
 
 // Closed-world export table: codegen plants one 4-word entry per exported
@@ -3128,6 +3773,38 @@ pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -
         return raise_badarg(ctx);
     };
     let Some(&code) = export_table().get(&(m, f, n as u64)) else {
+        // dynamic calls into the BIF surface (compiled statically
+        // everywhere else): the hot handful, extended on demand
+        if atom_bytes(m) == b"erlang" {
+            match (atom_bytes(f), n) {
+                (b"error", 1) | (b"exit", 1) | (b"throw", 1) => {
+                    let class = match atom_bytes(f) {
+                        b"error" => atom_error(),
+                        b"exit" => find_atom("exit").expect("exit atom"),
+                        _ => find_atom("throw").expect("throw atom"),
+                    };
+                    ctx.exc_class = class;
+                    ctx.exc_reason = argv[0];
+                    return EXC_SENTINEL;
+                }
+                (b"apply", 3) => return mana_rt_apply3(ctx, argv[0], argv[1], argv[2]),
+                (b"apply", 2) => return mana_rt_apply_fun(ctx, argv[0], argv[1]),
+                (b"send", 2) | (b"!", 2) => {
+                    mana_rt_send(ctx, argv[0], argv[1]);
+                    return argv[1];
+                }
+                (b"self", 0) => return make_pid(ctx.current),
+                _ => {}
+            }
+        }
+        if std::env::var_os("MANA_DEBUG_UNDEF").is_some() {
+            eprintln!(
+                "mana: undef {}:{}/{}",
+                String::from_utf8_lossy(atom_bytes(m)),
+                String::from_utf8_lossy(atom_bytes(f)),
+                n
+            );
+        }
         return raise_undef(ctx);
     };
     unsafe { call_dynamic(ctx, code, &argv[..n], 0).unwrap_or_else(|| raise_undef(ctx)) }
@@ -3452,7 +4129,7 @@ pub extern "C" fn mana_rt_pt_get(ctx: *mut ProcCtx, key: u64, default: u64, has_
 /// Any atom compiled into the program, by name. The closed-world table is
 /// complete, so a miss means the runtime tried to mint a new atom.
 fn find_atom(name: &str) -> Option<u64> {
-    atom_table().get(name.as_bytes()).copied()
+    atom_lookup(name.as_bytes())
 }
 
 /// Patterns: a binary or a non-empty list of binaries (compile_pattern is
@@ -4135,19 +4812,91 @@ pub extern "C" fn mana_rt_function_exported(_ctx: *mut ProcCtx, m: u64, f: u64, 
     }
 }
 
-/// erlang:binary_to_atom/1,2 — closed world: only atoms that exist in the
-/// compiled program can be produced (binary_to_existing_atom semantics;
-/// unknown names are badarg, where BEAM would mint the atom).
+/// erlang:list_to_atom/1 (interning) and list_to_existing_atom/1 (strict).
 #[no_mangle]
-pub extern "C" fn mana_rt_binary_to_atom(ctx: *mut ProcCtx, bin: u64) -> u64 {
+pub extern "C" fn mana_rt_list_to_atom(ctx: *mut ProcCtx, l: u64, existing: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut bytes = Vec::new();
+    let mut cur = l;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if h & TAG_MASK != TAG_SMALL {
+            return raise_badarg(ctx);
+        }
+        let cp = h as i64 >> 3;
+        let Some(c) = u32::try_from(cp).ok().and_then(char::from_u32) else {
+            return raise_badarg(ctx);
+        };
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        cur = unsafe { *p.add(1) };
+    }
+    if existing != 0 {
+        match atom_lookup(&bytes) {
+            Some(a) => a,
+            None => raise_badarg(ctx),
+        }
+    } else {
+        atom_intern(&bytes)
+    }
+}
+
+/// Deferred-undef target for make_fun/3 misses: raises when called. Extra
+/// (argument/fun) registers are ignored — SysV lets callers pass more.
+extern "C" fn make_fun_undef(ctx: *mut ProcCtx) -> u64 {
+    raise_undef(unsafe { &mut *ctx })
+}
+
+/// erlang:make_fun/3 — a fun value for an exported function. The closure
+/// convention appends the fun term as a trailing argument; raw compiled
+/// functions ignore it (SysV: extra args are harmless), so the closure's
+/// code pointer can be the export itself.
+#[no_mangle]
+pub extern "C" fn mana_rt_make_fun(ctx: *mut ProcCtx, m: u64, f: u64, arity: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if m & TAG_MASK != TAG_ATOM || f & TAG_MASK != TAG_ATOM || arity & TAG_MASK != TAG_SMALL {
+        return raise_badarg(ctx);
+    }
+    let a = (arity as i64 >> 3) as u64;
+    let code = export_table().get(&(m, f, a)).copied().unwrap_or_else(|| {
+        if std::env::var_os("MANA_DEBUG_UNDEF").is_some() {
+            eprintln!(
+                "mana: make_fun miss {}:{}/{}",
+                String::from_utf8_lossy(atom_bytes(m)),
+                String::from_utf8_lossy(atom_bytes(f)),
+                a
+            );
+        }
+        make_fun_undef as usize
+    });
+    let p = alloc_nursery(ctx, 2);
+    unsafe {
+        *p = (a << 8) | KIND_FUN; // zero captures
+        *p.add(1) = code as u64;
+    }
+    p as u64
+}
+
+/// erlang:binary_to_atom/1,2 — interns (existing == 0) or requires an
+/// existing atom (binary_to_existing_atom).
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_to_atom(ctx: *mut ProcCtx, bin: u64, existing: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let Some((p, n)) = bin_parts(bin) else {
         return raise_badarg(ctx);
     };
     let bytes = unsafe { std::slice::from_raw_parts(p, n) };
-    match atom_table().get(bytes) {
-        Some(a) => *a,
-        None => raise_badarg(ctx),
+    if existing != 0 {
+        match atom_lookup(bytes) {
+            Some(a) => a,
+            None => raise_badarg(ctx),
+        }
+    } else {
+        atom_intern(bytes)
     }
 }
 

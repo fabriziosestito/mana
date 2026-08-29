@@ -143,36 +143,52 @@ pub fn compile_program(
             }
         }
     }
-    let reachable = reachable_funs(mods, entry_mod, entry, poisoned)?;
+    let (reachable, missing_mods) = reachable_funs(mods, entry_mod, entry, poisoned)?;
     let gc_set = compute_may_gc(mods, &reachable);
     let raise_set = compute_may_raise(mods, &reachable);
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("creating {}: {}", out_dir.display(), e))?;
-    let mut objs = Vec::new();
-    for m in mods {
-        let include: HashSet<FunName> = reachable
-            .iter()
-            .filter(|(module, _)| module == &m.name)
-            .map(|(_, f)| f.clone())
-            .collect();
-        if include.is_empty() {
-            continue;
-        }
-        let context = Context::create();
-        let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
-        let entry_here = (m.name == entry_mod).then_some(entry);
-        cg.compile(m, &include, entry_here)?;
-        if dump_ir {
-            eprintln!("{}", cg.module.print_to_string().to_string());
-        }
-        cg.module
-            .verify()
-            .map_err(|e| format!("LLVM verifier ({}): {}", m.name, e))?;
-        let obj = out_dir.join(format!("{}.o", sanitize(&m.name)));
-        cg.emit_object(&obj)?;
-        objs.push(obj);
-    }
+    // one LLVM Context per module → modules compile in parallel. Target
+    // init is not thread-safe — do it once, up front; workers get deep
+    // stacks (AST walkers recurse per list element).
+    Target::initialize_native(&InitializationConfig::default())
+        .map_err(|e| format!("target init: {}", e))?;
+    use rayon::prelude::*;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .stack_size(256 * 1024 * 1024)
+        .build()
+        .map_err(|e| format!("thread pool: {}", e))?;
+    let objs: Vec<PathBuf> = pool.install(|| mods
+        .par_iter()
+        .map(|m| -> CgResult<Option<PathBuf>> {
+            let include: HashSet<FunName> = reachable
+                .iter()
+                .filter(|(module, _)| module == &m.name)
+                .map(|(_, f)| f.clone())
+                .collect();
+            if include.is_empty() {
+                return Ok(None);
+            }
+            let context = Context::create();
+            let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
+            *cg.missing_modules.borrow_mut() = missing_mods.clone();
+            let entry_here = (m.name == entry_mod).then_some(entry);
+            cg.compile(m, &include, entry_here)?;
+            if dump_ir {
+                eprintln!("{}", cg.module.print_to_string().to_string());
+            }
+            cg.module
+                .verify()
+                .map_err(|e| format!("LLVM verifier ({}): {}", m.name, e))?;
+            let obj = out_dir.join(format!("{}.o", sanitize(&m.name)));
+            cg.emit_object(&obj)?;
+            Ok(Some(obj))
+        })
+        .collect::<CgResult<Vec<_>>>())?
+        .into_iter()
+        .flatten()
+        .collect();
     Ok(objs)
 }
 
@@ -204,6 +220,9 @@ struct Cg<'ctx, 'p> {
     static_bytes_count: Cell<usize>,
     /// exported functions compiled in this module → mana_exports entries
     exports: RefCell<Vec<(FunName, FunctionValue<'ctx>)>>,
+    /// modules the program references but that are not compiled: calls to
+    /// them poison the calling function (stub) instead of failing the build
+    missing_modules: RefCell<HashSet<String>>,
     /// innermost enclosing try handler blocks (current function)
     handlers: RefCell<Vec<BasicBlock<'ctx>>>,
     /// lazily created per-function "pop frame; return sentinel" block
@@ -259,6 +278,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             eternal_alloc: Cell::new(false),
             static_bytes_count: Cell::new(0),
             exports: RefCell::new(Vec::new()),
+            missing_modules: RefCell::new(HashSet::new()),
             handlers: RefCell::new(Vec::new()),
             propagate_bb: Cell::new(None),
             var_slots: Default::default(),
@@ -355,7 +375,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn rt_register_atoms(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_register_atoms", || {
             let params: Vec<BasicMetadataTypeEnum> =
-                (0..17).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
+                (0..19).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
             self.ctx.void_type().fn_type(&params, false)
         })
     }
@@ -1059,6 +1079,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let names = [
             "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
             "badarg", "error", "badmap", "badkey", "undef", "ok", "module", "nofile",
+            "value", "undefined",
         ];
         let mut atom_args: Vec<BasicMetadataValueEnum> = Vec::new();
         for n in names {
@@ -1157,6 +1178,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 Ok(())
             }
             Expr::Call { module, name, args } if !is_bif_module(module) => {
+                if self.missing_modules.borrow().contains(module) {
+                    return Err(format!("module '{}' is not compiled", module));
+                }
                 let callee = self.remote_fn(module, name, args.len());
                 let argv = self.eval_args(f, args, scope)?;
                 self.pop_frame()?;
@@ -1307,6 +1331,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Expr::Call { module, name, args } => {
                 if is_bif_module(module) {
                     self.compile_bif(f, module, name, args, scope)
+                } else if self.missing_modules.borrow().contains(module) {
+                    Err(format!("module '{}' is not compiled", module))
                 } else {
                     let callee = self.remote_fn(module, name, args.len());
                     let may_raise = self.raise_set.contains(&(
@@ -1897,13 +1923,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             *self.var_slots.borrow_mut() = saved_slots;
             self.next_slot.set(saved_next);
             self.slot_cap.set(saved_cap);
+            if let Err(e) = r {
+                // an unsupported BIF captured as a fun: the shim raises at
+                // runtime if the fun is ever called
+                let msg = format!("fun {}:{}/{}: {}", target_mod, fname.name, fname.arity, e);
+                eprintln!("manac: warning: {} stubbed", msg);
+                self.emit_unsupported_stub(shim, &msg)?;
+            }
             if let Some(bb) = saved_bb {
                 self.builder.position_at_end(bb);
             }
-            r?;
             return Ok(shim);
         }
 
+        if module.is_some() && self.missing_modules.borrow().contains(target_mod) {
+            return Err(format!("module '{}' is not compiled", target_mod));
+        }
         let target = if module.is_none() || module == Some(self.module_name.as_str()) {
             self.local_fn(fname)?
         } else {
@@ -1987,6 +2022,32 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_conditional_branch(ok, cont, bad)
             .map_err(be)?;
         self.builder.position_at_end(bad);
+        // poor man's stacktrace: MANA_DEBUG_BADARG names the raising
+        // function (cold path — the call costs nothing unless raising)
+        let site = format!(
+            "{}:{}",
+            self.module_name,
+            f.get_name().to_string_lossy()
+        );
+        let ptr = self.static_bytes(site.as_bytes())?;
+        self.builder
+            .build_call(
+                self.rt_fn("mana_rt_note_badarg", || {
+                    self.ctx.void_type().fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                }),
+                &[
+                    ptr.into(),
+                    self.i64t.const_int(site.len() as u64, false).into(),
+                ],
+                "",
+            )
+            .map_err(be)?;
         let class = self.atom_term("error")?;
         let reason = self.atom_term("badarg")?;
         let ctx = self.ctx_val();
@@ -2812,12 +2873,25 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
         if matches!(
             module,
-            "erts_internal" | "elixir_erl" | "erl_eval" | "beam_lib"
+            "erts_internal" | "elixir_erl" | "erl_eval" | "beam_lib" | "global"
+                | "global_group" | "net_kernel"
         ) {
-            // BEAM/compiler guts: nothing is implemented; the caller gets
-            // stubbed (function-granular poisoning), failing loudly only if
-            // a program actually reaches it
-            return Err(format!("unsupported BIF {}:{}/{}", module, name, args.len()));
+            // BEAM/compiler/distribution guts: compile the call as a runtime
+            // raise instead of poisoning the whole caller — reached code
+            // often only touches these on branches that never run
+            // (GenServer.whereis' {global, Name} arm, ...). Args evaluated.
+            self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+            let module_atom = self.atom_term(module)?;
+            let reason = self.eternal_pair("unsupported", module_atom)?;
+            let class = self.atom_term("error")?;
+            let ctx = self.ctx_val();
+            self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
+            self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
+            let target = self.unwind_target(f)?;
+            self.builder.build_unconditional_branch(target).map_err(be)?;
+            let dead = self.ctx.append_basic_block(f, "unsup.dead");
+            self.builder.position_at_end(dead);
+            return Ok(self.i64t.get_undef());
         }
         if module == "file" {
             // file system access is not wired up yet: every call answers
@@ -3148,7 +3222,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let _ = call;
                 self.atom_term("true")
             }
-            ("!", 2) | ("send", 2) => {
+            ("!", 2) | ("send", 2) | ("send", 3) => {
+                // send/3's options (noconnect/nosuspend) are distribution
+                // concerns — ignored; it returns ok instead of the message
                 self.builder
                     .build_call(
                         self.rt_send(),
@@ -3156,7 +3232,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         "",
                     )
                     .map_err(be)?;
-                Ok(argv[1])
+                if argv.len() == 3 {
+                    self.atom_term("ok")
+                } else {
+                    Ok(argv[1])
+                }
             }
             ("and", 2) | ("or", 2) | ("xor", 2) => {
                 let t = self.atom_term("true")?;
@@ -3351,6 +3431,278 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("spawn_opt", 4) | ("spawn", 3) | ("spawn_link", 3) => {
+                let callee = self.rt_fn("mana_rt_spawn_opt_mfa", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let opts = match name {
+                    "spawn_opt" => argv[3],
+                    "spawn_link" => {
+                        // [link]
+                        let p = self.alloc_words_kind(2, true)?;
+                        let link = self.atom_term("link")?;
+                        self.store_word(p, 0, link)?;
+                        self.store_word(p, 1, self.nil())?;
+                        let addr = self
+                            .builder
+                            .build_ptr_to_int(p, self.i64t, "opt.addr")
+                            .map_err(be)?;
+                        self.builder
+                            .build_or(addr, self.i64t.const_int(TAG_CONS, false), "opt")
+                            .map_err(be)?
+                    }
+                    _ => self.nil(),
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                            opts.into(),
+                        ],
+                        "spawnopt",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("put", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_pd_put"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "pdput",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("get", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_pd_get"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "pdget",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("erase", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_pd_erase"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "pderase",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("get", 0) => {
+                let callee = self.rt_fn("mana_rt_pd_get_all", || {
+                    self.i64t.fn_type(
+                        &[BasicMetadataTypeEnum::PointerType(self.ptrt)],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(callee, &[self.ctx_val().into()], "pdall")
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("register", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_register"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "reg",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("whereis", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_whereis"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "whereis",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("unregister", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_unregister"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "unreg",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("demonitor", 2) => {
+                // options: [flush] (and/or info) — flush is honored, the
+                // info return value approximated; options list is constant
+                // in practice so it is not inspected
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_demonitor_flush"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "demon2",
+                    )
+                    .map_err(be)?;
+                let _ = call_result(call)?;
+                self.atom_term("true")
+            }
+            ("process_info", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_process_info2"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "pinfo",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("monitor", 3) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_monitor3"),
+                        &[self.ctx_val().into(), argv[1].into(), argv[2].into()],
+                        "mon3",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("monotonic_time", 0) | ("monotonic_time", 1) | ("system_time", 0)
+            | ("system_time", 1) => {
+                let helper = if name == "monotonic_time" {
+                    "mana_rt_monotonic_time"
+                } else {
+                    "mana_rt_system_time"
+                };
+                let unit = if argv.len() == 1 {
+                    argv[0]
+                } else {
+                    self.atom_term("native")?
+                };
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64(helper),
+                        &[self.ctx_val().into(), unit.into()],
+                        "time",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("convert_time_unit", 3) => {
+                let callee = self.rt_fn("mana_rt_convert_time_unit", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "ctu",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("fun_info", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_fun_info"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "funinfo",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("is_process_alive", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_is_process_alive"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "alive",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("make_fun", 3) => {
+                let callee = self.rt_fn("mana_rt_make_fun", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "mkfun",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("function_exported", 3) => {
                 let callee = self.rt_fn("mana_rt_function_exported", || {
                     self.i64t.fn_type(
@@ -3379,6 +3731,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 Ok(call_result(call)?.into_int_value())
             }
             ("is_port", 1) => self.atom_term("false"),
+            // no distribution: everything lives on nonode@nohost
+            ("node", 0) | ("node", 1) => self.atom_term("nonode@nohost"),
+            ("nodes", 0) | ("nodes", 1) => Ok(self.nil()),
+            ("is_alive", 0) => self.atom_term("false"),
             ("is_binary", 1) | ("is_bitstring", 1) => {
                 // byte-aligned only: binary <=> bitstring
                 let c = self.kind_test(f, argv[0], |s, header| {
@@ -3520,6 +3876,36 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("list_to_atom", 1) | ("list_to_existing_atom", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_list_to_atom"),
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            self.i64t
+                                .const_int((name == "list_to_existing_atom") as u64, false)
+                                .into(),
+                        ],
+                        "l2a",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("atom_to_list", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_atom_to_list"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "a2l",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("binary_to_list", 1)
             | ("list_to_binary", 1)
             | ("iolist_to_binary", 1)
@@ -3529,14 +3915,33 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             | ("binary_to_atom", 2)
             | ("binary_to_existing_atom", 1)
             | ("binary_to_existing_atom", 2) => {
-                // encoding args (latin1/utf8) are irrelevant: atom names are
-                // ascii; closed world makes to_atom = to_existing_atom
+                // encoding args (latin1/utf8) are irrelevant: names are utf8
+                if name == "binary_to_atom" || name == "binary_to_existing_atom" {
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_ptt_i64("mana_rt_binary_to_atom"),
+                            &[
+                                self.ctx_val().into(),
+                                argv[0].into(),
+                                self.i64t
+                                    .const_int(
+                                        (name == "binary_to_existing_atom") as u64,
+                                        false,
+                                    )
+                                    .into(),
+                            ],
+                            "b2a",
+                        )
+                        .map_err(be)?;
+                    let v = call_result(call)?.into_int_value();
+                    return self.check_exc(f, v);
+                }
                 let helper = match name {
                     "binary_to_list" => "mana_rt_binary_to_list",
                     "list_to_binary" => "mana_rt_list_to_binary",
                     "iolist_to_binary" => "mana_rt_iolist_to_binary",
-                    "atom_to_binary" => "mana_rt_atom_to_binary",
-                    _ => "mana_rt_binary_to_atom",
+                    _ => "mana_rt_atom_to_binary",
                 };
                 let call = self
                     .builder
@@ -5476,7 +5881,8 @@ fn is_bif_module(m: &str) -> bool {
         m,
         "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
             | "logger" | "ets" | "application" | "file" | "erts_internal"
-            | "elixir_erl" | "erl_eval" | "beam_lib"
+            | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
+            | "net_kernel"
     )
 }
 
@@ -5602,7 +6008,8 @@ fn expr_may_raise(
                 module.as_str(),
                 "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
                     | "logger" | "ets" | "application" | "file" | "erts_internal"
-                    | "elixir_erl" | "erl_eval" | "beam_lib"
+                    | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
+                    | "net_kernel"
             ) {
                 return true;
             }
@@ -5615,8 +6022,24 @@ fn expr_may_raise(
                         | ("exit", 1)
                         | ("throw", 1)
                         | ("spawn", 1)
+                        | ("spawn", 3)
                         | ("spawn_link", 1)
+                        | ("spawn_link", 3)
+                        | ("spawn_opt", 4)
                         | ("spawn_monitor", 1)
+                        | ("make_fun", 3)
+                        | ("monitor", 3)
+                        | ("is_process_alive", 1)
+                        | ("fun_info", 2)
+                        | ("monotonic_time", 0)
+                        | ("monotonic_time", 1)
+                        | ("system_time", 0)
+                        | ("system_time", 1)
+                        | ("convert_time_unit", 3)
+                        | ("register", 2)
+                        | ("whereis", 1)
+                        | ("unregister", 1)
+                        | ("process_info", 2)
                         | ("element", 2)
                         | ("setelement", 3)
                         | ("tuple_size", 1)
@@ -5646,6 +6069,9 @@ fn expr_may_raise(
                         | ("list_to_integer", 2)
                         | ("atom_to_binary", 1)
                         | ("atom_to_binary", 2)
+                        | ("atom_to_list", 1)
+                        | ("list_to_atom", 1)
+                        | ("list_to_existing_atom", 1)
                         | ("binary_to_atom", 1)
                         | ("binary_to_atom", 2)
                         | ("binary_to_existing_atom", 1)
@@ -5758,6 +6184,7 @@ fn expr_may_gc(
                         | ("integer_to_binary", 1)
                         | ("atom_to_binary", 1)
                         | ("atom_to_binary", 2)
+                        | ("atom_to_list", 1)
                         | ("apply", 2)
                         | ("apply", 3)
                         | ("raise", 3)
@@ -6100,6 +6527,10 @@ fn pattern_vars(p: &Pattern, out: &mut Vec<String>) {
 enum Edge {
     Local(FunName),
     Remote(String, FunName),
+    /// literal M:F named in a spawn/apply argument position where the
+    /// argument-list length is not statically known — every defined arity
+    /// of the target is reachable
+    RemoteAnyArity(String, String),
 }
 
 fn reachable_funs(
@@ -6107,7 +6538,7 @@ fn reachable_funs(
     entry_mod: &str,
     entry: &FunName,
     poisoned: &HashMap<String, String>,
-) -> CgResult<HashSet<(String, FunName)>> {
+) -> CgResult<(HashSet<(String, FunName)>, HashSet<String>)> {
     let defs: HashMap<(&str, &FunName), &Fun> = mods
         .iter()
         .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
@@ -6181,15 +6612,27 @@ fn reachable_funs(
         let mut atoms = BTreeSet::new();
         collect_atoms(&fun.body, &mut atoms);
         for a in atoms {
-            if a.starts_with("Elixir.") {
-                if module_names.contains(a.as_str()) {
-                    mentioned.insert(a.clone());
-                    module_atoms.entry(module.clone()).or_default().insert(a);
-                } else {
-                    // possibly a dispatch target whose beam was never pulled
-                    // (consolidated protocol impls); the driver decides
-                    // whether a beam exists for it
-                    missing_dyn.insert(a);
+            if module_names.contains(a.as_str()) {
+                mentioned.insert(a.clone());
+                module_atoms.entry(module.clone()).or_default().insert(a);
+            } else if a.starts_with("Elixir.") {
+                // possibly a dispatch target whose beam was never pulled
+                // (consolidated protocol impls); the driver decides
+                // whether a beam exists for it
+                missing_dyn.insert(a);
+            }
+        }
+        // (ModuleAtom, FunAtom) appearing as consecutive literal call args
+        // is MFA-shaped data flow (proc_lib:start_link(gen, init_it, ...)):
+        // seed every defined arity of the named function
+        let mut arg_pairs = Vec::new();
+        collect_atom_arg_pairs(&fun.body, &mut arg_pairs);
+        for (pm, pf) in arg_pairs {
+            if let Some(target) = mods.iter().find(|x| x.name == pm) {
+                for (df, _) in &target.definitions {
+                    if df.name == pf && seeded.insert((pm.clone(), df.clone())) {
+                        work.push((pm.clone(), df.clone()));
+                    }
                 }
             }
         }
@@ -6206,7 +6649,10 @@ fn reachable_funs(
             }
         }
         for a in &mentioned {
-            let full = mentioned_dyn.contains(a);
+            // full seeding stays Elixir-only (Erlang infra mentions each
+            // other constantly — full-seeding gen/global pulls all of OTP);
+            // pair seeding (dynamically-named functions) applies everywhere
+            let full = mentioned_dyn.contains(a) && a.starts_with("Elixir.");
             let m = mods.iter().find(|m| &m.name == a).unwrap();
             for ex in &m.exports {
                 if ex.name == "module_info" || ex.name == "__info__" {
@@ -6230,6 +6676,23 @@ fn reachable_funs(
                 Edge::Local(f) => (module.clone(), f),
                 Edge::Remote(m, _) if is_bif_module(&m) => continue, // BIF
                 Edge::Remote(m, f) => (m, f),
+                Edge::RemoteAnyArity(m, _) if is_bif_module(&m) => continue,
+                Edge::RemoteAnyArity(m, fa) => {
+                    if have_module.contains(m.as_str()) {
+                        if let Some(target) = mods.iter().find(|x| x.name == m) {
+                            for (df, _) in &target.definitions {
+                                if df.name == fa {
+                                    work.push((m.clone(), df.clone()));
+                                }
+                            }
+                        }
+                    } else {
+                        // an uncompiled module named in a dynamic MFA — the
+                        // driver may be able to pull its beam
+                        missing_dyn.insert(m);
+                    }
+                    continue;
+                }
             };
             if defs.contains_key(&(tmod.as_str(), &tfun)) {
                 work.push((tmod, tfun));
@@ -6252,23 +6715,19 @@ fn reachable_funs(
             }
         }
     }
-    if !missing_modules.is_empty() {
-        for (m, (rm, rf)) in &missing_modules {
-            eprintln!(
-                "manac: module '{}' (required by {}:{}/{}) is not among the compiled modules",
-                m, rm, rf.name, rf.arity
-            );
-        }
-        let (m, (rm, rf)) = missing_modules.iter().next().unwrap();
-        return Err(format!(
-            "module '{}' (required by {}:{}/{}) is not among the compiled \
-             modules — the Erlang/Elixir standard library is not yet supported",
+    // missing modules are non-fatal: the driver pulls the ones it can
+    // locate and rebuilds; callers of the rest get stubbed (loud at
+    // runtime only if actually reached)
+    for (m, (rm, rf)) in &missing_modules {
+        eprintln!(
+            "manac: module '{}' (required by {}:{}/{}) is not among the compiled modules",
             m, rm, rf.name, rf.arity
-        ));
+        );
     }
     for m in &missing_dyn {
         eprintln!("manac: note: dynamic module candidate '{}' is not compiled", m);
     }
+    let missing_set: HashSet<String> = missing_modules.keys().cloned().collect();
     if std::env::var("MANA_DEBUG_SEED").is_ok() {
         eprintln!(
             "manac: seed debug: mentioned={} pairs={} seeded={} to_string1={} chars_int_seeded={}",
@@ -6281,7 +6740,83 @@ fn reachable_funs(
                 .any(|(m, _)| m == "Elixir.String.Chars.Integer"),
         );
     }
-    Ok(seen)
+    Ok((seen, missing_set))
+}
+
+/// Consecutive literal-atom argument pairs in call argument lists —
+/// MFA-shaped data flow feeding behaviour spawn machinery.
+fn collect_atom_arg_pairs(e: &Expr, out: &mut Vec<(String, String)>) {
+    fn scan_args(args: &[Expr], out: &mut Vec<(String, String)>) {
+        for w in args.windows(2) {
+            if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) =
+                (&w[0], &w[1])
+            {
+                out.push((m.clone(), fa.clone()));
+            }
+        }
+    }
+    match e {
+        Expr::Lit(_) | Expr::Var(_) | Expr::FunRef { .. } => {}
+        Expr::Tuple(items) | Expr::Values(items) => {
+            items.iter().for_each(|i| collect_atom_arg_pairs(i, out))
+        }
+        Expr::Cons(h, t) => {
+            collect_atom_arg_pairs(h, out);
+            collect_atom_arg_pairs(t, out);
+        }
+        Expr::Fun(f) => collect_atom_arg_pairs(&f.body, out),
+        Expr::Let { arg, body, .. } => {
+            collect_atom_arg_pairs(arg, out);
+            collect_atom_arg_pairs(body, out);
+        }
+        Expr::LetRec { defs, body } => {
+            defs.iter()
+                .for_each(|(_, f)| collect_atom_arg_pairs(&f.body, out));
+            collect_atom_arg_pairs(body, out);
+        }
+        Expr::Apply { args, .. } | Expr::PrimOp { args, .. } => {
+            scan_args(args, out);
+            args.iter().for_each(|a| collect_atom_arg_pairs(a, out));
+        }
+        Expr::Call { args, .. } => {
+            scan_args(args, out);
+            args.iter().for_each(|a| collect_atom_arg_pairs(a, out));
+        }
+        Expr::CallDyn { module, name, args } => {
+            scan_args(args, out);
+            collect_atom_arg_pairs(module, out);
+            collect_atom_arg_pairs(name, out);
+            args.iter().for_each(|a| collect_atom_arg_pairs(a, out));
+        }
+        Expr::Case { arg, clauses } => {
+            collect_atom_arg_pairs(arg, out);
+            for c in clauses {
+                collect_atom_arg_pairs(&c.guard, out);
+                collect_atom_arg_pairs(&c.body, out);
+            }
+        }
+        Expr::Try { arg, body, handler, .. } => {
+            collect_atom_arg_pairs(arg, out);
+            collect_atom_arg_pairs(body, out);
+            collect_atom_arg_pairs(handler, out);
+        }
+        Expr::Do(a, b) => {
+            collect_atom_arg_pairs(a, out);
+            collect_atom_arg_pairs(b, out);
+        }
+        Expr::Binary(segs) => segs
+            .iter()
+            .for_each(|s| collect_atom_arg_pairs(&s.value, out)),
+        Expr::Map { pairs, update } => {
+            for (k, _, v) in pairs {
+                collect_atom_arg_pairs(k, out);
+                collect_atom_arg_pairs(v, out);
+            }
+            if let Some(u) = update {
+                collect_atom_arg_pairs(u, out);
+            }
+        }
+    }
 }
 
 /// Literal function names in dynamic-call name positions (with arity), and
@@ -6301,6 +6836,17 @@ fn collect_dyn_names(e: &Expr, pairs: &mut HashSet<(String, usize)>, dyn_any: &m
             // a surviving erlang:apply/3 call has fully dynamic M and F
             if module == "erlang" && name == "apply" && args.len() == 3 {
                 *dyn_any = true;
+            }
+            // make_fun(Mod, F, A) with literal F/A: a callback-cache shape
+            // (gen_server) — the named function is dynamically dispatched
+            if module == "erlang" && name == "make_fun" && args.len() == 3 {
+                if let (Expr::Lit(Literal::Atom(fa)), Expr::Lit(Literal::Int(n))) =
+                    (&args[1], &args[2])
+                {
+                    if *n >= 0 {
+                        pairs.insert((fa.clone(), *n as usize));
+                    }
+                }
             }
             args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any));
         }
@@ -6439,6 +6985,16 @@ fn collect_atoms(e: &Expr, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Length of a statically-spelled proper list (cons spine ending in nil),
+/// if determinable.
+fn static_list_len(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Lit(Literal::Nil) => Some(0),
+        Expr::Cons(_, t) => static_list_len(t).map(|n| n + 1),
+        _ => None,
+    }
+}
+
 fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut HashSet<FunName>) {
     match e {
         Expr::Var(_) | Expr::Lit(_) => {}
@@ -6492,6 +7048,29 @@ fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut HashSet<FunNa
                     arity: args.len(),
                 },
             ));
+            // literal-MFA spawns/applies are dynamic dispatch reachability
+            // can see: spawn(M, F, Args) / spawn_opt / apply — behaviour
+            // machinery (proc_lib → gen:init_it) lives on this path
+            let mfa_args = match (module.as_str(), name.as_str(), args.len()) {
+                ("erlang", "spawn", 3)
+                | ("erlang", "spawn_link", 3)
+                | ("erlang", "spawn_monitor", 3)
+                | ("erlang", "spawn_opt", 4)
+                | ("erlang", "apply", 3) => Some((&args[0], &args[1], &args[2])),
+                _ => None,
+            };
+            if let Some((m, fa, alist)) = mfa_args {
+                if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) = (m, fa)
+                {
+                    match static_list_len(alist) {
+                        Some(n) => out.push(Edge::Remote(
+                            m.clone(),
+                            FunName { name: fa.clone(), arity: n },
+                        )),
+                        None => out.push(Edge::RemoteAnyArity(m.clone(), fa.clone())),
+                    }
+                }
+            }
             args.iter()
                 .for_each(|a| collect_edges(a, out, letrec_bound));
         }
