@@ -18,8 +18,8 @@ end
 
 defmodule Bench.Ecto do
   @moduledoc """
-  The changeset pipeline — the Go predecessor measured BEAM ~1.46µs/iter
-  here and never beat it. The scoreboard question: do we?
+  The changeset pipeline — the milestone scoreboard entry: warm BEAM runs
+  this at ~1.7µs/iter. The target is beating it.
   """
   alias Bench.Ecto.User
 

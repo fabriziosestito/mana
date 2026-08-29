@@ -23,4 +23,4 @@ First recorded run (2026-08-29, 16-core linux, release runtime vs warm BEAM):
 | changeset invalid | 8.7 µs | 1.7 µs |
 
 The changeset gap (~5x) is the optimization target for the next perf
-milestone — the predecessor Go project started at the same ratio.
+milestone.
