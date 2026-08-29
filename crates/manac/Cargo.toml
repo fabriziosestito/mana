@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 mana-syntax = { path = "../mana-syntax" }
 mana-codegen = { path = "../mana-codegen" }
+blake3 = "1.8.7"
+dirs = "6.0.0"

@@ -199,14 +199,19 @@ defmodule Mix.Tasks.Mana.Compile do
     end
   end
 
-  # $XDG_CACHE_HOME/mana/cores/<elixir>-otp<otp>: core dumps are pure
+  # <user cache>/mana/cores/<elixir>-otp<otp>: core dumps are pure
   # functions of the beam, so one cache per toolchain serves every project.
+  # :filename.basedir follows each OS's convention (XDG on Linux,
+  # ~/Library/Caches on macOS, Local AppData on Windows); MANA_CACHE_DIR
+  # overrides, and manac's object cache honors the same variable.
   defp shared_cache_dir do
     base =
-      System.get_env("XDG_CACHE_HOME") ||
-        Path.join(System.user_home!(), ".cache")
+      case System.get_env("MANA_CACHE_DIR") do
+        nil -> List.to_string(:filename.basedir(:user_cache, ~c"mana"))
+        dir -> dir
+      end
 
-    Path.join([base, "mana", "cores", "#{System.version()}-otp#{System.otp_release()}"])
+    Path.join([base, "cores", "#{System.version()}-otp#{System.otp_release()}"])
   end
 
   defp resolve_entry!(nil) do

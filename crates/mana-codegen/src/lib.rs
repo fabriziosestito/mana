@@ -121,6 +121,102 @@ struct Lift {
 /// (closed world). A C `main` (init ctx, call entry) lands in the entry
 /// module's object. `poisoned` maps unparseable module names to their
 /// errors, surfaced if reachability needs them.
+/// The content-addressed object cache (Go's build-cache model). An entry
+/// is keyed by the "action": everything that feeds a module's object —
+/// the compiler binary itself, the target/config, the module's core text,
+/// its include set, the effect verdicts of its remote callees, the missing
+/// modules it references, and whether it emits main. Anything new that
+/// influences codegen MUST be added to the key (Go's cgo caching bug is
+/// the canonical omission).
+pub struct ObjCache {
+    pub root: PathBuf,
+    /// blake3 of the running compiler binary (dev-branch tool identity)
+    pub tool_hash: [u8; 32],
+    pub debug: bool,
+}
+
+impl ObjCache {
+    fn path_for(&self, key: &blake3::Hash) -> PathBuf {
+        let hex = key.to_hex();
+        self.root
+            .join("obj")
+            .join(&hex.as_str()[..2])
+            .join(format!("{}.o", hex))
+    }
+
+    /// Cache lookup; refreshes the entry's mtime (age-based trim keeps
+    /// recently-used entries) at most ~hourly.
+    fn get(&self, key: &blake3::Hash) -> Option<PathBuf> {
+        let p = self.path_for(key);
+        let meta = std::fs::metadata(&p).ok()?;
+        if let Ok(age) = meta.modified().and_then(|m| {
+            m.elapsed()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        }) {
+            if age.as_secs() > 3600 {
+                let _ = filetime_touch(&p);
+            }
+        }
+        Some(p)
+    }
+
+    /// Idempotent publish: write-to-temp + atomic rename. Concurrent manac
+    /// processes may duplicate effort but cannot corrupt entries. (File
+    /// locking is notoriously unreliable on network filesystems — this
+    /// scheme needs none.)
+    fn put(&self, key: &blake3::Hash, obj: &Path) -> CgResult<PathBuf> {
+        let dst = self.path_for(key);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("cache dir: {}", e))?;
+        }
+        let tmp = dst.with_extension(format!("o.tmp-{}", std::process::id()));
+        std::fs::copy(obj, &tmp).map_err(|e| format!("cache write: {}", e))?;
+        std::fs::rename(&tmp, &dst).map_err(|e| format!("cache publish: {}", e))?;
+        Ok(dst)
+    }
+
+    /// Age-based trim, Go-style: at most once per 24h, drop entries not
+    /// used (mtime) for 30 days. Best-effort — errors are ignored.
+    pub fn trim(&self) {
+        let stamp = self.root.join("obj").join("trim.stamp");
+        if let Ok(meta) = std::fs::metadata(&stamp) {
+            if let Ok(age) = meta.modified().and_then(|m| {
+                m.elapsed()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            }) {
+                if age.as_secs() < 24 * 3600 {
+                    return;
+                }
+            }
+        }
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+        if let Ok(buckets) = std::fs::read_dir(self.root.join("obj")) {
+            for bucket in buckets.flatten() {
+                if !bucket.path().is_dir() {
+                    continue;
+                }
+                if let Ok(entries) = std::fs::read_dir(bucket.path()) {
+                    for e in entries.flatten() {
+                        if let Ok(meta) = e.metadata() {
+                            if meta.modified().map(|m| m < cutoff).unwrap_or(false) {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::write(&stamp, b"");
+    }
+}
+
+fn filetime_touch(p: &Path) -> std::io::Result<()> {
+    // portable mtime refresh: open for append and set_len to current size
+    let f = std::fs::OpenOptions::new().append(true).open(p)?;
+    let len = f.metadata()?.len();
+    f.set_len(len)
+}
+
 pub fn compile_program(
     mods: &[Module],
     entry_mod: &str,
@@ -128,6 +224,7 @@ pub fn compile_program(
     out_dir: &Path,
     dump_ir: bool,
     poisoned: &HashMap<String, String>,
+    cache: Option<&ObjCache>,
 ) -> CgResult<Vec<PathBuf>> {
     if entry.arity != 0 {
         return Err(format!(
@@ -159,6 +256,8 @@ pub fn compile_program(
         .stack_size(256 * 1024 * 1024)
         .build()
         .map_err(|e| format!("thread pool: {}", e))?;
+    let hits = std::sync::atomic::AtomicUsize::new(0);
+    let misses = std::sync::atomic::AtomicUsize::new(0);
     let objs: Vec<PathBuf> = pool.install(|| mods
         .par_iter()
         .map(|m| -> CgResult<Option<PathBuf>> {
@@ -170,10 +269,19 @@ pub fn compile_program(
             if include.is_empty() {
                 return Ok(None);
             }
+            let entry_here = (m.name == entry_mod).then_some(entry);
+            let key = cache.map(|c| {
+                action_key(c, m, &include, entry_here, &gc_set, &raise_set, &missing_mods)
+            });
+            if let (Some(c), Some(key)) = (cache, key.as_ref()) {
+                if let Some(cached) = c.get(key) {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Some(cached));
+                }
+            }
             let context = Context::create();
             let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
             *cg.missing_modules.borrow_mut() = missing_mods.clone();
-            let entry_here = (m.name == entry_mod).then_some(entry);
             cg.compile(m, &include, entry_here)?;
             if dump_ir {
                 eprintln!("{}", cg.module.print_to_string().to_string());
@@ -183,13 +291,129 @@ pub fn compile_program(
                 .map_err(|e| format!("LLVM verifier ({}): {}", m.name, e))?;
             let obj = out_dir.join(format!("{}.o", sanitize(&m.name)));
             cg.emit_object(&obj)?;
+            misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cache.map(|c| c.debug).unwrap_or(false) {
+                eprintln!("manac: cache miss: {}", m.name);
+            }
+            if let (Some(c), Some(key)) = (cache, key.as_ref()) {
+                return Ok(Some(c.put(key, &obj)?));
+            }
             Ok(Some(obj))
         })
         .collect::<CgResult<Vec<_>>>())?
         .into_iter()
         .flatten()
         .collect();
+    if let Some(c) = cache {
+        if c.debug {
+            eprintln!(
+                "manac: cache: {} hits, {} misses",
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                misses.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+        c.trim();
+    }
     Ok(objs)
+}
+
+/// The action key for one module's object: a blake3 hash over every input
+/// that can influence the emitted code. Deterministic encoding — all sets
+/// are sorted before hashing.
+fn action_key(
+    cache: &ObjCache,
+    m: &Module,
+    include: &HashSet<FunName>,
+    entry_here: Option<&FunName>,
+    gc_set: &GcSet,
+    raise_set: &GcSet,
+    missing: &HashSet<String>,
+) -> blake3::Hash {
+    let debug_key = std::env::var("MANA_DEBUG_KEY").ok().filter(|d| d == &m.name);
+    let mut h = blake3::Hasher::new();
+    h.update(b"mana-action-v1\0");
+    h.update(&cache.tool_hash);
+    // target + codegen config (constants today; keyed for the day they move)
+    h.update(TargetMachine::get_default_triple().as_str().to_bytes());
+    h.update(b"O2/PIC\0");
+    // the AST's Debug form is deterministic (Vec-based, no hash containers)
+    h.update(format!("{:?}", m).as_bytes());
+    h.update(b"\0include\0");
+    let mut inc: Vec<String> = include
+        .iter()
+        .map(|f| format!("{}/{}", f.name, f.arity))
+        .collect();
+    inc.sort();
+    for f in &inc {
+        h.update(f.as_bytes());
+        h.update(b"\0");
+    }
+    match entry_here {
+        Some(e) => {
+            h.update(b"entry\0");
+            h.update(e.name.as_bytes());
+            h.update(b"\0");
+        }
+        None => {
+            h.update(b"noentry\0");
+        }
+    }
+    // cross-unit deps: the (module, fun, arity, gc, raise) verdict of every
+    // remote callee, plus referenced-but-missing modules (callers of those
+    // compile as stubs)
+    let mut dep_lines: Vec<String> = Vec::new();
+    for fname in include {
+        if let Some((_, fun)) = m.definitions.iter().find(|(f, _)| f == fname) {
+            let mut edges = Vec::new();
+            let mut lb = HashSet::new();
+            collect_edges(&fun.body, &mut edges, &mut lb);
+            for e in edges {
+                if let Edge::Remote(tm, tf) = e {
+                    if is_bif_module(&tm) {
+                        continue;
+                    }
+                    let key = (tm.clone(), tf.clone());
+                    let gc = gc_set.contains(&key);
+                    let rs = raise_set.contains(&key);
+                    dep_lines.push(format!(
+                        "{}:{}/{} {} {}",
+                        tm, tf.name, tf.arity, gc as u8, rs as u8
+                    ));
+                }
+            }
+        }
+    }
+    dep_lines.sort();
+    dep_lines.dedup();
+    h.update(b"deps\0");
+    for d in &dep_lines {
+        h.update(d.as_bytes());
+        h.update(b"\0");
+    }
+    let mut missing_hit: Vec<&String> = missing
+        .iter()
+        .filter(|mm| dep_lines.iter().any(|d| d.starts_with(&format!("{}:", mm))))
+        .collect();
+    missing_hit.sort();
+    h.update(b"missing\0");
+    for mm in &missing_hit {
+        h.update(mm.as_bytes());
+        h.update(b"\0");
+    }
+    if debug_key.is_some() {
+        let mut inc2 = inc.clone();
+        inc2.sort();
+        eprintln!(
+            "manac: key[{}]: include({})={:?} deps({})={:?} missing={:?}",
+            m.name,
+            inc2.len(),
+            inc2,
+            dep_lines.len(),
+            dep_lines,
+            missing_hit
+        );
+    }
+    h.finalize()
 }
 
 struct Cg<'ctx, 'p> {

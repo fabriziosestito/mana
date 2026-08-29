@@ -138,6 +138,22 @@ When asked to open a PR:
 
 ## Gotchas
 
+- **The build cache must key EVERY codegen input.** manac keeps a
+  content-addressed object cache (Go's build-cache model) under the OS user
+  cache dir (`~/.cache/mana`, `~/Library/Caches/mana`, `%LOCALAPPDATA%\mana`;
+  `MANA_CACHE_DIR` overrides, `MANA_NO_CACHE=1` disables, `MANA_DEBUG_CACHE=1`
+  prints hits/misses, `MANA_DEBUG_KEY=<module>` dumps one module's key
+  inputs). A module's key hashes: the manac binary itself (rebuilding the
+  compiler invalidates everything), target+config, the module's AST, its
+  include set, the (gc, raise) verdict of every remote callee, referenced
+  missing modules, and the entry flag. If you add ANY new input that
+  influences emitted code (a flag, an environment toggle, a new analysis),
+  it MUST go into `action_key` — an omission means stale objects that
+  "cannot happen" (Go's cgo caching bug is the canonical example). Entries
+  trim by age (30 days unused, checked at most daily); publishes are atomic
+  renames, safe for concurrent compiles. The mix task keeps a parallel
+  cross-project CORE cache (`<user cache>/mana/cores/<elixir>-otp<otp>/`,
+  via `:filename.basedir`) — dumped stdlib Core Erlang keyed by beam mtime.
 - **Never delete half-built LLVM basic blocks.** Erasing a block that
   another block still branches to leaves dangling references (LLVM's erase
   does not fix up uses) and manifests as glibc heap corruption in manac

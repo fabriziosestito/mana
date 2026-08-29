@@ -98,14 +98,48 @@ fn run() -> Result<(), String> {
 
     let out = output.unwrap_or_else(|| PathBuf::from(&entry_mod));
     let obj_dir = std::env::temp_dir().join(format!("manac-{}", std::process::id()));
-    let objs =
-        mana_codegen::compile_program(&modules, &entry_mod, &entry, &obj_dir, emit_ir, &poisoned)?;
+    let cache = obj_cache(emit_ir)?;
+    let objs = mana_codegen::compile_program(
+        &modules,
+        &entry_mod,
+        &entry,
+        &obj_dir,
+        emit_ir,
+        &poisoned,
+        cache.as_ref(),
+    )?;
 
     let link_result = link(&objs, &out);
     let _ = std::fs::remove_dir_all(&obj_dir);
     link_result?;
     println!("{}", out.display());
     Ok(())
+}
+
+/// The content-addressed object cache under the OS user-cache dir
+/// (~/.cache/mana, ~/Library/Caches/mana, %LOCALAPPDATA%\mana), overridden
+/// by MANA_CACHE_DIR, disabled by MANA_NO_CACHE or --emit-ir. The tool
+/// identity is the manac binary's own content hash (dev-branch rule, like
+/// Go): rebuilding the compiler invalidates everything, correctly.
+fn obj_cache(emit_ir: bool) -> Result<Option<mana_codegen::ObjCache>, String> {
+    if emit_ir || std::env::var_os("MANA_NO_CACHE").is_some() {
+        return Ok(None);
+    }
+    let root = match std::env::var_os("MANA_CACHE_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => match dirs::cache_dir() {
+            Some(d) => d.join("mana"),
+            None => return Ok(None), // no home dir — run uncached
+        },
+    };
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+    let bytes = std::fs::read(&exe).map_err(|e| format!("reading {}: {}", exe.display(), e))?;
+    let tool_hash = *blake3::hash(&bytes).as_bytes();
+    Ok(Some(mana_codegen::ObjCache {
+        root,
+        tool_hash,
+        debug: std::env::var_os("MANA_DEBUG_CACHE").is_some(),
+    }))
 }
 
 /// `[MODULE:]FUN/ARITY`; module defaults to the first input file's module.
