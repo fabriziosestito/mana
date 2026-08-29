@@ -2669,6 +2669,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .build_int_signed_rem(ua, ub, "rem")
                     .map_err(be)?
             }
+            ("band", Some(b)) => {
+                let ub = self.untag_int(b)?;
+                self.builder.build_and(ua, ub, "band").map_err(be)?
+            }
+            ("bor", Some(b)) => {
+                let ub = self.untag_int(b)?;
+                self.builder.build_or(ua, ub, "bor").map_err(be)?
+            }
+            ("bxor", Some(b)) => {
+                let ub = self.untag_int(b)?;
+                self.builder.build_xor(ua, ub, "bxor").map_err(be)?
+            }
+            ("bnot", None) => self
+                .builder
+                .build_xor(ua, self.i64t.const_all_ones(), "bnot")
+                .map_err(be)?,
             ("neg", None) => self
                 .builder
                 .build_int_sub(self.i64t.const_zero(), ua, "neg")
@@ -3428,18 +3444,28 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let rest = specs
             .iter()
             .any(|s| matches!(s.kind, SegKind::Bin { size: SegSize::All }));
-        let const_total: u64 = specs
+        let const_total_bits: u64 = specs
             .iter()
             .map(|s| match s.kind {
                 SegKind::Int { size: SegSize::Bytes(n) }
-                | SegKind::Bin { size: SegSize::Bytes(n) } => n,
+                | SegKind::Bin { size: SegSize::Bytes(n) } => 8 * n,
+                SegKind::Int { size: SegSize::Bits(b) } => b,
                 _ => 0,
             })
             .sum();
+        let at_least = rest || !all_const;
+        if !at_least && const_total_bits % 8 != 0 {
+            // our binaries are byte-aligned: an exact sub-byte-total
+            // pattern can never match
+            self.builder.build_unconditional_branch(fail).map_err(be)?;
+            let dead = self.ctx.append_basic_block(f, "bm.dead");
+            self.builder.position_at_end(dead);
+            return Ok(());
+        }
+        let const_total: u64 = const_total_bits.div_ceil(8);
         // preflight: is-binary + (for all-const patterns) the length check;
         // dynamic patterns re-check bounds per segment. Inline: tag test,
         // kind byte, length compare — no runtime call.
-        let at_least = rest || !all_const;
         let ok = self.kind_test(f, val, |s, header| {
             let k = s
                 .builder
@@ -3475,15 +3501,100 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let mut off: IntValue<'ctx> = self.i64t.const_zero();
         // true while every previous segment had a static byte width: the
         // preflight (len >= const_total) then already bounds-checks this
-        // segment, so const/byte reads can inline without a runtime call
+        // segment, so const/byte reads can inline without a runtime call.
+        // static_bits tracks the exact bit offset while prefix_static.
         let mut prefix_static = true;
+        let mut static_bits: u64 = 0;
         for (spec, seg) in specs.iter().zip(segs) {
+            if prefix_static
+                && static_bits % 8 != 0
+                && !matches!(spec.kind, SegKind::Int { size: SegSize::Bits(_) })
+            {
+                return Err(
+                    "TODO(bitstring): byte segment at a sub-byte offset".into()
+                );
+            }
             let subject = match slot {
                 Some(s) => self.reload(s)?,
                 None => val,
             };
             match &spec.kind {
                 SegKind::Int { size } => {
+                    if let SegSize::Bits(s) = size {
+                        // sub-byte unsigned big-endian read at a constant
+                        // bit offset (nibble destructuring in
+                        // Code.Identifier.escape and friends)
+                        if !prefix_static {
+                            return Err(
+                                "TODO(bitstring): sub-byte segment after dynamic prefix"
+                                    .into(),
+                            );
+                        }
+                        let s = *s;
+                        let first = static_bits / 8;
+                        let last = (static_bits + s - 1) / 8;
+                        let bp = self
+                            .builder
+                            .build_int_to_ptr(subject, self.ptrt, "bb.p")
+                            .map_err(be)?;
+                        let mut acc = self.i64t.const_zero();
+                        for byte_i in first..=last {
+                            let gep = unsafe {
+                                self.builder
+                                    .build_in_bounds_gep(
+                                        self.ctx.i8_type(),
+                                        bp,
+                                        &[self.i64t.const_int(8 + byte_i, false)],
+                                        "bb.g",
+                                    )
+                                    .map_err(be)?
+                            };
+                            let b = self
+                                .builder
+                                .build_load(self.ctx.i8_type(), gep, "bb.b")
+                                .map_err(be)?
+                                .into_int_value();
+                            let w = self
+                                .builder
+                                .build_int_z_extend(b, self.i64t, "bb.w")
+                                .map_err(be)?;
+                            let shifted = self
+                                .builder
+                                .build_left_shift(
+                                    acc,
+                                    self.i64t.const_int(8, false),
+                                    "bb.sh",
+                                )
+                                .map_err(be)?;
+                            acc = self.builder.build_or(shifted, w, "bb.acc").map_err(be)?;
+                        }
+                        let span_bits = (last - first + 1) * 8;
+                        let shift = span_bits - (static_bits - first * 8) - s;
+                        let down = self
+                            .builder
+                            .build_right_shift(
+                                acc,
+                                self.i64t.const_int(shift, false),
+                                false,
+                                "bb.dn",
+                            )
+                            .map_err(be)?;
+                        let masked = self
+                            .builder
+                            .build_and(
+                                down,
+                                self.i64t.const_int((1u64 << s) - 1, false),
+                                "bb.msk",
+                            )
+                            .map_err(be)?;
+                        let v = self.retag_int(masked)?;
+                        self.match_pattern(f, v, &seg.value, scope, fail)?;
+                        static_bits += s;
+                        if static_bits % 8 == 0 {
+                            off = self.i64t.const_int(static_bits / 8, false);
+                        }
+                        continue;
+                    }
                     let nbytes = self.seg_bytes(f, size, scope, Some(fail))?;
                     // constant integer sub-patterns with constant sizes
                     // compare as bytes (covers erlc's wide folded literals)
@@ -3546,6 +3657,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                         "boff",
                                     )
                                     .map_err(be)?;
+                                static_bits += 8 * bytes.len() as u64;
                                 continue;
                             }
                             let ptr = self.static_bytes(&bytes)?;
@@ -3591,6 +3703,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                     "boff",
                                 )
                                 .map_err(be)?;
+                            static_bits += 8 * bytes.len() as u64;
                             continue;
                         }
                     }
@@ -3629,6 +3742,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             .builder
                             .build_int_add(off, self.i64t.const_int(1, false), "boff")
                             .map_err(be)?;
+                        static_bits += 8;
                         continue;
                     }
                     let flags = (spec.little as u64) | ((spec.signed as u64) << 1);
@@ -3738,12 +3852,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     off = self.builder.build_int_add(off, width, "boff").map_err(be)?;
                 }
             }
-            prefix_static = prefix_static
-                && matches!(
-                    &spec.kind,
-                    SegKind::Int { size: SegSize::Bytes(_) }
-                        | SegKind::Bin { size: SegSize::Bytes(_) }
-                );
+            match &spec.kind {
+                SegKind::Int { size: SegSize::Bytes(n) }
+                | SegKind::Bin { size: SegSize::Bytes(n) } => static_bits += 8 * n,
+                _ => prefix_static = false,
+            }
         }
         // no rest segment: the pattern must consume the binary exactly
         if !rest && !all_const {
@@ -3790,6 +3903,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     ) -> CgResult<IntValue<'ctx>> {
         match size {
             SegSize::Bytes(n) => Ok(self.i64t.const_int(*n, false)),
+            SegSize::Bits(_) => Err("internal: seg_bytes on sub-byte segment".into()),
             SegSize::All => Err("internal: seg_bytes on rest segment".into()),
             SegSize::Dyn { size, unit } => {
                 let v = self.compile_value(f, size, scope)?;
@@ -4323,6 +4437,48 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             argv[1].into(),
                         ],
                         "fdiv",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("get_module_info", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_get_module_info"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "gmi",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("get_module_info", 1) => Ok(self.nil()),
+            ("band", 2) | ("bor", 2) | ("bxor", 2) => {
+                let opcode = match name {
+                    "band" => 8u64, // AR_BAND
+                    "bor" => 9,     // AR_BOR
+                    _ => 10,        // AR_BXOR
+                };
+                self.arith_fastslow(f, name, opcode, argv[0], Some(argv[1]))
+            }
+            ("bnot", 1) => self.arith_fastslow(f, "bnot", 13, argv[0], None),
+            ("bsl", 2) | ("bsr", 2) => {
+                // no inline fast path: shift semantics (negative amounts,
+                // 61-bit overflow abort) live in the runtime
+                let opcode = if name == "bsl" { 11u64 } else { 12 }; // AR_BSL/AR_BSR
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_arith(),
+                        &[
+                            self.ctx_val().into(),
+                            self.i64t.const_int(opcode, false).into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                        ],
+                        "bshift",
                     )
                     .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
@@ -5582,6 +5738,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 SegKind::Int { size: SegSize::Bytes(n) } => {
                     seg_const_bytes(seg.value.as_ref(), *n, spec.little)?
                 }
+                SegKind::Int { size: SegSize::Bits(_) } => {
+                    return Err(
+                        "TODO(bitstring): sub-byte segments in construction".into()
+                    )
+                }
                 SegKind::Int { size: SegSize::Dyn { .. } } => None,
                 SegKind::Int { size: SegSize::All } => {
                     return Err("bitstring: integer segment with size 'all'".into())
@@ -5796,6 +5957,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             dyn_sizes[i].unwrap(),
                             self.i64t.const_int(u64::MAX, false), // -1: whole
                         ),
+                        SegSize::Bits(_) => {
+                            return Err(
+                                "TODO(bitstring): sub-byte binary segment".into()
+                            )
+                        }
                         SegSize::Bytes(n) => {
                             let c = self.i64t.const_int(*n, false);
                             (c, c)
@@ -6395,6 +6561,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let helper = match (name, argv.len()) {
             ("characters_to_binary", 1..=3) => "mana_rt_unicode_to_binary",
             ("characters_to_list", 1 | 2) => "mana_rt_unicode_to_list",
+            ("characters_to_nfc_list", 1) => "mana_rt_unicode_to_nfc_list",
             _ => return Err(format!("unsupported BIF unicode:{}/{}", name, argv.len())),
         };
         let call = self
@@ -7242,6 +7409,9 @@ enum SegKind {
 /// (`expr * unit` bits; the byte-alignment check happens at runtime).
 enum SegSize {
     Bytes(u64),
+    /// constant bit count that is NOT a byte multiple (nibble reads in
+    /// Code.Identifier.escape etc.) — patterns only, static prefix only
+    Bits(u64),
     All,
     Dyn { size: Expr, unit: i64 },
 }
@@ -7321,9 +7491,14 @@ fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {
     };
     let kind = match (ty, &spec[0]) {
         ("utf8", _) => SegKind::Utf8,
-        ("integer", Expr::Lit(Literal::Int(sz))) => SegKind::Int {
-            size: SegSize::Bytes(const_bytes_of(*sz)?),
-        },
+        ("integer", Expr::Lit(Literal::Int(sz))) => {
+            let bits = sz * unit;
+            if bits >= 0 && bits % 8 != 0 && bits <= 57 && !little && !signed {
+                SegKind::Int { size: SegSize::Bits(bits as u64) }
+            } else {
+                SegKind::Int { size: SegSize::Bytes(const_bytes_of(*sz)?) }
+            }
+        }
         ("binary", Expr::Lit(Literal::Atom(a))) if a == "all" => {
             SegKind::Bin { size: SegSize::All }
         }
@@ -7600,6 +7775,13 @@ fn expr_may_raise(
                         | ("/", 2)
                         | ("div", 2)
                         | ("rem", 2)
+                        | ("band", 2)
+                        | ("bor", 2)
+                        | ("bxor", 2)
+                        | ("bsl", 2)
+                        | ("bsr", 2)
+                        | ("bnot", 1)
+                        | ("get_module_info", 2)
                         | ("+", 1)
                         | ("-", 1)
                         | ("float", 1)
@@ -8199,7 +8381,8 @@ fn reachable_funs(
     // (protocol impl_for tables, dispatch lists, pick-a-module functions)
     // gets its exports seeded as roots; modules that are merely statically
     // required (Kernel etc.) keep full pruning. Reflection exports
-    // (module_info, __info__) stay out — TODO(reflection).
+    // (module_info) stays out — the runtime answers it; __info__ compiles
+    // (get_module_info BIF backs its attributes/compile clauses).
     let module_names: HashSet<&str> = mods.iter().map(|m| m.name.as_str()).collect();
     // Dynamic-dispatch seeding: a module is a candidate target when its
     // name atom appears in reachable code (protocol impl tables, dispatch
@@ -8274,7 +8457,7 @@ fn reachable_funs(
             let full = mentioned_dyn.contains(a) && a.starts_with("Elixir.");
             let m = mods.iter().find(|m| &m.name == a).unwrap();
             for ex in &m.exports {
-                if ex.name == "module_info" || ex.name == "__info__" {
+                if ex.name == "module_info" {
                     continue;
                 }
                 if !(full || dyn_pairs.contains(&(ex.name.clone(), ex.arity))) {

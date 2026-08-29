@@ -1834,6 +1834,11 @@ fn num_of(t: u64) -> Option<(f64, bool)> {
 }
 
 // arithmetic opcodes for mana_rt_arith
+fn abort_bignum(what: &str) -> ! {
+    eprintln!("mana: TODO(bignum): {}", what);
+    std::process::exit(1);
+}
+
 pub const AR_ADD: u64 = 0;
 pub const AR_SUB: u64 = 1;
 pub const AR_MUL: u64 = 2;
@@ -1842,6 +1847,12 @@ pub const AR_IDIV: u64 = 4;
 pub const AR_REM: u64 = 5;
 pub const AR_NEG: u64 = 6;
 pub const AR_ABS: u64 = 7;
+pub const AR_BAND: u64 = 8;
+pub const AR_BOR: u64 = 9;
+pub const AR_BXOR: u64 = 10;
+pub const AR_BSL: u64 = 11;
+pub const AR_BSR: u64 = 12;
+pub const AR_BNOT: u64 = 13;
 
 /// Arithmetic slow path: anything that isn't the inline both-small-int
 /// case. Mixed/float ops produce boxed floats (box_float — never GCs);
@@ -1849,6 +1860,51 @@ pub const AR_ABS: u64 = 7;
 #[no_mangle]
 pub extern "C" fn mana_rt_arith(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
+    // bit ops are integer-only: no float coercion, badarith otherwise
+    if let AR_BAND | AR_BOR | AR_BXOR | AR_BSL | AR_BSR | AR_BNOT = op {
+        if a & TAG_MASK != TAG_SMALL {
+            return raise_badarith(ctx);
+        }
+        let x = a as i64 >> 3;
+        if op == AR_BNOT {
+            return (((!x) << 3) as u64) | TAG_SMALL;
+        }
+        if b & TAG_MASK != TAG_SMALL {
+            return raise_badarith(ctx);
+        }
+        let y = b as i64 >> 3;
+        let r = match op {
+            AR_BAND => x & y,
+            AR_BOR => x | y,
+            AR_BXOR => x ^ y,
+            // Erlang: a negative shift amount reverses direction
+            AR_BSL | AR_BSR => {
+                let n = if op == AR_BSR { -y } else { y };
+                if n <= -64 {
+                    if x < 0 { -1 } else { 0 }
+                } else if n < 0 {
+                    x >> (-n)
+                } else if n >= 64 {
+                    if x != 0 {
+                        abort_bignum("bsl overflow");
+                    }
+                    0
+                } else {
+                    let s = x << n;
+                    if (s >> n) != x {
+                        abort_bignum("bsl overflow");
+                    }
+                    s
+                }
+            }
+            _ => unreachable!(),
+        };
+        // small ints are 61-bit; anything wider needs real bignums
+        if r > (i64::MAX >> 3) || r < (i64::MIN >> 3) {
+            abort_bignum("bit op result exceeds 61 bits");
+        }
+        return ((r << 3) as u64) | TAG_SMALL;
+    }
     let Some((x, xi)) = num_of(a) else {
         return raise_badarith(ctx);
     };
@@ -5257,46 +5313,13 @@ pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -
             }
         }
         // module_info is never compiled; answer the introspection shapes
-        // callers actually use (attributes → [], module → the atom)
+        // callers actually use (attributes → behaviours, module → the atom)
         if atom_bytes(f) == b"module_info" && module_is_compiled(m) {
             if n == 0 {
                 return NIL;
             }
             if n == 1 {
-                return match atom_bytes(argv[0]) {
-                    b"module" => m,
-                    b"attributes" => {
-                        // [{behaviour, [B]}] per declared behaviour
-                        let bs = behaviours_of(m);
-                        let saved = ctx.roots_head;
-                        let mut fr = [0u64, 2, NIL, 0];
-                        fr[0] = saved;
-                        ctx.roots_head = fr.as_ptr() as u64;
-                        for &b in bs.iter().rev() {
-                            let inner = alloc_nursery(ctx, 2);
-                            unsafe {
-                                *inner = b;
-                                *inner.add(1) = NIL;
-                            }
-                            let t = alloc_nursery(ctx, 3);
-                            unsafe {
-                                *t = (2 << 8) | KIND_TUPLE;
-                                *t.add(1) = atom_intern(b"behaviour");
-                                *t.add(2) = inner as u64 | TAG_CONS;
-                            }
-                            fr[3] = t as u64;
-                            let cell = alloc_nursery(ctx, 2);
-                            unsafe {
-                                *cell = fr[3];
-                                *cell.add(1) = fr[2];
-                            }
-                            fr[2] = cell as u64 | TAG_CONS;
-                        }
-                        ctx.roots_head = saved;
-                        fr[2]
-                    }
-                    _ => NIL,
-                };
+                return module_info_item(ctx, m, argv[0]);
             }
         }
         if std::env::var_os("MANA_DEBUG_UNDEF").is_some() {
@@ -5310,6 +5333,87 @@ pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -
         return raise_undef(ctx);
     };
     unsafe { call_dynamic(ctx, code, &argv[..n], 0).unwrap_or_else(|| raise_undef(ctx)) }
+}
+
+/// Introspection items shared by the module_info fallback in apply3 and
+/// erlang:get_module_info/2 (which compiled `__info__/1` clauses call).
+fn module_info_item(ctx: &mut ProcCtx, m: u64, item: u64) -> u64 {
+    match atom_bytes(item) {
+        b"module" => m,
+        b"attributes" => {
+            // [{behaviour, [B]}] per declared behaviour
+            let bs = behaviours_of(m);
+            let saved = ctx.roots_head;
+            let mut fr = [0u64, 2, NIL, 0];
+            fr[0] = saved;
+            ctx.roots_head = fr.as_ptr() as u64;
+            for &b in bs.iter().rev() {
+                let inner = alloc_nursery(ctx, 2);
+                unsafe {
+                    *inner = b;
+                    *inner.add(1) = NIL;
+                }
+                let t = alloc_nursery(ctx, 3);
+                unsafe {
+                    *t = (2 << 8) | KIND_TUPLE;
+                    *t.add(1) = atom_intern(b"behaviour");
+                    *t.add(2) = inner as u64 | TAG_CONS;
+                }
+                fr[3] = t as u64;
+                let cell = alloc_nursery(ctx, 2);
+                unsafe {
+                    *cell = fr[3];
+                    *cell.add(1) = fr[2];
+                }
+                fr[2] = cell as u64 | TAG_CONS;
+            }
+            ctx.roots_head = saved;
+            fr[2]
+        }
+        b"functions" | b"exports" => {
+            // {name, arity} pairs from the export table, name/arity sorted
+            // for determinism (BEAM's order is unspecified)
+            let mut fs: Vec<(u64, u64)> = export_table()
+                .keys()
+                .filter(|(km, _, _)| *km == m)
+                .map(|(_, kf, ka)| (*kf, *ka))
+                .collect();
+            fs.sort_by(|a, b| atom_bytes(a.0).cmp(atom_bytes(b.0)).then(a.1.cmp(&b.1)));
+            let saved = ctx.roots_head;
+            let mut fr = [0u64, 2, NIL, 0];
+            fr[0] = saved;
+            ctx.roots_head = fr.as_ptr() as u64;
+            for &(f, a) in fs.iter().rev() {
+                let t = alloc_nursery(ctx, 3);
+                unsafe {
+                    *t = (2 << 8) | KIND_TUPLE;
+                    *t.add(1) = f;
+                    *t.add(2) = ((a << 3) as u64) | TAG_SMALL;
+                }
+                fr[3] = t as u64;
+                let cell = alloc_nursery(ctx, 2);
+                unsafe {
+                    *cell = fr[3];
+                    *cell.add(1) = fr[2];
+                }
+                fr[2] = cell as u64 | TAG_CONS;
+            }
+            ctx.roots_head = saved;
+            fr[2]
+        }
+        _ => NIL,
+    }
+}
+
+/// erlang:get_module_info/2 — reached by compiled `__info__/1` clauses
+/// (attributes/compile arms); the useful arms answer, the rest are [].
+#[no_mangle]
+pub extern "C" fn mana_rt_get_module_info(ctx: *mut ProcCtx, m: u64, item: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if m & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    module_info_item(ctx, m, item)
 }
 
 /// erlang:apply/2 — call a fun value with a runtime argument list.
@@ -5383,6 +5487,23 @@ fn chardata_flatten(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
         }
         cur = unsafe { *p.add(1) };
     }
+}
+
+/// unicode:characters_to_nfc_list/1 — NFC-normalized code point list
+/// (String.Tokenizer validates identifiers through this).
+#[no_mangle]
+pub extern "C" fn mana_rt_unicode_to_nfc_list(ctx: *mut ProcCtx, t: u64) -> u64 {
+    use unicode_normalization::UnicodeNormalization;
+    let ctx = unsafe { &mut *ctx };
+    let mut bytes = Vec::new();
+    if chardata_flatten(t, &mut bytes).is_err() {
+        return raise_badarg(ctx);
+    }
+    let Ok(s) = std::str::from_utf8(&bytes) else {
+        return raise_badarg(ctx);
+    };
+    let nfc: String = s.nfc().collect();
+    utf8_to_codepoint_list(ctx, nfc.as_bytes())
 }
 
 /// unicode:characters_to_binary/1 (utf8 in, utf8 out).
