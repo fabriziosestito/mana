@@ -6475,6 +6475,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("is_loaded", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_code_is_loaded"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "cil",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             _ => Err(format!("unsupported BIF code:{}/{}", name, argv.len())),
         }
     }

@@ -6678,6 +6678,41 @@ fn module_is_compiled(m: u64) -> bool {
     export_table().keys().any(|&(em, _, _)| em == m)
 }
 
+/// code:is_loaded/1 → {file, "native"} | false (Ecto.Queryable.Atom probes
+/// schema modules through this).
+#[no_mangle]
+pub extern "C" fn mana_rt_code_is_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if m & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    if !module_is_compiled(m) {
+        return known().false_a;
+    }
+    // {file, "native"} — charlist, matching code:is_loaded's shape for
+    // preloaded/static code
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for &b in b"native".iter().rev() {
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = ((b as u64) << 3) | TAG_SMALL;
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+    }
+    let t = alloc_nursery(ctx, 3);
+    unsafe {
+        *t = (2 << 8) | KIND_TUPLE;
+        *t.add(1) = atom_intern(b"file");
+        *t.add(2) = fr[2];
+    }
+    ctx.roots_head = saved;
+    t as u64
+}
+
 /// code:ensure_loaded/1 → {module, M} | {error, nofile}. Eternal tuples —
 /// tiny, bounded by call sites.
 #[no_mangle]
