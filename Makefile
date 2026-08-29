@@ -12,5 +12,20 @@ test:
 test-conformance: build
 	cd test/conformance && MANA_BIN=$(BIN) mix test
 
+# run every benchmark suite natively and on BEAM; SUITE=Classic|Str|Ecto
+SUITE ?= Classic Str Ecto
+bench: build-release
+	@cd benchmarks && for s in $(SUITE); do \
+	  echo "==== Bench.$$s (mana) ===="; \
+	  MANA_BIN=$(RBIN) mix mana.compile --entry Bench.$$s.run/0 --out /tmp/mana_bench_$$s >/dev/null && /tmp/mana_bench_$$s/app; \
+	  echo "==== Bench.$$s (BEAM) ===="; \
+	  mix run --no-start -e "Bench.$$s.run()"; \
+	done
+
+build-release:
+	cargo build --release
+
+RBIN := $(CURDIR)/target/release/manac
+
 example-elixir: build
 	cd examples/elixir/fib && MANA_BIN=$(BIN) mix mana.compile --entry Fib.main/0 && ./_mana/app

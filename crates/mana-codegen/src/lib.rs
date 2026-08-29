@@ -282,6 +282,7 @@ pub fn compile_program(
             let context = Context::create();
             let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
             *cg.missing_modules.borrow_mut() = missing_mods.clone();
+            cg.is_entry_module.set(entry_here.is_some());
             cg.compile(m, &include, entry_here)?;
             if dump_ir {
                 eprintln!("{}", cg.module.print_to_string().to_string());
@@ -447,6 +448,9 @@ struct Cg<'ctx, 'p> {
     /// modules the program references but that are not compiled: calls to
     /// them poison the calling function (stub) instead of failing the build
     missing_modules: RefCell<HashSet<String>>,
+    /// (module, behaviour) pairs for the mana_behaviours section
+    behaviours: RefCell<Vec<(String, String)>>,
+    is_entry_module: Cell<bool>,
     /// innermost enclosing try handler blocks (current function)
     handlers: RefCell<Vec<BasicBlock<'ctx>>>,
     /// lazily created per-function "pop frame; return sentinel" block
@@ -503,6 +507,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             static_bytes_count: Cell::new(0),
             exports: RefCell::new(Vec::new()),
             missing_modules: RefCell::new(HashSet::new()),
+            behaviours: RefCell::new(Vec::new()),
+            is_entry_module: Cell::new(false),
             handlers: RefCell::new(Vec::new()),
             propagate_bb: Cell::new(None),
             var_slots: Default::default(),
@@ -843,6 +849,29 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         class: IntValue<'ctx>,
         reason: IntValue<'ctx>,
     ) -> CgResult<()> {
+        // poor man's stacktrace, raise flavor (MANA_DEBUG_RAISE)
+        let site = format!("{}:{}", self.module_name, f.get_name().to_string_lossy());
+        let ptr = self.static_bytes(site.as_bytes())?;
+        self.builder
+            .build_call(
+                self.rt_fn("mana_rt_note_raise", || {
+                    self.ctx.void_type().fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                }),
+                &[
+                    ptr.into(),
+                    self.i64t.const_int(site.len() as u64, false).into(),
+                    reason.into(),
+                ],
+                "",
+            )
+            .map_err(be)?;
         let ctx = self.ctx_val();
         self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
         self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
@@ -973,6 +1002,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // module and function names are atoms on BEAM (so they satisfy
         // binary_to_existing_atom, and S4's export table will need them)
         self.atom_global(&ast.name);
+        for b in &ast.behaviours {
+            self.atom_global(b);
+            self.behaviours
+                .borrow_mut()
+                .push((ast.name.clone(), b.clone()));
+        }
         for (fname, _) in &ast.definitions {
             if include.contains(fname) {
                 self.atom_global(&fname.name);
@@ -1113,6 +1148,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 ("binary", "compile_pattern", 1) => ("", 0, &[]),
                 // Elixir.Float decomposes IEEE bits with sub-bit segments
                 // (TODO(bitstring)); precision ops go native instead
+                ("Elixir.System", "cmd", 2) => ("mana_rt_system_cmd", 0, &[NIL_C]),
+                ("Elixir.System", "cmd", 3) => ("mana_rt_system_cmd", 0, &[]),
                 ("Elixir.Float", "round", 2) => ("mana_rt_float_prec", 0, &[0]),
                 ("Elixir.Float", "ceil", 2) => ("mana_rt_float_prec", 0, &[1]),
                 ("Elixir.Float", "floor", 2) => ("mana_rt_float_prec", 0, &[2]),
@@ -1664,6 +1701,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             // stacktraces are not built — TODO(stacktraces); the raw
             // stacktrace argument was evaluated as part of the try lowering
             Expr::PrimOp { name, .. } if name == "build_stacktrace" => Ok(self.nil()),
+            // re-raise with dynamic class + raw stacktrace (dropped)
+            Expr::PrimOp { name, args } if name == "raw_raise" && args.len() == 3 => {
+                let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+                let ctx = self.ctx_val();
+                self.mem_store(ctx, CTX_EXC_CLASS, argv[0], MemKind::Ctx)?;
+                self.mem_store(ctx, CTX_EXC_REASON, argv[1], MemKind::Ctx)?;
+                let target = self.unwind_target(f)?;
+                self.builder.build_unconditional_branch(target).map_err(be)?;
+                let dead = self.ctx.append_basic_block(f, "rawraise.dead");
+                self.builder.position_at_end(dead);
+                Ok(self.i64t.get_undef())
+            }
             Expr::PrimOp { name, .. } => Err(format!("unsupported primop {}", name)),
             Expr::Case { arg, clauses } => {
                 let vals = self.compile_case_arg(f, arg, clauses, scope)?;
@@ -3430,6 +3479,39 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if module == "re" {
             return self.compile_re_bif(f, name, args, scope);
         }
+        if module == "timer" {
+            // no timer server in a static binary: start is a no-op, tc is
+            // native; send_after/apply_after wait for the timers milestone
+            let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+            return match (name, argv.len()) {
+                ("start", 0) | ("start_link", 0) => self.atom_term("ok"),
+                ("tc", 1) => {
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_ptt_i64("mana_rt_timer_tc"),
+                            &[self.ctx_val().into(), argv[0].into(), self.nil().into()],
+                            "tc",
+                        )
+                        .map_err(be)?;
+                    let v = call_result(call)?.into_int_value();
+                    self.check_exc(f, v)
+                }
+                ("tc", 2) => {
+                    let call = self
+                        .builder
+                        .build_call(
+                            self.rt_ptt_i64("mana_rt_timer_tc"),
+                            &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                            "tc",
+                        )
+                        .map_err(be)?;
+                    let v = call_result(call)?.into_int_value();
+                    self.check_exc(f, v)
+                }
+                _ => Err(format!("unsupported BIF timer:{}/{}", name, argv.len())),
+            };
+        }
         if module == "ets" {
             return self.compile_ets_bif(f, name, args, scope);
         }
@@ -3866,15 +3948,26 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             ("float_to_binary", 1) | ("float_to_binary", 2) | ("float_to_list", 1)
             | ("float_to_list", 2) => {
-                // options ([:short] etc.) are evaluated and ignored — our
-                // only format IS shortest round-trip
+                let opts = if argv.len() == 2 { argv[1] } else { self.nil() };
+                let callee = self.rt_fn("mana_rt_float_to_binary", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
                 let call = self
                     .builder
                     .build_call(
-                        self.rt_ptt_i64("mana_rt_float_to_binary"),
+                        callee,
                         &[
                             self.ctx_val().into(),
                             argv[0].into(),
+                            opts.into(),
                             self.i64t
                                 .const_int(name.ends_with("list") as u64, false)
                                 .into(),
@@ -4106,6 +4199,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("spawn_opt", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_spawn_opt_fun"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "spawnopt2",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("spawn_opt", 4) | ("spawn", 3) | ("spawn_link", 3) => {
                 let callee = self.rt_fn("mana_rt_spawn_opt_mfa", || {
                     self.i64t.fn_type(
@@ -4275,6 +4380,50 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("send_after", 3) | ("start_timer", 3) => {
+                let callee = self.rt_fn("mana_rt_send_after", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                            self.i64t
+                                .const_int((name == "start_timer") as u64, false)
+                                .into(),
+                        ],
+                        "sendafter",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("cancel_timer", 1) | ("cancel_timer", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_cancel_timer"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "canceltimer",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("monotonic_time", 0) | ("monotonic_time", 1) | ("system_time", 0)
             | ("system_time", 1) => {
                 let helper = if name == "monotonic_time" {
@@ -4333,6 +4482,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         self.rt_ptt_i64("mana_rt_fun_info"),
                         &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
                         "funinfo",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("fun_info_mfa", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_fun_info_mfa"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "fmfa",
                     )
                     .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
@@ -4406,16 +4567,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 Ok(call_result(call)?.into_int_value())
             }
             ("system_info", 1) => {
-                // the subset reached so far; extend as callers appear
-                if let Expr::Lit(Literal::Atom(a)) = &args[0] {
-                    return match a.as_str() {
-                        "endian" => self.atom_term("little"),
-                        "otp_release" => self.compile_binary_const_term(f, b"26", scope),
-                        _ => Err(format!("unsupported system_info({})", a)),
-                    };
-                }
-                Err("unsupported dynamic system_info/1".into())
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_system_info"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "sysinfo",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
             }
+            ("garbage_collect", 0) => self.atom_term("true"),
             ("is_port", 1) => self.atom_term("false"),
             // no distribution: everything lives on nonode@nohost
             ("node", 0) | ("node", 1) => self.atom_term("nonode@nohost"),
@@ -5708,6 +5871,36 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     ) -> CgResult<IntValue<'ctx>> {
         let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
         match (name, argv.len()) {
+            ("root_dir", 0) | ("lib_dir", 0) => {
+                // static binaries have no OTP tree; a plausible path keeps
+                // header-printing callers alive (they only display it)
+                let s = b"/mana";
+                let bin = self.compile_binary_const_term(f, s, scope)?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_binary_to_list"),
+                        &[self.ctx_val().into(), bin.into()],
+                        "cl",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("lib_dir", 1) => {
+                let s = b"/mana/lib";
+                let bin = self.compile_binary_const_term(f, s, scope)?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_binary_to_list"),
+                        &[self.ctx_val().into(), bin.into()],
+                        "cl",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("ensure_loaded", 1) => {
                 let call = self
                     .builder
@@ -6107,6 +6300,75 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("update", 3) => {
+                // update(K, V, M): key must exist (badkey otherwise)
+                let callee = self.rt_fn("mana_rt_map_update_exact", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "mupd",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("take", 2) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64("mana_rt_map_take"),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "mtake",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("merge_with", 3) => {
+                let callee = self.rt_fn("mana_rt_maps_merge_with", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "mmw",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("fold", 3) => {
                 // fold(Fun, Acc, Map)
                 let callee = self.rt_fn("mana_rt_maps_fold", || {
@@ -6432,7 +6694,43 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if atoms.is_empty() {
             return;
         }
+        // behaviours table: (module_atom, behaviour_atom) raw-pointer pairs
+        // in the `mana_behaviours` section, for module_info(:attributes)
+        // the entry module anchors the section so its __start/__stop
+        // symbols always exist (a zeroed pair the runtime skips)
+        if self.is_entry_module.get() && self.behaviours.borrow().is_empty() {
+            self.behaviours
+                .borrow_mut()
+                .push((self.module_name.clone(), self.module_name.clone()));
+        }
+        let behaviour_refs: Vec<PointerValue<'ctx>> = {
+            let bs = self.behaviours.borrow();
+            bs.iter()
+                .enumerate()
+                .map(|(i, (m, b))| {
+                    let init = self.ctx.const_struct(
+                        &[
+                            atoms.get(m.as_str()).unwrap().as_pointer_value().into(),
+                            atoms.get(b.as_str()).unwrap().as_pointer_value().into(),
+                        ],
+                        false,
+                    );
+                    let g = self.module.add_global(
+                        init.get_type(),
+                        None,
+                        &format!("mana_behaviour.{}.{}", sanitize(m), i),
+                    );
+                    g.set_initializer(&init);
+                    g.set_constant(true);
+                    g.set_alignment(8);
+                    g.set_section(Some("mana_behaviours"));
+                    g.set_linkage(Linkage::Internal);
+                    g.as_pointer_value()
+                })
+                .collect()
+        };
         let mut used: Vec<PointerValue<'ctx>> = Vec::with_capacity(atoms.len());
+        used.extend(behaviour_refs);
         // export table entries: {mod_atom, fun_atom, arity, code} in the
         // `mana_exports` section (raw pointers; the runtime tags them)
         for (fname, code) in self.exports.borrow().iter() {
@@ -6716,14 +7014,18 @@ fn is_bif_module(m: &str) -> bool {
     matches!(
         m,
         "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
-            | "logger" | "ets" | "application" | "file" | "math" | "re" | "erts_internal"
+            | "logger" | "ets" | "application" | "file" | "math" | "re" | "timer"
+            | "erts_internal"
             | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
             | "net_kernel"
     )
 }
 
 fn is_raise(primop: &str) -> bool {
-    matches!(primop, "match_fail" | "raise" | "error" | "exit" | "throw")
+    matches!(
+        primop,
+        "match_fail" | "raise" | "raw_raise" | "error" | "exit" | "throw"
+    )
 }
 
 // ---- GC-effect analysis ----
@@ -6845,7 +7147,7 @@ fn expr_may_raise(
                 "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
                     | "logger" | "ets" | "application" | "file" | "erts_internal"
                     | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
-                    | "net_kernel" | "math" | "re"
+                    | "net_kernel" | "math" | "re" | "timer"
             ) {
                 return true;
             }
@@ -6880,12 +7182,19 @@ fn expr_may_raise(
                         | ("spawn", 3)
                         | ("spawn_link", 1)
                         | ("spawn_link", 3)
+                        | ("spawn_opt", 2)
                         | ("spawn_opt", 4)
                         | ("spawn_monitor", 1)
                         | ("make_fun", 3)
                         | ("monitor", 3)
+                        | ("system_info", 1)
                         | ("is_process_alive", 1)
                         | ("fun_info", 2)
+                        | ("fun_info_mfa", 1)
+                        | ("send_after", 3)
+                        | ("start_timer", 3)
+                        | ("cancel_timer", 1)
+                        | ("cancel_timer", 2)
                         | ("monotonic_time", 0)
                         | ("monotonic_time", 1)
                         | ("system_time", 0)
@@ -7062,12 +7371,13 @@ fn expr_may_gc(
                     name.as_str(),
                     "put" | "remove" | "merge" | "from_list" | "to_list" | "find"
                         | "fold" | "keys" | "values" | "iterator" | "next"
+                        | "merge_with" | "take" | "update"
                 )
             {
                 return true;
             }
             // io:nl allocates its newline binary; unicode/re allocate results
-            if matches!(module.as_str(), "io" | "unicode" | "re") {
+            if matches!(module.as_str(), "io" | "unicode" | "re" | "timer") {
                 return true;
             }
             let callee_gc = module != "erlang"

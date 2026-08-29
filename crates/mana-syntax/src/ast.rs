@@ -5,6 +5,9 @@
 pub struct Module {
     pub name: String,
     pub exports: Vec<FunName>,
+    /// `-behaviour(...)` attributes (module_info(:attributes) needs them —
+    /// benchee-style behaviour checks)
+    pub behaviours: Vec<String>,
     pub definitions: Vec<(FunName, Fun)>,
 }
 

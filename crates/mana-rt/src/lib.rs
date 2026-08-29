@@ -98,8 +98,8 @@ const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
 const OLD_LIMIT_INIT: usize = 4 * OLD_CHUNK_WORDS;
 /// Reservation only — anonymous pages commit lazily on first touch.
-const STACK_BYTES: usize = 8 * 1024 * 1024;
-const ROOT_STACK_BYTES: usize = 32 * 1024 * 1024;
+const STACK_BYTES: usize = 256 * 1024 * 1024; // lazy-commit reservation — TODO(stacks): growable
+const ROOT_STACK_BYTES: usize = 512 * 1024 * 1024; // lazy-commit reservation
 const REDUCTIONS_PER_SLICE: i64 = 4000;
 
 // ---------------------------------------------------------------------------
@@ -553,6 +553,7 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
             return;
         }
         park_if_stw(ctx);
+        drain_timer_deliveries(ctx);
 
         let pid = ctx
             .run_q
@@ -2044,20 +2045,64 @@ fn fmt_float(f: f64) -> String {
     s
 }
 
-/// erlang:float_to_binary/2 with [:short] (Elixir's default path) or /1.
+/// erlang:float_to_binary/1,2 and float_to_list — options: [:short]
+/// (shortest round-trip), {:decimals, N} (+ :compact trims zeros); no
+/// options = %e like BEAM.
 #[no_mangle]
-pub extern "C" fn mana_rt_float_to_binary(ctx: *mut ProcCtx, t: u64, as_list: u64) -> u64 {
+pub extern "C" fn mana_rt_float_to_binary(ctx: *mut ProcCtx, t: u64, opts: u64, as_list: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    match num_of(t) {
-        Some((x, false)) => {
-            let s = fmt_float(x);
-            if as_list != 0 {
-                bytes_to_charlist(ctx, s.as_bytes())
-            } else {
-                bytes_to_new_bin(ctx, s.as_bytes())
+    let Some((x, false)) = num_of(t) else {
+        return raise_badarg(ctx);
+    };
+    let (mut decimals, mut compact, mut short) = (None::<usize>, false, false);
+    let mut cur = opts;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let opt = unsafe { *p };
+        if opt & TAG_MASK == TAG_ATOM {
+            match atom_bytes(opt) {
+                b"short" => short = true,
+                b"compact" => compact = true,
+                _ => {}
+            }
+        } else if opt & TAG_MASK == TAG_BOXED && opt != 0 {
+            let hp = opt as *const u64;
+            let h = unsafe { *hp };
+            if h & 0xff == KIND_TUPLE
+                && h >> 8 == 2
+                && atom_bytes(unsafe { *hp.add(1) }) == b"decimals"
+            {
+                let d = unsafe { *hp.add(2) };
+                if d & TAG_MASK == TAG_SMALL {
+                    decimals = Some((d as i64 >> 3).clamp(0, 253) as usize);
+                }
             }
         }
-        _ => raise_badarg(ctx),
+        cur = unsafe { *p.add(1) };
+    }
+    let s = if short {
+        fmt_float(x)
+    } else if let Some(d) = decimals {
+        let mut s = format!("{:.*}", d, x);
+        if compact && s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.push('0');
+            }
+        }
+        s
+    } else {
+        display_float(x)
+    };
+    if as_list != 0 {
+        utf8_to_codepoint_list(ctx, s.as_bytes())
+    } else {
+        bytes_to_new_bin(ctx, s.as_bytes())
     }
 }
 
@@ -2169,6 +2214,29 @@ pub extern "C" fn mana_rt_fun_info(ctx: *mut ProcCtx, fun: u64, item: u64) -> u6
     t as u64
 }
 
+/// erlang:fun_info_mfa/1 — closures carry no MFA metadata; arity is real,
+/// module/name are undefined (callers only display them).
+#[no_mangle]
+pub extern "C" fn mana_rt_fun_info_mfa(ctx: *mut ProcCtx, fun: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if fun & TAG_MASK != TAG_BOXED || fun == 0 {
+        return raise_badarg(ctx);
+    }
+    let header = unsafe { *(fun as *const u64) };
+    if header & 0xff != KIND_FUN {
+        return raise_badarg(ctx);
+    }
+    let arity = (header >> 8) & 0xff;
+    let t = alloc_nursery(ctx, 4);
+    unsafe {
+        *t = (3 << 8) | KIND_TUPLE;
+        *t.add(1) = known().undefined;
+        *t.add(2) = known().undefined;
+        *t.add(3) = (arity << 3) | TAG_SMALL;
+    }
+    t as u64
+}
+
 /// erlang:is_process_alive/1.
 #[no_mangle]
 pub extern "C" fn mana_rt_is_process_alive(ctx: *mut ProcCtx, pid: u64) -> u64 {
@@ -2191,12 +2259,16 @@ pub extern "C" fn mana_rt_monotonic_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     in_time_unit(ctx, nanos, unit)
 }
 
-/// erlang:system_time/1.
+/// erlang:system_time/1. Unix nanoseconds exceed 61-bit smalls (BEAM uses
+/// bignums) — we offset from 2020-01-01 instead; wall-clock DELTAS and
+/// second/millisecond absolute values are unaffected in practice —
+/// TODO(bignum).
 #[no_mangle]
 pub extern "C" fn mana_rt_system_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
+    const EPOCH_2020_SECS: u64 = 1_577_836_800;
     let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+        .duration_since(std::time::UNIX_EPOCH + std::time::Duration::from_secs(EPOCH_2020_SECS))
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0);
     in_time_unit(ctx, nanos, unit)
@@ -2231,6 +2303,308 @@ pub extern "C" fn mana_rt_convert_time_unit(
         }
     };
     in_time_unit(ctx, nanos, to)
+}
+
+/// erlang:system_info/1 — the closed-world answer sheet. Extend as
+/// callers appear; unknown items raise badarg (loud).
+#[no_mangle]
+pub extern "C" fn mana_rt_system_info(ctx: *mut ProcCtx, item: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if item & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let cpus = || {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1)
+    };
+    match atom_bytes(item) {
+        b"endian" => find_atom("little").unwrap_or(NIL),
+        b"otp_release" => bytes_to_charlist(ctx, b"26"),
+        b"system_version" => bytes_to_charlist(ctx, b"mana\n"),
+        b"version" => bytes_to_charlist(ctx, b"14.0"),
+        b"emu_flavor" => atom_intern(b"emu"),
+        b"os_type" => {
+            let t = alloc_nursery(ctx, 3);
+            unsafe {
+                *t = (2 << 8) | KIND_TUPLE;
+                *t.add(1) = atom_intern(b"unix");
+                *t.add(2) = atom_intern(b"linux");
+            }
+            t as u64
+        }
+        b"logical_processors" | b"logical_processors_available"
+        | b"logical_processors_online" => ((cpus() << 3) as u64) | TAG_SMALL,
+        b"schedulers" | b"schedulers_online" => {
+            let n = ctx.global.n_scheds as u64;
+            ((n << 3) as u64) | TAG_SMALL
+        }
+        b"os_monotonic_time_source" => {
+            // property list benchee's repeated_measurement reads
+            let cell = alloc_nursery(ctx, 2);
+            let t = alloc_nursery(ctx, 3);
+            unsafe {
+                *t = (2 << 8) | KIND_TUPLE;
+                *t.add(1) = atom_intern(b"resolution");
+                *t.add(2) = ((1_000_000_000u64) << 3) | TAG_SMALL;
+                *cell = t as u64;
+                *cell.add(1) = NIL;
+            }
+            cell as u64 | TAG_CONS
+        }
+        _ => raise_badarg(ctx),
+    }
+}
+
+/// Elixir.System.cmd/2,3 (native override): run a command, capture stdout,
+/// return {Output, ExitCode}. Synchronous on the calling scheduler thread —
+/// fine for system probing; real port support is TODO(port).
+#[no_mangle]
+pub extern "C" fn mana_rt_system_cmd(ctx: *mut ProcCtx, cmd: u64, args: u64, _opts: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some(cmd_b) = term_to_source(cmd) else {
+        return raise_badarg(ctx);
+    };
+    let Ok(cmd_s) = String::from_utf8(cmd_b) else {
+        return raise_badarg(ctx);
+    };
+    let mut argv: Vec<String> = Vec::new();
+    let mut cur = args;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctx);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        let Some(b) = term_to_source(h) else {
+            return raise_badarg(ctx);
+        };
+        let Ok(s) = String::from_utf8(b) else {
+            return raise_badarg(ctx);
+        };
+        argv.push(s);
+        cur = unsafe { *p.add(1) };
+    }
+    let out = std::process::Command::new(&cmd_s).args(&argv).output();
+    let (bytes, code): (Vec<u8>, i64) = match out {
+        Ok(o) => (o.stdout, o.status.code().unwrap_or(1) as i64),
+        Err(_) => (Vec::new(), 127),
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, 0];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    fr[2] = bytes_to_new_bin(ctx, &bytes);
+    let t = alloc_nursery(ctx, 3);
+    ctx.roots_head = saved;
+    unsafe {
+        *t = (2 << 8) | KIND_TUPLE;
+        *t.add(1) = fr[2];
+        *t.add(2) = ((code << 3) as u64) | TAG_SMALL;
+    }
+    t as u64
+}
+
+/// timer:tc — time a fun application in microseconds → {Us, Result}.
+#[no_mangle]
+pub extern "C" fn mana_rt_timer_tc(ctx: *mut ProcCtx, fun: u64, args: u64) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    let t0 = monotonic_epoch().elapsed();
+    let v = mana_rt_apply_fun(ctx, fun, args);
+    if v == EXC_SENTINEL {
+        return v;
+    }
+    let us = (monotonic_epoch().elapsed() - t0).as_micros() as i64;
+    let ctxr = unsafe { &mut *ctx };
+    let saved = ctxr.roots_head;
+    let mut fr = [0u64, 1, v];
+    fr[0] = saved;
+    ctxr.roots_head = fr.as_ptr() as u64;
+    let t = alloc_nursery(ctxr, 3);
+    ctxr.roots_head = saved;
+    unsafe {
+        *t = (2 << 8) | KIND_TUPLE;
+        *t.add(1) = ((us << 3) as u64) | TAG_SMALL;
+        *t.add(2) = fr[2];
+    }
+    let _ = ctxr;
+    t as u64
+}
+
+// ---------------------------------------------------------------------------
+// timers (send_after / start_timer / cancel_timer)
+//
+// A dedicated timer thread sleeps until the nearest deadline and delivers
+// by pushing to the target's ingress + waking its scheduler (the same
+// cross-thread path sends use). Messages are eternal deep copies —
+// immortal, so the timer heap needs no GC integration; timer volume is
+// low on our paths — TODO(timer-gc).
+
+struct TimerEntry {
+    deadline: std::time::Instant,
+    ref_id: u64,
+    dest_pid: Option<usize>,
+    dest_name: Option<u64>, // registered-name atom, resolved at fire time
+    msg: u64,               // eternal
+}
+
+struct Timers {
+    entries: Vec<TimerEntry>,
+    global: &'static Global,
+    thread_started: bool,
+}
+
+static TIMERS: std::sync::Mutex<Option<Timers>> = std::sync::Mutex::new(None);
+static TIMER_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The timer thread is OUTSIDE the STW protocol, so it must not mutate
+/// process/scheduler state directly (a state flip mid-major corrupts the
+/// run queues). It only enqueues (pid, msg) here and wakes a scheduler;
+/// schedulers drain at their loop top — a safepoint.
+static TIMER_DELIVERIES: SegQueue<(usize, u64)> = SegQueue::new();
+
+fn deliver_cross_thread(g: &'static Global, id: usize, msg: u64) {
+    TIMER_DELIVERIES.push((id, msg));
+    for s in 0..g.n_scheds {
+        wake_sched(g, s);
+    }
+}
+
+/// Called from the scheduler loop (a safepoint-adjacent context).
+fn drain_timer_deliveries(ctx: &mut ProcCtx) {
+    while let Some((id, msg)) = TIMER_DELIVERIES.pop() {
+        push_and_wake(ctx, id, msg);
+    }
+}
+
+fn timer_thread() {
+    loop {
+        let mut guard = TIMERS.lock().unwrap();
+        loop {
+            let now = std::time::Instant::now();
+            let t = guard.as_mut().unwrap();
+            let g = t.global;
+            // fire everything due
+            let mut i = 0;
+            while i < t.entries.len() {
+                if t.entries[i].deadline <= now {
+                    let e = t.entries.swap_remove(i);
+                    let pid = e.dest_pid.or_else(|| {
+                        e.dest_name.and_then(|name| {
+                            NAME_REGISTRY
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .and_then(|m| m.get(&name).copied())
+                        })
+                    });
+                    if let Some(pid) = pid {
+                        deliver_cross_thread(g, pid, e.msg);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            let next = t.entries.iter().map(|e| e.deadline).min();
+            match next {
+                Some(dl) => {
+                    let wait = dl.saturating_duration_since(std::time::Instant::now());
+                    let (g2, _) = TIMER_CV.wait_timeout(guard, wait).unwrap();
+                    guard = g2;
+                }
+                None => {
+                    guard = TIMER_CV.wait(guard).unwrap();
+                }
+            }
+        }
+    }
+}
+
+/// send_after/start_timer. `wrap != 0` wraps the message as
+/// {timeout, Ref, Msg} (start_timer semantics). Returns the timer ref.
+#[no_mangle]
+pub extern "C" fn mana_rt_send_after(
+    ctx: *mut ProcCtx,
+    ms: u64,
+    dest: u64,
+    msg: u64,
+    wrap: u64,
+) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if ms & TAG_MASK != TAG_SMALL || (ms as i64 >> 3) < 0 {
+        return raise_badarg(ctx);
+    }
+    let millis = (ms as i64 >> 3) as u64;
+    let (dest_pid, dest_name) = if dest & 0xF == PID_TAG4 {
+        (Some((dest >> 4) as usize), None)
+    } else if dest & TAG_MASK == TAG_ATOM {
+        (None, Some(dest))
+    } else {
+        return raise_badarg(ctx);
+    };
+    let r = mana_rt_make_ref(ctx as *mut ProcCtx);
+    let payload = if wrap != 0 {
+        // {timeout, Ref, Msg}
+        let m = eternal_deep_copy(msg);
+        let p = alloc_space(4);
+        unsafe {
+            *p = (3 << 8) | KIND_TUPLE;
+            *p.add(1) = atom_intern(b"timeout");
+            *p.add(2) = r;
+            *p.add(3) = m;
+        }
+        p as u64
+    } else {
+        eternal_deep_copy(msg)
+    };
+    let mut guard = TIMERS.lock().unwrap();
+    let t = guard.get_or_insert_with(|| Timers {
+        entries: Vec::new(),
+        global: ctx.global,
+        thread_started: false,
+    });
+    if !t.thread_started {
+        t.thread_started = true;
+        std::thread::Builder::new()
+            .name("mana-timers".into())
+            .spawn(timer_thread)
+            .expect("timer thread");
+    }
+    t.entries.push(TimerEntry {
+        deadline: std::time::Instant::now() + std::time::Duration::from_millis(millis),
+        ref_id: r >> 4,
+        dest_pid,
+        dest_name,
+        msg: payload,
+    });
+    drop(guard);
+    TIMER_CV.notify_one();
+    r
+}
+
+/// cancel_timer/1,2 → remaining ms | false.
+#[no_mangle]
+pub extern "C" fn mana_rt_cancel_timer(ctx: *mut ProcCtx, r: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if r & 0xF != REF_TAG4 {
+        return raise_badarg(ctx);
+    }
+    let ref_id = r >> 4;
+    let mut guard = TIMERS.lock().unwrap();
+    let Some(t) = guard.as_mut() else {
+        return known().false_a;
+    };
+    match t.entries.iter().position(|e| e.ref_id == ref_id) {
+        Some(i) => {
+            let e = t.entries.swap_remove(i);
+            let rem = e
+                .deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64;
+            ((rem << 3) as u64) | TAG_SMALL
+        }
+        None => known().false_a,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2420,6 +2794,22 @@ pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) 
             ctx.roots_head = saved;
             t as u64
         }
+        b"trap_exit" => {
+            let cell = proc_ref(ctx.global, id).unwrap();
+            let p = unsafe { proc_mut(cell) };
+            let v = if p.lstate.lock().trap_exit {
+                known().true_a
+            } else {
+                known().false_a
+            };
+            let t = alloc_nursery(ctx, 3);
+            unsafe {
+                *t = (2 << 8) | KIND_TUPLE;
+                *t.add(1) = item;
+                *t.add(2) = v;
+            }
+            t as u64
+        }
         b"current_stacktrace" => {
             // stacktraces are not built — TODO(stacktraces)
             let t = alloc_nursery(ctx, 3);
@@ -2445,6 +2835,50 @@ pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) 
         }
         _ => known().undefined,
     }
+}
+
+/// erlang:spawn_opt/2 — closure spawn with link/monitor options.
+#[no_mangle]
+pub extern "C" fn mana_rt_spawn_opt_fun(ctx: *mut ProcCtx, fun: u64, opts: u64) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    let (mut link, mut monitor) = (false, false);
+    let mut cur = opts;
+    while cur != NIL {
+        if cur & TAG_MASK != TAG_CONS {
+            return raise_badarg(ctxr);
+        }
+        let p = (cur & !TAG_MASK) as *const u64;
+        let opt = unsafe { *p };
+        if opt & TAG_MASK == TAG_ATOM {
+            match atom_bytes(opt) {
+                b"link" => link = true,
+                b"monitor" => monitor = true,
+                _ => {}
+            }
+        } else if opt & TAG_MASK == TAG_BOXED && opt != 0 {
+            let hp = opt as *const u64;
+            let h = unsafe { *hp };
+            if h & 0xff == KIND_TUPLE
+                && h >> 8 == 2
+                && atom_bytes(unsafe { *hp.add(1) }) == b"monitor"
+            {
+                monitor = true;
+            }
+        }
+        cur = unsafe { *p.add(1) };
+    }
+    let pid = mana_rt_spawn(ctx, fun);
+    if pid == 0 {
+        return raise_badarg(unsafe { &mut *ctx });
+    }
+    if link {
+        mana_rt_link(ctx, pid);
+    }
+    if monitor {
+        let r = mana_rt_monitor(ctx, pid);
+        return shared_tuple(unsafe { &mut *ctx }, &[pid, r]);
+    }
+    pid
 }
 
 // ---------------------------------------------------------------------------
@@ -3306,6 +3740,18 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
             }
         },
         _ => 0,
+    }
+}
+
+/// Raise-site notifier (MANA_DEBUG_RAISE): names the raising function and
+/// prints the reason term — the debugging stand-in for stacktraces.
+#[no_mangle]
+pub extern "C" fn mana_rt_note_raise(msg: *const u8, len: u64, reason: u64) {
+    if std::env::var_os("MANA_DEBUG_RAISE").is_some() {
+        let m = unsafe { std::slice::from_raw_parts(msg, len as usize) };
+        let mut r = String::new();
+        write_term(reason, &mut r);
+        eprintln!("mana: raise in {}: {}", String::from_utf8_lossy(m), r);
     }
 }
 
@@ -4614,6 +5060,29 @@ fn atom_intern(bytes: &[u8]) -> u64 {
     atom
 }
 
+// Behaviours table: (module_atom, behaviour_atom) raw-pointer pairs.
+extern "C" {
+    static __start_mana_behaviours: u64;
+    static __stop_mana_behaviours: u64;
+}
+
+fn behaviours_of(m: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    unsafe {
+        let start = &raw const __start_mana_behaviours;
+        let stop = &raw const __stop_mana_behaviours;
+        let n = (stop as usize - start as usize) / 16;
+        for i in 0..n {
+            let e = start.add(2 * i);
+            // a self-referential pair is the section anchor, not data
+            if *e | TAG_ATOM == m && *e.add(1) != *e {
+                out.push(*e.add(1) | TAG_ATOM);
+            }
+        }
+    }
+    out
+}
+
 // Closed-world export table: codegen plants one 4-word entry per exported
 // function in the `mana_exports` ELF section: raw pointers to the module
 // and function atom structs, the arity, and the code pointer. Atoms are
@@ -4738,6 +5207,49 @@ pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -
                 }
                 (b"self", 0) => return make_pid(ctx.current),
                 _ => {}
+            }
+        }
+        // module_info is never compiled; answer the introspection shapes
+        // callers actually use (attributes → [], module → the atom)
+        if atom_bytes(f) == b"module_info" && module_is_compiled(m) {
+            if n == 0 {
+                return NIL;
+            }
+            if n == 1 {
+                return match atom_bytes(argv[0]) {
+                    b"module" => m,
+                    b"attributes" => {
+                        // [{behaviour, [B]}] per declared behaviour
+                        let bs = behaviours_of(m);
+                        let saved = ctx.roots_head;
+                        let mut fr = [0u64, 2, NIL, 0];
+                        fr[0] = saved;
+                        ctx.roots_head = fr.as_ptr() as u64;
+                        for &b in bs.iter().rev() {
+                            let inner = alloc_nursery(ctx, 2);
+                            unsafe {
+                                *inner = b;
+                                *inner.add(1) = NIL;
+                            }
+                            let t = alloc_nursery(ctx, 3);
+                            unsafe {
+                                *t = (2 << 8) | KIND_TUPLE;
+                                *t.add(1) = atom_intern(b"behaviour");
+                                *t.add(2) = inner as u64 | TAG_CONS;
+                            }
+                            fr[3] = t as u64;
+                            let cell = alloc_nursery(ctx, 2);
+                            unsafe {
+                                *cell = fr[3];
+                                *cell.add(1) = fr[2];
+                            }
+                            fr[2] = cell as u64 | TAG_CONS;
+                        }
+                        ctx.roots_head = saved;
+                        fr[2]
+                    }
+                    _ => NIL,
+                };
             }
         }
         if std::env::var_os("MANA_DEBUG_UNDEF").is_some() {
@@ -4867,8 +5379,10 @@ pub extern "C" fn mana_rt_unicode_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
     fr[2]
 }
 
-/// The minimal format engine (~s ~ts ~p ~w ~n ~~); unknown directives
-/// print their raw text. Shared by io:format and io_lib:format.
+/// The io_lib format engine: ~[F][.P][t]C for C in s f e p w n ~, with
+/// `*` widths/precisions taken from the argument list and negative widths
+/// meaning left-alignment (the benchee console subset). Unknown directives
+/// print their raw text.
 fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
     let mut fbytes = Vec::new();
     chardata_flatten(fmt, &mut fbytes)?;
@@ -4887,6 +5401,11 @@ fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
     let mut out = Vec::new();
     let mut ai = 0;
     let mut i = 0;
+    let mut next_arg = |ai: &mut usize| -> u64 {
+        let v = argv.get(*ai).copied().unwrap_or(NIL);
+        *ai += 1;
+        v
+    };
     while i < fbytes.len() {
         let b = fbytes[i];
         if b != b'~' || i + 1 >= fbytes.len() {
@@ -4894,25 +5413,113 @@ fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
             i += 1;
             continue;
         }
-        // skip modifiers like ~ts
         let mut j = i + 1;
-        while j < fbytes.len() && fbytes[j] == b't' {
+        // field width: [-]digits or *
+        let mut width: Option<i64> = None;
+        let mut neg = false;
+        if fbytes.get(j) == Some(&b'-') {
+            neg = true;
             j += 1;
         }
+        if fbytes.get(j) == Some(&b'*') {
+            let w = next_arg(&mut ai);
+            if w & TAG_MASK == TAG_SMALL {
+                width = Some(w as i64 >> 3);
+            }
+            j += 1;
+        } else {
+            let mut digits = 0i64;
+            let mut any = false;
+            while let Some(&d) = fbytes.get(j) {
+                if d.is_ascii_digit() {
+                    digits = digits * 10 + (d - b'0') as i64;
+                    any = true;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if any {
+                width = Some(if neg { -digits } else { digits });
+            }
+        }
+        // precision: .digits or .*
+        let mut prec: Option<usize> = None;
+        if fbytes.get(j) == Some(&b'.') {
+            j += 1;
+            if fbytes.get(j) == Some(&b'*') {
+                let p = next_arg(&mut ai);
+                if p & TAG_MASK == TAG_SMALL {
+                    prec = Some((p as i64 >> 3).max(0) as usize);
+                }
+                j += 1;
+            } else {
+                let mut digits = 0usize;
+                while let Some(&d) = fbytes.get(j) {
+                    if d.is_ascii_digit() {
+                        digits = digits * 10 + (d - b'0') as usize;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                prec = Some(digits);
+            }
+        }
+        // modifiers
+        while matches!(fbytes.get(j), Some(b't') | Some(b'l')) {
+            j += 1;
+        }
+        let pad = |out: &mut Vec<u8>, piece: Vec<u8>, width: Option<i64>| {
+            match width {
+                Some(w) => {
+                    let w_abs = w.unsigned_abs() as usize;
+                    let fill = w_abs.saturating_sub(piece.len());
+                    if w < 0 {
+                        out.extend_from_slice(&piece);
+                        out.extend(std::iter::repeat(b' ').take(fill));
+                    } else {
+                        out.extend(std::iter::repeat(b' ').take(fill));
+                        out.extend_from_slice(&piece);
+                    }
+                }
+                None => out.extend_from_slice(&piece),
+            }
+        };
         match fbytes.get(j) {
             Some(b'n') => out.push(b'\n'),
             Some(b'~') => out.push(b'~'),
             Some(b's') => {
-                let a = argv.get(ai).copied().unwrap_or(NIL);
-                ai += 1;
-                chardata_flatten(a, &mut out)?;
+                let a = next_arg(&mut ai);
+                let mut piece = Vec::new();
+                if a & TAG_MASK == TAG_ATOM {
+                    piece.extend_from_slice(atom_bytes(a));
+                } else {
+                    chardata_flatten(a, &mut piece)?;
+                }
+                pad(&mut out, piece, width);
+            }
+            Some(b'f') => {
+                let a = next_arg(&mut ai);
+                let Some((x, _)) = num_of(a) else {
+                    return Err(());
+                };
+                let piece = format!("{:.*}", prec.unwrap_or(6), x).into_bytes();
+                pad(&mut out, piece, width);
+            }
+            Some(b'e') => {
+                let a = next_arg(&mut ai);
+                let Some((x, _)) = num_of(a) else {
+                    return Err(());
+                };
+                let piece = display_float(x).into_bytes();
+                pad(&mut out, piece, width);
             }
             Some(b'p') | Some(b'w') => {
-                let a = argv.get(ai).copied().unwrap_or(NIL);
-                ai += 1;
+                let a = next_arg(&mut ai);
                 let mut s = String::new();
                 write_term(a, &mut s);
-                out.extend_from_slice(s.as_bytes());
+                pad(&mut out, s.into_bytes(), width);
             }
             Some(&other) => {
                 out.push(b'~');
@@ -4959,14 +5566,35 @@ fn bytes_to_charlist(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     fr[2]
 }
 
-/// io_lib:format/2 — the formatted charlist instead of printing.
+/// utf8 bytes → CODEPOINT charlist (io_lib semantics; binary_to_list's
+/// byte semantics live in bytes_to_charlist).
+fn utf8_to_codepoint_list(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+    let s = String::from_utf8_lossy(bytes);
+    let cps: Vec<u64> = s.chars().map(|c| ((c as u64) << 3) | TAG_SMALL).collect();
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for &cp in cps.iter().rev() {
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = cp;
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[2]
+}
+
+/// io_lib:format/2 — the formatted codepoint charlist.
 #[no_mangle]
 pub extern "C" fn mana_rt_io_lib_format(ctx: *mut ProcCtx, fmt: u64, args: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let Ok(out) = format_engine(fmt, args) else {
         return raise_badarg(ctx);
     };
-    bytes_to_charlist(ctx, &out)
+    utf8_to_codepoint_list(ctx, &out)
 }
 
 /// io_lib:write/1 (and write/2 with depth ignored) — display text of a term.
@@ -4975,7 +5603,7 @@ pub extern "C" fn mana_rt_io_lib_write(ctx: *mut ProcCtx, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let mut s = String::new();
     write_term(t, &mut s);
-    bytes_to_charlist(ctx, s.as_bytes())
+    utf8_to_codepoint_list(ctx, s.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -5557,6 +6185,102 @@ pub extern "C" fn mana_rt_map_keys(ctx: *mut ProcCtx, m: u64, vals: u64) -> u64 
             *cell.add(1) = fr[3];
         }
         fr[3] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[3]
+}
+
+/// maps:take/2 → {Value, MapWithoutKey} | error.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_take(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if map_parts(m).is_none() {
+        return raise_map_err(ctx, true, m);
+    }
+    let v = mana_rt_map_pat_get(m, key);
+    if v == EXC_SENTINEL {
+        return atom_error();
+    }
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 3, key, m, v];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let removed = mana_rt_map_remove(ctx as *mut ProcCtx, fr[2], fr[3]);
+    if removed == EXC_SENTINEL {
+        ctx.roots_head = saved;
+        return EXC_SENTINEL;
+    }
+    fr[3] = removed;
+    let t = alloc_nursery(ctx, 3);
+    ctx.roots_head = saved;
+    unsafe {
+        *t = (2 << 8) | KIND_TUPLE;
+        *t.add(1) = fr[4];
+        *t.add(2) = fr[3];
+    }
+    t as u64
+}
+
+/// maps:merge_with/3 — merge with a conflict fun (calls back into compiled
+/// code; everything rooted around the callbacks).
+#[no_mangle]
+pub extern "C" fn mana_rt_maps_merge_with(ctx: *mut ProcCtx, fun: u64, m1: u64, m2: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if map_parts(m1).is_none() {
+        return raise_map_err(ctx, true, m1);
+    }
+    if map_parts(m2).is_none() {
+        return raise_map_err(ctx, true, m2);
+    }
+    // acc starts as m1; for each pair in m2: put or resolve via fun
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 3, fun, m1, m2];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let n2 = map_parts(fr[4]).unwrap().1;
+    for i in 0..n2 {
+        let (p2, _) = map_parts(fr[4]).unwrap();
+        let (k, v2) = unsafe { (*p2.add(1 + i), *p2.add(1 + n2 + i)) };
+        let existing = mana_rt_map_pat_get(fr[3], k);
+        let newv = if existing == EXC_SENTINEL {
+            v2
+        } else {
+            // fun(K, V1, V2) — build the args list rooted
+            let mut fr2 = [0u64, 3, k, existing, v2];
+            fr2[0] = ctx.roots_head;
+            ctx.roots_head = fr2.as_ptr() as u64;
+            let c3 = alloc_nursery(ctx, 2);
+            unsafe {
+                *c3 = fr2[4];
+                *c3.add(1) = NIL;
+            }
+            let c2 = alloc_nursery(ctx, 2);
+            unsafe {
+                *c2 = fr2[3];
+                *c2.add(1) = c3 as u64 | TAG_CONS;
+            }
+            let c1 = alloc_nursery(ctx, 2);
+            unsafe {
+                *c1 = fr2[2];
+                *c1.add(1) = c2 as u64 | TAG_CONS;
+            }
+            ctx.roots_head = fr2[0];
+            let r = mana_rt_apply_fun(ctx as *mut ProcCtx, fr[2], c1 as u64 | TAG_CONS);
+            if r == EXC_SENTINEL {
+                ctx.roots_head = saved;
+                return EXC_SENTINEL;
+            }
+            r
+        };
+        // re-read the key (allocs may have moved m2)
+        let (p2, _) = map_parts(fr[4]).unwrap();
+        let k2 = unsafe { *p2.add(1 + i) };
+        let merged = mana_rt_map_put(ctx as *mut ProcCtx, k2, newv, fr[3]);
+        if merged == EXC_SENTINEL {
+            ctx.roots_head = saved;
+            return EXC_SENTINEL;
+        }
+        fr[3] = merged;
     }
     ctx.roots_head = saved;
     fr[3]

@@ -105,12 +105,26 @@ impl Parser {
         }
         self.expect(Tok::Attributes)?;
         self.expect(Tok::LBracket)?;
+        let mut behaviours: Vec<String> = Vec::new();
         if !self.eat(&Tok::RBracket) {
             loop {
-                // 'key' = const  — parsed and discarded
-                self.parse_atom()?;
+                // 'key' = const — behaviour(s) kept, the rest discarded
+                let key = self.parse_atom()?;
                 self.expect(Tok::Eq)?;
-                self.parse_expr()?;
+                let value = self.parse_expr()?;
+                if key == "behaviour" || key == "behavior" {
+                    fn atoms(e: &Expr, out: &mut Vec<String>) {
+                        match e {
+                            Expr::Lit(Literal::Atom(a)) => out.push(a.clone()),
+                            Expr::Cons(h, t) => {
+                                atoms(h, out);
+                                atoms(t, out);
+                            }
+                            _ => {}
+                        }
+                    }
+                    atoms(&value, &mut behaviours);
+                }
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -125,6 +139,7 @@ impl Parser {
         Ok(Module {
             name,
             exports,
+            behaviours,
             definitions,
         })
     }
