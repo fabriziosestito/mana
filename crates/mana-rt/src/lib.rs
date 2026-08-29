@@ -4002,6 +4002,15 @@ fn map_key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
     if c != 0 {
         return c.cmp(&0);
     }
+    if a == b {
+        return std::cmp::Ordering::Equal;
+    }
+    // compare == 0 with distinct bits: a binary's byte compare was already
+    // exact — only numbers (1 vs 1.0), possibly nested in containers, need
+    // the exactness tiebreak
+    if a & TAG_MASK == TAG_BOXED && unsafe { *(a as *const u64) } & 0xff == KIND_BIN {
+        return std::cmp::Ordering::Equal;
+    }
     if mana_rt_eq_exact(a, b) == 1 {
         return std::cmp::Ordering::Equal;
     }
@@ -5043,12 +5052,12 @@ extern "C" {
     static __stop_mana_atoms: u64;
 }
 
-type AtomTable = std::sync::RwLock<std::collections::HashMap<&'static [u8], u64>>;
+type AtomTable = std::sync::RwLock<rustc_hash::FxHashMap<&'static [u8], u64>>;
 
 fn atom_table_lock() -> &'static AtomTable {
     static TABLE: std::sync::OnceLock<AtomTable> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
-        let mut map = std::collections::HashMap::new();
+        let mut map = rustc_hash::FxHashMap::default();
         unsafe {
             let start = &raw const __start_mana_atoms;
             let stop = &raw const __stop_mana_atoms;
@@ -5130,11 +5139,11 @@ extern "C" {
     static __stop_mana_exports: u64;
 }
 
-fn export_table() -> &'static std::collections::HashMap<(u64, u64, u64), usize> {
-    static TABLE: std::sync::OnceLock<std::collections::HashMap<(u64, u64, u64), usize>> =
+fn export_table() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), usize> {
+    static TABLE: std::sync::OnceLock<rustc_hash::FxHashMap<(u64, u64, u64), usize>> =
         std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
-        let mut map = std::collections::HashMap::new();
+        let mut map = rustc_hash::FxHashMap::default();
         unsafe {
             let start = &raw const __start_mana_exports;
             let stop = &raw const __stop_mana_exports;

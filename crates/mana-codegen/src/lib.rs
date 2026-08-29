@@ -1026,6 +1026,87 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.builder.build_ptr_to_int(p, self.i64t, "reason").map_err(be)
     }
 
+    /// Inline flatmap lookup for a key whose equality is bit-identity
+    /// (atoms, smalls, nil). The subject must already be known to be a map.
+    /// Misses branch to `fail`; returns the value on the hit path.
+    fn inline_map_get(
+        &self,
+        f: FunctionValue<'ctx>,
+        subject: IntValue<'ctx>,
+        key: IntValue<'ctx>,
+        fail: BasicBlock<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let p = self
+            .builder
+            .build_int_to_ptr(subject, self.ptrt, "map.ptr")
+            .map_err(be)?;
+        let header = self.load_word(p, 0)?;
+        let n = self
+            .builder
+            .build_right_shift(header, self.i64t.const_int(8, false), false, "map.n")
+            .map_err(be)?;
+        let entry = self.builder.get_insert_block().unwrap();
+        let head = self.ctx.append_basic_block(f, "mg.head");
+        let body = self.ctx.append_basic_block(f, "mg.body");
+        let next = self.ctx.append_basic_block(f, "mg.next");
+        let hit = self.ctx.append_basic_block(f, "mg.hit");
+        self.builder.build_unconditional_branch(head).map_err(be)?;
+
+        self.builder.position_at_end(head);
+        let i = self.builder.build_phi(self.i64t, "mg.i").map_err(be)?;
+        i.add_incoming(&[(&self.i64t.const_zero(), entry)]);
+        let iv = i.as_basic_value().into_int_value();
+        let done = self
+            .builder
+            .build_int_compare(IntPredicate::UGE, iv, n, "mg.done")
+            .map_err(be)?;
+        self.builder
+            .build_conditional_branch(done, fail, body)
+            .map_err(be)?;
+
+        self.builder.position_at_end(body);
+        let one = self.i64t.const_int(1, false);
+        let koff = self.builder.build_int_add(one, iv, "mg.ko").map_err(be)?;
+        let kptr = unsafe {
+            self.builder
+                .build_in_bounds_gep(self.i64t, p, &[koff], "mg.kp")
+                .map_err(be)?
+        };
+        let kw = self
+            .builder
+            .build_load(self.i64t, kptr, "mg.k")
+            .map_err(be)?
+            .into_int_value();
+        let eq = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, kw, key, "mg.eq")
+            .map_err(be)?;
+        self.builder
+            .build_conditional_branch(eq, hit, next)
+            .map_err(be)?;
+
+        self.builder.position_at_end(next);
+        let inext = self.builder.build_int_add(iv, one, "mg.inc").map_err(be)?;
+        i.add_incoming(&[(&inext, next)]);
+        self.builder.build_unconditional_branch(head).map_err(be)?;
+
+        self.builder.position_at_end(hit);
+        let voff = self
+            .builder
+            .build_int_add(self.builder.build_int_add(one, n, "mg.vb").map_err(be)?, iv, "mg.vo")
+            .map_err(be)?;
+        let vptr = unsafe {
+            self.builder
+                .build_in_bounds_gep(self.i64t, p, &[voff], "mg.vp")
+                .map_err(be)?
+        };
+        Ok(self
+            .builder
+            .build_load(self.i64t, vptr, "mg.v")
+            .map_err(be)?
+            .into_int_value())
+    }
+
     fn slot_ptr(&self, idx: u64) -> CgResult<PointerValue<'ctx>> {
         let frame = self.cur_frame.get().expect("slot in frameless function");
         unsafe {
@@ -2212,11 +2293,38 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         capture_names: &[String],
         scope: &Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
-        let p = self.alloc_words(2 + capture_names.len() as u64)?;
         let header = self.i64t.const_int(
             ((capture_names.len() as u64) << 16) | ((arity as u64) << 8) | KIND_FUN,
             false,
         );
+        // captureless: a per-code-pointer static constant — no allocation
+        // (safe: forward_major/minor pass non-heap boxed terms through)
+        if capture_names.is_empty() {
+            let sym = format!("mana_fun.{}", code.get_name().to_string_lossy());
+            let g = match self.module.get_global(&sym) {
+                Some(g) => g,
+                None => {
+                    let init = self.ctx.const_struct(
+                        &[
+                            header.into(),
+                            code.as_global_value().as_pointer_value().into(),
+                        ],
+                        false,
+                    );
+                    let g = self.module.add_global(init.get_type(), None, &sym);
+                    g.set_initializer(&init);
+                    g.set_constant(true);
+                    g.set_alignment(8);
+                    g.set_linkage(Linkage::LinkOnceODR);
+                    g
+                }
+            };
+            return self
+                .builder
+                .build_ptr_to_int(g.as_pointer_value(), self.i64t, "fun.static")
+                .map_err(be);
+        }
+        let p = self.alloc_words(2 + capture_names.len() as u64)?;
         self.store_word(p, 0, header)?;
         let code_int = self
             .builder
@@ -3152,21 +3260,34 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         Some(s) => self.reload(s)?,
                         None => val,
                     };
-                    let key = self.compile_value(f, k, scope)?;
-                    let call = self
-                        .builder
-                        .build_call(
-                            self.rt_tt_i64("mana_rt_map_pat_get"),
-                            &[subject.into(), key.into()],
-                            "mpat",
-                        )
-                        .map_err(be)?;
-                    let v = call_result(call)?.into_int_value();
-                    let hit = self
-                        .builder
-                        .build_int_compare(IntPredicate::NE, v, self.sentinel(), "mpat.h")
-                        .map_err(be)?;
-                    self.branch_test(f, hit, fail)?;
+                    // immediate literal keys (atoms/smalls/nil) equal only
+                    // bit-identical terms: scan the key words inline — no
+                    // runtime call
+                    let immediate_key = matches!(
+                        k,
+                        Expr::Lit(Literal::Atom(_) | Literal::Nil)
+                    ) || matches!(k, Expr::Lit(Literal::Int(v)) if v.unsigned_abs() < (1 << 60));
+                    let v = if immediate_key {
+                        let key = self.compile_value(f, k, scope)?;
+                        self.inline_map_get(f, subject, key, fail)?
+                    } else {
+                        let key = self.compile_value(f, k, scope)?;
+                        let call = self
+                            .builder
+                            .build_call(
+                                self.rt_tt_i64("mana_rt_map_pat_get"),
+                                &[subject.into(), key.into()],
+                                "mpat",
+                            )
+                            .map_err(be)?;
+                        let v = call_result(call)?.into_int_value();
+                        let hit = self
+                            .builder
+                            .build_int_compare(IntPredicate::NE, v, self.sentinel(), "mpat.h")
+                            .map_err(be)?;
+                        self.branch_test(f, hit, fail)?;
+                        v
+                    };
                     self.match_pattern(f, v, sub, scope, fail)?;
                 }
                 Ok(())
@@ -3316,38 +3437,46 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             })
             .sum();
         // preflight: is-binary + (for all-const patterns) the length check;
-        // dynamic patterns re-check bounds per segment
-        let call = self
-            .builder
-            .build_call(
-                self.rt_fn("mana_rt_bin_len_check", || {
-                    self.i64t.fn_type(
-                        &[
-                            BasicMetadataTypeEnum::IntType(self.i64t),
-                            BasicMetadataTypeEnum::IntType(self.i64t),
-                            BasicMetadataTypeEnum::IntType(self.i64t),
-                        ],
-                        false,
-                    )
-                }),
-                &[
-                    val.into(),
-                    self.i64t.const_int(const_total, false).into(),
-                    self.i64t
-                        .const_int((rest || !all_const) as u64, false)
-                        .into(),
-                ],
-                "blen",
-            )
-            .map_err(be)?;
-        let ok = call_result(call)?.into_int_value();
-        let ok = self
-            .builder
-            .build_int_compare(IntPredicate::NE, ok, self.i64t.const_zero(), "blen.ok")
-            .map_err(be)?;
+        // dynamic patterns re-check bounds per segment. Inline: tag test,
+        // kind byte, length compare — no runtime call.
+        let at_least = rest || !all_const;
+        let ok = self.kind_test(f, val, |s, header| {
+            let k = s
+                .builder
+                .build_and(header, s.i64t.const_int(0xff, false), "bl.k")
+                .map_err(be)?;
+            let is_bin = s
+                .builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    k,
+                    s.i64t.const_int(KIND_BIN, false),
+                    "bl.bin",
+                )
+                .map_err(be)?;
+            let len = s
+                .builder
+                .build_right_shift(header, s.i64t.const_int(8, false), false, "bl.len")
+                .map_err(be)?;
+            let want = s.i64t.const_int(const_total, false);
+            let lok = s
+                .builder
+                .build_int_compare(
+                    if at_least { IntPredicate::UGE } else { IntPredicate::EQ },
+                    len,
+                    want,
+                    "bl.ok",
+                )
+                .map_err(be)?;
+            s.builder.build_and(is_bin, lok, "bl.and").map_err(be)
+        })?;
         self.branch_test(f, ok, fail)?;
 
         let mut off: IntValue<'ctx> = self.i64t.const_zero();
+        // true while every previous segment had a static byte width: the
+        // preflight (len >= const_total) then already bounds-checks this
+        // segment, so const/byte reads can inline without a runtime call
+        let mut prefix_static = true;
         for (spec, seg) in specs.iter().zip(segs) {
             let subject = match slot {
                 Some(s) => self.reload(s)?,
@@ -3364,6 +3493,61 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         if let Some(bytes) =
                             seg_const_bytes(&Expr::Lit(l.clone()), *n, spec.little)?
                         {
+                            // short literals under a preflighted length:
+                            // inline byte loads + compares (the whitespace
+                            // trim pyramid runs ~20 of these per string)
+                            if prefix_static && bytes.len() <= 16 {
+                                let bp = self
+                                    .builder
+                                    .build_int_to_ptr(subject, self.ptrt, "bm.p")
+                                    .map_err(be)?;
+                                let mut ok = self.ctx.bool_type().const_all_ones();
+                                for (j, byte) in bytes.iter().enumerate() {
+                                    let idx = self
+                                        .builder
+                                        .build_int_add(
+                                            off,
+                                            self.i64t.const_int(8 + j as u64, false),
+                                            "bm.i",
+                                        )
+                                        .map_err(be)?;
+                                    let gep = unsafe {
+                                        self.builder
+                                            .build_in_bounds_gep(
+                                                self.ctx.i8_type(),
+                                                bp,
+                                                &[idx],
+                                                "bm.g",
+                                            )
+                                            .map_err(be)?
+                                    };
+                                    let b = self
+                                        .builder
+                                        .build_load(self.ctx.i8_type(), gep, "bm.b")
+                                        .map_err(be)?
+                                        .into_int_value();
+                                    let eq = self
+                                        .builder
+                                        .build_int_compare(
+                                            IntPredicate::EQ,
+                                            b,
+                                            self.ctx.i8_type().const_int(*byte as u64, false),
+                                            "bm.eq",
+                                        )
+                                        .map_err(be)?;
+                                    ok = self.builder.build_and(ok, eq, "bm.and").map_err(be)?;
+                                }
+                                self.branch_test(f, ok, fail)?;
+                                off = self
+                                    .builder
+                                    .build_int_add(
+                                        off,
+                                        self.i64t.const_int(bytes.len() as u64, false),
+                                        "boff",
+                                    )
+                                    .map_err(be)?;
+                                continue;
+                            }
                             let ptr = self.static_bytes(&bytes)?;
                             let call = self
                                 .builder
@@ -3412,6 +3596,40 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     }
                     if matches!(size, SegSize::Bytes(n) if *n > 8) {
                         return Err("TODO(bignum): binding integer segments over 64 bits".into());
+                    }
+                    // 1-byte unsigned reads under a preflighted length:
+                    // inline load (<<h, rest::binary>> — the string-walk
+                    // shape)
+                    if prefix_static && matches!(size, SegSize::Bytes(1)) && !spec.signed {
+                        let bp = self
+                            .builder
+                            .build_int_to_ptr(subject, self.ptrt, "br.p")
+                            .map_err(be)?;
+                        let idx = self
+                            .builder
+                            .build_int_add(off, self.i64t.const_int(8, false), "br.i")
+                            .map_err(be)?;
+                        let gep = unsafe {
+                            self.builder
+                                .build_in_bounds_gep(self.ctx.i8_type(), bp, &[idx], "br.g")
+                                .map_err(be)?
+                        };
+                        let b = self
+                            .builder
+                            .build_load(self.ctx.i8_type(), gep, "br.b")
+                            .map_err(be)?
+                            .into_int_value();
+                        let w = self
+                            .builder
+                            .build_int_z_extend(b, self.i64t, "br.w")
+                            .map_err(be)?;
+                        let v = self.retag_int(w)?;
+                        self.match_pattern(f, v, &seg.value, scope, fail)?;
+                        off = self
+                            .builder
+                            .build_int_add(off, self.i64t.const_int(1, false), "boff")
+                            .map_err(be)?;
+                        continue;
                     }
                     let flags = (spec.little as u64) | ((spec.signed as u64) << 1);
                     let call = self
@@ -3520,6 +3738,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     off = self.builder.build_int_add(off, width, "boff").map_err(be)?;
                 }
             }
+            prefix_static = prefix_static
+                && matches!(
+                    &spec.kind,
+                    SegKind::Int { size: SegSize::Bytes(_) }
+                        | SegKind::Bin { size: SegSize::Bytes(_) }
+                );
         }
         // no rest segment: the pattern must consume the binary exactly
         if !rest && !all_const {
@@ -7520,9 +7744,17 @@ fn expr_may_gc(
         Expr::Lit(Literal::Float(_)) => true, // boxed
         Expr::Lit(_) => false,
         // allocation sites (CallDyn builds its args list + callee unknown)
-        Expr::Tuple(_) | Expr::Cons(..) | Expr::Fun(_) | Expr::FunRef { .. }
+        Expr::Tuple(_) | Expr::Cons(..)
         | Expr::LetRec { .. } | Expr::Map { .. }
         | Expr::CallDyn { .. } => true,
+        // captureless funs are static constants — no allocation
+        Expr::FunRef { .. } => false,
+        Expr::Fun(fun) => {
+            let mut bound: HashSet<String> = fun.params.iter().cloned().collect();
+            let mut out = BTreeSet::new();
+            free_vars(&fun.body, &mut bound, &mut out);
+            !out.is_empty()
+        }
         // fully-constant binaries are static terms — no allocation
         Expr::Binary(segs) => !binary_all_const(segs),
         Expr::Apply { target, args } => {
