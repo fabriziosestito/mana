@@ -10,6 +10,16 @@ first lowered to Core Erlang by the standard `erlc`/`elixirc` toolchain; we
 compile that to machine code via LLVM and link it against our own Rust
 runtime. There is no BEAM anywhere in the output.
 
+Prior art worth consulting: `~/wrk/mana` is the author's earlier
+Elixir → **Go** transpiler that walked much of this same road (Ecto
+changesets, Plug, benchmarking methodology). Its `PROJECT.md` is an
+engineering log of what broke and why — nested-closure shadowing in
+Ecto's `validate_change`, the `:re.version → "mana"` regex trick, the
+warm-BEAM bench discipline all originated there. Mine it for pitfalls
+before re-deriving them; do NOT reference it in this repo's code or docs
+(production readers don't know about past experiments — AGENTS.md is the
+one place it may be mentioned).
+
 Design pillars (do not violate them casually):
 
 - **Closed world.** No hot code loading, no dynamic code loading, no
