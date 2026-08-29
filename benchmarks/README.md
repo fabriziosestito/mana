@@ -10,17 +10,23 @@ two console reports side by side.
 
 Suites: `Bench.Classic` (fib, list churn, maps, binaries), `Bench.Str`
 (unicode/binary string paths), `Bench.Ecto` (the changeset pipeline —
-the milestone scoreboard).
+the milestone scoreboard). `Bench.EctoLoop` is the profiling vehicle for
+the changeset pipeline: a plain 50k-iteration loop with no benchee
+machinery, wired to `make bench-profile` (wall time + callgrind).
 
 Numbers are machine-dependent; the reports are for comparison, not
 conformance. Memory/reduction collection stays off (BEAM-internal tracing).
 
-First recorded run (2026-08-29, 16-core linux, release runtime vs warm BEAM):
+Scoreboard (16-core linux, release runtime vs warm BEAM):
 
-| suite entry | mana | BEAM |
-|---|---|---|
-| changeset valid | 8.5 µs | 1.7 µs |
-| changeset invalid | 8.7 µs | 1.7 µs |
+| suite entry | mana | BEAM | |
+|---|---|---|---|
+| changeset valid | 8.5 µs | 1.7 µs | 2026-08-29, first recorded run |
+| changeset valid | 2.9 µs | 1.9 µs | 2026-08-29, after the perf campaign |
+| changeset invalid | 2.6 µs | 1.8 µs | 2026-08-29, after the perf campaign |
 
-The changeset gap (~5x) is the optimization target for the next perf
-milestone.
+The campaign (maps fast paths, frame slimming, static constant binaries,
+inline map/binary matching) took the gap from ~5x to ~1.5x; instruction
+count on the tight loop fell 5.3x. The remaining gap is spread across
+term comparison (`Ecto.Type.equal?`), binary-keyed param maps, and
+per-call framing — no single >10% lever left in the profile.
