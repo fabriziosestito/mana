@@ -24,6 +24,7 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | changeset valid | 8.5 µs | 1.7 µs | 2026-08-29, first recorded run |
 | changeset valid | 2.9 µs | 1.9 µs | 2026-08-29, after the perf campaign |
 | changeset invalid | 2.6 µs | 1.8 µs | 2026-08-29, after the perf campaign |
+| query build+inspect | 68 µs | 35 µs | 2026-08-29, Ecto.Query milestone starting number |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction

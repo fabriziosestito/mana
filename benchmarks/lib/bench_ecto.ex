@@ -19,18 +19,32 @@ end
 defmodule Bench.Ecto do
   @moduledoc """
   The changeset pipeline — the milestone scoreboard entry: warm BEAM runs
-  this at ~1.7µs/iter. The target is beating it.
+  this at ~1.7µs/iter. The target is beating it. Query build+inspect
+  records the Ecto.Query milestone's starting number.
   """
+  import Ecto.Query
   alias Bench.Ecto.User
 
   @attrs %{"name" => "Ada", "email" => "ada@example.com", "age" => 36}
   @bad %{"name" => "A", "age" => 200}
 
   def run do
+    min_age = 18
+
     Benchee.run(
       %{
         "changeset valid" => fn -> User.changeset(%User{}, @attrs) end,
-        "changeset invalid" => fn -> User.changeset(%User{}, @bad) end
+        "changeset invalid" => fn -> User.changeset(%User{}, @bad) end,
+        "query build+inspect" => fn ->
+          q =
+            from u in "users",
+              where: u.age > ^min_age and u.active,
+              order_by: u.name,
+              limit: 10,
+              select: {u.name, u.age}
+
+          inspect(q)
+        end
       },
       warmup: 0.5,
       time: 1.5,
