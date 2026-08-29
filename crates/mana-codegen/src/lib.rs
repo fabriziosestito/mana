@@ -52,8 +52,8 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, FunctionType, IntType, PointerType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, CallSiteValue, FunctionValue, GlobalValue, IntValue, PointerValue,
-    ValueKind,
+    BasicMetadataValueEnum, BasicValue, CallSiteValue, FunctionValue, GlobalValue,
+    InstructionValue, IntValue, PointerValue, ValueKind,
 };
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
@@ -458,6 +458,14 @@ struct Cg<'ctx, 'p> {
     var_slots: RefCell<HashMap<String, u64>>,
     next_slot: Cell<u64>,
     slot_cap: Cell<u64>,
+    /// slot high-water mark: frame len + memset are patched down to this
+    /// once the body is compiled (the prepass cap is an over-approximation)
+    peak_slot: Cell<u64>,
+    frame_memset: Cell<Option<InstructionValue<'ctx>>>,
+    frame_len_store: Cell<Option<InstructionValue<'ctx>>>,
+    /// leading slots holding params/captures — written before the first GC
+    /// point, so the entry memset skips them
+    frame_skip: Cell<u64>,
 }
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
@@ -514,6 +522,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             var_slots: Default::default(),
             next_slot: Cell::new(0),
             slot_cap: Cell::new(0),
+            peak_slot: Cell::new(0),
+            frame_memset: Cell::new(None),
+            frame_len_store: Cell::new(None),
+            frame_skip: Cell::new(0),
         }
     }
 
@@ -742,6 +754,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         letrec_sibs: &[FunName],
     ) -> CgResult<()> {
         self.var_slots.borrow_mut().clear();
+        self.frame_memset.set(None);
+        self.frame_len_store.set(None);
+        self.frame_skip.set(0);
         let mut letrec: HashSet<FunName> = letrec_sibs.iter().cloned().collect();
         if !expr_may_gc(body, &self.module_name, self.gc_set, &mut letrec) {
             self.cur_frame.set(None);
@@ -754,14 +769,30 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let nvars = vars.len() as u64;
         let cap = nvars + nodes as u64 + 8;
 
+        // var_names (params/captures) take the leading slots: every caller
+        // stores them right after this returns, before the first GC point,
+        // so the zeroing memset can skip them
+        let skip;
         {
             let mut slots = self.var_slots.borrow_mut();
-            for (i, v) in vars.iter().enumerate() {
-                slots.insert(v.clone(), i as u64);
+            for v in var_names {
+                if !slots.contains_key(v) {
+                    let i = slots.len() as u64;
+                    slots.insert(v.clone(), i);
+                }
+            }
+            skip = slots.len() as u64;
+            for v in vars.iter() {
+                if !slots.contains_key(v.as_str()) {
+                    let i = slots.len() as u64;
+                    slots.insert(v.clone(), i);
+                }
             }
         }
         self.next_slot.set(nvars);
         self.slot_cap.set(cap);
+        self.peak_slot.set(nvars);
+        self.frame_skip.set(skip);
 
         let frame_ty = self.i64t.array_type((cap + 2) as u32);
         let frame = self
@@ -771,27 +802,47 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let ctx = self.ctx_val();
         let prev = self.mem_load(ctx, CTX_ROOTS, MemKind::Ctx)?;
         self.mem_store(frame, 0, prev, MemKind::Frame)?;
-        self.mem_store(frame, 1, self.i64t.const_int(cap, false), MemKind::Frame)?;
-        // zero-init all slots with one memset — 0 marks an empty slot the
-        // collector skips (cheaper than storing NIL per slot)
+        // len: placeholder — patched down to the slot high-water mark once
+        // the body is compiled (see patch_frame)
+        let len_slot = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    self.i64t,
+                    frame,
+                    &[self.i64t.const_int(1, false)],
+                    "len",
+                )
+                .map_err(be)?
+        };
+        let len_store = self
+            .builder
+            .build_store(len_slot, self.i64t.const_int(cap, false))
+            .map_err(be)?;
+        let _ = len_store.set_metadata(self.tbaa_frame, self.tbaa_kind);
+        self.frame_len_store.set(Some(len_store));
+        // zero-init the non-prebound slots with one memset — 0 marks an
+        // empty slot the collector skips (cheaper than storing NIL per
+        // slot). Size is a placeholder patched in patch_frame.
         let slots = unsafe {
             self.builder
                 .build_in_bounds_gep(
                     self.i64t,
                     frame,
-                    &[self.i64t.const_int(2, false)],
+                    &[self.i64t.const_int(2 + skip, false)],
                     "slots",
                 )
                 .map_err(be)?
         };
-        self.builder
+        let ms = self
+            .builder
             .build_memset(
                 slots,
                 8,
                 self.ctx.i8_type().const_zero(),
-                self.i64t.const_int(cap * 8, false),
+                self.i64t.const_int((cap - skip) * 8, false),
             )
             .map_err(be)?;
+        self.frame_memset.set(ms.as_instruction());
         let frame_int = self
             .builder
             .build_ptr_to_int(frame, self.i64t, "frame.addr")
@@ -799,6 +850,23 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.mem_store(ctx, CTX_ROOTS, frame_int, MemKind::Ctx)?;
         self.cur_frame.set(Some(frame));
         Ok(())
+    }
+
+    /// After the body is compiled the true slot high-water mark is known:
+    /// shrink the frame len and the entry memset from the prepass cap
+    /// (an over-approximation) down to it. The alloca keeps the padded
+    /// size — untouched stack costs nothing.
+    fn patch_frame(&self) {
+        let peak = self.peak_slot.get();
+        if let Some(ls) = self.frame_len_store.take() {
+            let ok = ls.set_operand(0, self.i64t.const_int(peak, false));
+            debug_assert!(ok, "frame len store operand patch failed");
+        }
+        if let Some(ms) = self.frame_memset.take() {
+            let skip = self.frame_skip.get();
+            let ok = ms.set_operand(2, self.i64t.const_int((peak - skip) * 8, false));
+            debug_assert!(ok, "frame memset size operand patch failed");
+        }
     }
 
     /// Unlink the frame (before any return or tail call).
@@ -946,6 +1014,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let n = self.next_slot.get();
         assert!(n < self.slot_cap.get(), "frame slot capacity exceeded");
         self.next_slot.set(n + 1);
+        if n + 1 > self.peak_slot.get() {
+            self.peak_slot.set(n + 1);
+        }
         n
     }
 
@@ -1206,7 +1277,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.bind_var(&mut scope, p, v)?;
         }
         self.emit_reduction_check(f)?;
-        self.compile_tail(f, &fun.body, &mut scope)
+        let r = self.compile_tail(f, &fun.body, &mut scope);
+        self.patch_frame();
+        r
     }
 
     /// Preemption point: decrement the reduction budget, yield to the
@@ -1323,7 +1396,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
             }
             self.emit_reduction_check(f)?;
-            self.compile_tail(f, &l.body, &mut scope)?;
+            let r = self.compile_tail(f, &l.body, &mut scope);
+            self.patch_frame();
+            r?;
         }
         Ok(())
     }
@@ -1401,7 +1476,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.compile_tail(f, body, &mut inner)
             }
             Expr::Do(first, then) => {
+                let wm = self.next_slot.get();
                 self.compile_value(f, first, scope)?;
+                self.next_slot.set(wm);
                 self.compile_tail(f, then, scope)
             }
             Expr::Case { arg, clauses } => {
@@ -1545,7 +1622,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.compile_value(f, body, &mut inner)
             }
             Expr::Do(first, then) => {
+                let wm = self.next_slot.get();
                 self.compile_value(f, first, scope)?;
+                self.next_slot.set(wm);
                 self.compile_value(f, then, scope)
             }
             Expr::Try {
@@ -1818,6 +1897,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         // into these), `:=` = exact (badkey on miss)
                         let mut acc = self.compile_value(f, base, scope)?;
                         for (k, assoc, v) in pairs {
+                            let wm = self.next_slot.get();
                             let acc_slot =
                                 if self.framed() { Some(self.spill(acc)?) } else { None };
                             let kv = self.eval_siblings(f, &[k, v], scope)?;
@@ -1855,6 +1935,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                 .map_err(be)?;
                             let r = call_result(call)?.into_int_value();
                             acc = self.check_exc(f, r)?;
+                            self.next_slot.set(wm);
                         }
                         Ok(acc)
                     }
@@ -1883,6 +1964,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Val(IntValue<'ctx>),
             Slot(u64),
         }
+        // spill slots die once reloaded below — release them for reuse
+        let wm = self.next_slot.get();
         let mut held = Vec::with_capacity(exprs.len());
         for (i, e) in exprs.iter().enumerate() {
             if gc_after[i] && self.framed() {
@@ -1905,12 +1988,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = self.compile_value(f, e, scope)?;
                 held.push(Held::Val(v));
             }
-        }        held.into_iter()
+        }        let out = held
+            .into_iter()
             .map(|h| match h {
                 Held::Val(v) => Ok(v),
                 Held::Slot(s) => self.reload(s),
             })
-            .collect()
+            .collect();
+        self.next_slot.set(wm);
+        out
     }
 
     /// Evaluate and root every expression (used when the consumer itself is
@@ -2224,6 +2310,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let saved_slots = self.var_slots.borrow().clone();
             let saved_next = self.next_slot.get();
             let saved_cap = self.slot_cap.get();
+            let saved_peak = self.peak_slot.get();
+            let saved_memset = self.frame_memset.get();
+            let saved_len_store = self.frame_len_store.get();
+            let saved_skip = self.frame_skip.get();
 
             let entry = self.ctx.append_basic_block(shim, "entry");
             self.builder.position_at_end(entry);
@@ -2237,6 +2327,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.bind_var(&mut scope, p, v)?;
             }
             let r = self.compile_tail(shim, &body, &mut scope);
+            self.patch_frame();
 
             *self.handlers.borrow_mut() = saved_handlers;
             self.propagate_bb.set(saved_prop);
@@ -2245,6 +2336,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             *self.var_slots.borrow_mut() = saved_slots;
             self.next_slot.set(saved_next);
             self.slot_cap.set(saved_cap);
+            self.peak_slot.set(saved_peak);
+            self.frame_memset.set(saved_memset);
+            self.frame_len_store.set(saved_len_store);
+            self.frame_skip.set(saved_skip);
             if let Err(e) = r {
                 // an unsupported BIF captured as a fun: the shim raises at
                 // runtime if the fun is ever called
@@ -2634,6 +2729,21 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         arg: &Expr,
         scope: &mut Scope<'ctx>,
     ) -> CgResult<()> {
+        // statement boundary: temps rooted while evaluating `arg` are dead
+        // once the values sit in the let-bound var slots
+        let wm = self.next_slot.get();
+        let r = self.bind_let_inner(f, vars, arg, scope);
+        self.next_slot.set(wm);
+        r
+    }
+
+    fn bind_let_inner(
+        &self,
+        f: FunctionValue<'ctx>,
+        vars: &[String],
+        arg: &Expr,
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<()> {
         match (vars.len(), arg) {
             (1, _) => {
                 let v = self.compile_value(f, arg, scope)?;
@@ -2699,7 +2809,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.bind_let(f, vars, body, scope)
             }
             (_, Expr::Do(a, b)) => {
+                let wm = self.next_slot.get();
                 self.compile_value(f, a, scope)?;
+                self.next_slot.set(wm);
                 self.bind_let(f, vars, b, scope)
             }
             _ => Err("multi-value let from a non-values expression is not supported".into()),
@@ -2754,7 +2866,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let mut next = self.ctx.append_basic_block(f, "clause0");
         self.builder.build_unconditional_branch(next).map_err(be)?;
 
+        // clauses are mutually exclusive at runtime: each attempt may reuse
+        // the temp slots of the previous one (subject slots sit below wm)
+        let wm = self.next_slot.get();
         for (i, clause) in clauses.iter().enumerate() {
+            self.next_slot.set(wm);
             self.builder.position_at_end(next);
             next = if i + 1 < clauses.len() {
                 self.ctx.append_basic_block(f, &format!("clause{}", i + 1))
@@ -2852,7 +2968,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.compile_body_values(f, body, scope, nvals)
             }
             Expr::Do(a, b) => {
+                let wm = self.next_slot.get();
                 self.compile_value(f, a, scope)?;
+                self.next_slot.set(wm);
                 self.compile_body_values(f, b, scope, nvals)
             }
             Expr::Case { arg, clauses } => {
