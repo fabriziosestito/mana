@@ -90,6 +90,9 @@ pub const KIND_FUN: u64 = 2;
 /// sorted (term order with an exactness tiebreak: 1 before 1.0).
 pub const KIND_MAP: u64 = 4;
 pub const KIND_BIN: u64 = 5;
+/// An inert big-integer literal (decimal digits): ordered/compared/printed
+/// correctly, badarith under arithmetic — TODO(bignum) for real math.
+pub const KIND_BIGLIT: u64 = 6;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
@@ -131,7 +134,7 @@ fn payload_words(header: u64) -> usize {
         KIND_FLOAT => 1,
         KIND_FUN => 1 + (header >> 16) as usize,
         KIND_MAP => 2 * (header >> 8) as usize,
-        KIND_BIN => ((header >> 8) as usize + 7) / 8,
+        KIND_BIN | KIND_BIGLIT => ((header >> 8) as usize + 7) / 8,
         _ => 0,
     }
 }
@@ -1224,6 +1227,90 @@ pub extern "C" fn mana_rt_spawn_opt_mfa(
         return shared_tuple(unsafe { &mut *ctx }, &[pid, r]);
     }
     pid
+}
+
+// ---------------------------------------------------------------------------
+// big-integer literal tokens
+
+fn biglit_digits(t: u64) -> Option<&'static [u8]> {
+    if t & TAG_MASK != TAG_BOXED || t == 0 {
+        return None;
+    }
+    let p = t as *const u64;
+    let h = unsafe { *p };
+    if h & 0xff != KIND_BIGLIT {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(p.add(1) as *const u8, (h >> 8) as usize) })
+}
+
+/// Interned eternal big-literal terms, keyed by their decimal text.
+#[no_mangle]
+pub extern "C" fn mana_rt_big_literal(ptr: *const u8, len: u64) -> u64 {
+    static TABLE: std::sync::Mutex<
+        Option<std::collections::HashMap<&'static [u8], u64>>,
+    > = std::sync::Mutex::new(None);
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let mut guard = TABLE.lock().unwrap();
+    let map = guard.get_or_insert_with(Default::default);
+    if let Some(&t) = map.get(bytes) {
+        return t;
+    }
+    let n = bytes.len();
+    let words = 1 + (n + 7) / 8;
+    let p = alloc_space(words);
+    unsafe {
+        *p = ((n as u64) << 8) | KIND_BIGLIT;
+        if n % 8 != 0 {
+            *p.add(words - 1) = 0;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(1) as *mut u8, n);
+    }
+    let t = p as u64;
+    let key: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+    map.insert(key, t);
+    t
+}
+
+/// Numeric comparison against/between big literals: sign + digit count +
+/// lexicographic (exact for integers); floats compare via f64 parse.
+fn big_num_cmp(a: u64, b: u64) -> i64 {
+    fn parts(t: u64) -> Option<(bool, &'static [u8])> {
+        biglit_digits(t).map(|d| match d.strip_prefix(b"-") {
+            Some(rest) => (true, rest),
+            None => (false, d),
+        })
+    }
+    match (parts(a), parts(b)) {
+        (Some((na, da)), Some((nb, db))) => {
+            if na != nb {
+                return if na { -1 } else { 1 };
+            }
+            let ord = da
+                .len()
+                .cmp(&db.len())
+                .then_with(|| da.cmp(db));
+            let r = match ord {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            if na { -r } else { r }
+        }
+        (Some((neg, d)), None) => {
+            // big vs small/float: approximate via f64 (exact for ordering
+            // against 61-bit smalls; adequate for floats)
+            let x: f64 = std::str::from_utf8(d)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(f64::INFINITY);
+            let x = if neg { -x } else { x };
+            let y = num_val(b);
+            (x > y) as i64 - (x < y) as i64
+        }
+        (None, Some(_)) => -big_num_cmp(b, a),
+        (None, None) => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3031,6 +3118,7 @@ fn type_rank(t: u64) -> u8 {
                 KIND_FUN => 3,
                 KIND_MAP => 6,
                 KIND_BIN => 9,
+                KIND_BIGLIT => 0, // numbers
                 _ => 5, // tuple
             }
         }
@@ -3059,6 +3147,9 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
     }
     match ra {
         0 => {
+            if biglit_digits(a).is_some() || biglit_digits(b).is_some() {
+                return big_num_cmp(a, b);
+            }
             // numbers, possibly mixed int/float
             if a & TAG_MASK == TAG_SMALL && b & TAG_MASK == TAG_SMALL {
                 let (x, y) = ((a as i64) >> 3, (b as i64) >> 3);
@@ -3210,6 +3301,7 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
                     1
                 }
                 KIND_BIN => (bin_bytes(a) == bin_bytes(b)) as i64,
+                KIND_BIGLIT => (biglit_digits(a) == biglit_digits(b)) as i64,
                 _ => 0, // funs: identity only (raw-equal handled above)
             }
         },
@@ -5371,6 +5463,74 @@ pub extern "C" fn mana_rt_lists_keyfind(
     known().false_a
 }
 
+/// maps:iterator/1 → {mana_miter, 0, Map}; maps:next/1 walks it in
+/// canonical (sorted) key order, returning {K, V, NextIter} | none.
+#[no_mangle]
+pub extern "C" fn mana_rt_map_iterator(ctx: *mut ProcCtx, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if map_parts(m).is_none() {
+        return raise_map_err(ctx, true, m);
+    }
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, m];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let t = alloc_nursery(ctx, 4);
+    ctx.roots_head = saved;
+    unsafe {
+        *t = (3 << 8) | KIND_TUPLE;
+        *t.add(1) = atom_intern(b"mana_miter");
+        *t.add(2) = TAG_SMALL; // small 0
+        *t.add(3) = fr[2];
+    }
+    t as u64
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_map_next(ctx: *mut ProcCtx, iter: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let ok = iter & TAG_MASK == TAG_BOXED
+        && iter != 0
+        && unsafe { *(iter as *const u64) } == (3 << 8) | KIND_TUPLE
+        && unsafe { atom_bytes(*(iter as *const u64).add(1)) } == b"mana_miter";
+    if !ok {
+        return raise_badarg(ctx);
+    }
+    let (i, m) = unsafe {
+        let p = iter as *const u64;
+        ((*p.add(2) as i64 >> 3) as usize, *p.add(3))
+    };
+    let Some((_, n)) = map_parts(m) else {
+        return raise_badarg(ctx);
+    };
+    if i >= n {
+        return find_atom("none").expect("none atom");
+    }
+    // build the next iterator, then the result tuple, rooting the map
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, m, 0];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let ni = alloc_nursery(ctx, 4);
+    unsafe {
+        *ni = (3 << 8) | KIND_TUPLE;
+        *ni.add(1) = atom_intern(b"mana_miter");
+        *ni.add(2) = (((i + 1) as u64) << 3) | TAG_SMALL;
+        *ni.add(3) = fr[2];
+    }
+    fr[3] = ni as u64;
+    let t = alloc_nursery(ctx, 4);
+    ctx.roots_head = saved;
+    unsafe {
+        let (p, n) = map_parts(fr[2]).unwrap();
+        *t = (3 << 8) | KIND_TUPLE;
+        *t.add(1) = *p.add(1 + i);
+        *t.add(2) = *p.add(1 + n + i);
+        *t.add(3) = fr[3];
+    }
+    t as u64
+}
+
 /// maps:keys/1 and maps:values/1 (`vals != 0`). Key order = canonical.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_keys(ctx: *mut ProcCtx, m: u64, vals: u64) -> u64 {
@@ -5831,6 +5991,11 @@ fn write_term(t: u64, out: &mut String) {
                         write_term(*p.add(1 + n + i), out);
                     }
                     out.push('}');
+                }
+                KIND_BIGLIT => {
+                    let bytes =
+                        std::slice::from_raw_parts(p.add(1) as *const u8, (header >> 8) as usize);
+                    out.push_str(&String::from_utf8_lossy(bytes));
                 }
                 KIND_BIN => {
                     let bytes = std::slice::from_raw_parts(p.add(1) as *const u8, (header >> 8) as usize);

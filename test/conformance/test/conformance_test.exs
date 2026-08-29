@@ -48,9 +48,12 @@ defmodule ConformanceTest do
       {native, status} = System.cmd(app, [])
       assert status == 0, "native #{mod_str} crashed (exit #{status}):\n#{native}"
 
-      # oracle: same module, fresh BEAM OS process
-      {beam_out, 0} =
-        System.cmd("elixir", ["-pa", Mix.Project.compile_path(), "-e", "#{mod_str}.go()"])
+      # oracle: same module, fresh BEAM OS process (all dep ebins on path)
+      pa_args =
+        Path.wildcard(Path.join(Mix.Project.build_path(), "lib/*/ebin"))
+        |> Enum.flat_map(&["-pa", &1])
+
+      {beam_out, 0} = System.cmd("elixir", pa_args ++ ["-e", "#{mod_str}.go()"])
 
       assert normalize(native) == normalize(beam_out),
              "output diverges from BEAM for #{mod_str}"

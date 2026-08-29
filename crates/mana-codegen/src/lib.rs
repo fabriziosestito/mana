@@ -1668,12 +1668,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Expr::Case { arg, clauses } => {
                 let vals = self.compile_case_arg(f, arg, clauses, scope)?;
                 let merge = self.ctx.append_basic_block(f, "case.merge");
-                let mut incoming: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
-                self.compile_case(f, &vals, clauses, scope, Some((merge, &mut incoming)))?;
+                let mut incoming: Vec<(Vec<IntValue<'ctx>>, BasicBlock<'ctx>)> = Vec::new();
+                self.compile_case(f, &vals, clauses, scope, Some((merge, &mut incoming, 1)))?;
                 self.builder.position_at_end(merge);
                 let phi = self.builder.build_phi(self.i64t, "case.val").map_err(be)?;
                 for (v, bb) in &incoming {
-                    phi.add_incoming(&[(v, *bb)]);
+                    phi.add_incoming(&[(&v[0], *bb)]);
                 }
                 Ok(phi.as_basic_value().into_int_value())
             }
@@ -2492,9 +2492,32 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     fn compile_literal(&self, l: &Literal) -> CgResult<IntValue<'ctx>> {
         match l {
             Literal::Int(n) => Ok(self.small_int(*n)),
-            Literal::Big(_) => {
-                Err("TODO(bignum): integer literal exceeds 61 bits outside a bitstring segment"
-                    .into())
+            Literal::Big(d) => {
+                // an inert interned big-literal term: orders/compares/
+                // prints correctly; arithmetic on it is badarith at runtime
+                // (TODO(bignum)). Decimal's pow10 tables and >=-guards work.
+                let ptr = self.static_bytes(d.as_bytes())?;
+                let callee = self.rt_fn("mana_rt_big_literal", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            ptr.into(),
+                            self.i64t.const_int(d.len() as u64, false).into(),
+                        ],
+                        "biglit",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
             }
             Literal::Atom(a) => self.atom_term(a),
             Literal::Nil => Ok(self.nil()),
@@ -2571,6 +2594,21 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
                 Ok(())
             }
+            (_, Expr::Case { arg: carg, clauses }) => {
+                let vs = self.compile_case_values(f, carg, clauses, scope, vars.len())?;
+                for (var, v) in vars.iter().zip(vs) {
+                    self.bind_var(scope, var, v)?;
+                }
+                Ok(())
+            }
+            (_, Expr::Let { vars: iv, arg: ia, body }) => {
+                self.bind_let(f, iv, ia, scope)?;
+                self.bind_let(f, vars, body, scope)
+            }
+            (_, Expr::Do(a, b)) => {
+                self.compile_value(f, a, scope)?;
+                self.bind_let(f, vars, b, scope)
+            }
             _ => Err("multi-value let from a non-values expression is not supported".into()),
         }
     }
@@ -2613,7 +2651,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         vals: &CaseVals<'ctx>,
         clauses: &[Clause],
         scope: &Scope<'ctx>,
-        mut merge: Option<(BasicBlock<'ctx>, &mut Vec<(IntValue<'ctx>, BasicBlock<'ctx>)>)>,
+        mut merge: Option<(
+            BasicBlock<'ctx>,
+            &mut Vec<(Vec<IntValue<'ctx>>, BasicBlock<'ctx>)>,
+            usize,
+        )>,
     ) -> CgResult<()> {
         let fail_bb = self.ctx.append_basic_block(f, "case.nomatch");
         let mut next = self.ctx.append_basic_block(f, "clause0");
@@ -2662,10 +2704,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             match merge {
                 None => self.compile_tail(f, &clause.body, &mut cscope)?,
-                Some((merge_bb, ref mut incoming)) => {
-                    let v = self.compile_value(f, &clause.body, &mut cscope)?;
+                Some((merge_bb, ref mut incoming, nvals)) => {
+                    let vs =
+                        self.compile_body_values(f, &clause.body, &mut cscope, nvals)?;
                     let cur = self.builder.get_insert_block().unwrap();
-                    incoming.push((v, cur));
+                    incoming.push((vs, cur));
                     self.builder
                         .build_unconditional_branch(merge_bb)
                         .map_err(be)?;
@@ -2693,6 +2736,86 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
+    /// A clause body producing `nvals` values (Core Erlang `<a, b>` bodies
+    /// under multi-value lets). nvals == 1 accepts any expression; multi
+    /// accepts Values plus Let/Do/Case wrappers around them.
+    fn compile_body_values(
+        &self,
+        f: FunctionValue<'ctx>,
+        body: &Expr,
+        scope: &mut Scope<'ctx>,
+        nvals: usize,
+    ) -> CgResult<Vec<IntValue<'ctx>>> {
+        if nvals == 1 {
+            return Ok(vec![self.compile_value(f, body, scope)?]);
+        }
+        match body {
+            Expr::Values(es) if es.len() == nvals => es
+                .iter()
+                .map(|e| self.compile_value(f, e, scope))
+                .collect(),
+            Expr::Let { vars, arg, body } => {
+                self.bind_let(f, vars, arg, scope)?;
+                self.compile_body_values(f, body, scope, nvals)
+            }
+            Expr::Do(a, b) => {
+                self.compile_value(f, a, scope)?;
+                self.compile_body_values(f, b, scope, nvals)
+            }
+            Expr::Case { arg, clauses } => {
+                Ok(self.compile_case_values(f, arg, clauses, scope, nvals)?)
+            }
+            // raising bodies produce no values; the phi inputs are dead
+            Expr::PrimOp { name, args } if is_raise(name) => {
+                self.compile_raise(f, name, args, scope)?;
+                Ok(vec![self.i64t.get_undef(); nvals])
+            }
+            Expr::Call { module, name, args }
+                if module == "erlang"
+                    && matches!(
+                        (name.as_str(), args.len()),
+                        ("error", 1) | ("error", 2) | ("error", 3) | ("exit", 1)
+                            | ("throw", 1)
+                    ) =>
+            {
+                self.compile_raise(f, name, &args[..1.max(args.len().min(2))], scope)?;
+                Ok(vec![self.i64t.get_undef(); nvals])
+            }
+            other => Err(format!(
+                "multi-value body shape not supported ({} values): {:.60?}",
+                nvals, other
+            )),
+        }
+    }
+
+    /// A case in value position yielding `nvals` values via N phis.
+    fn compile_case_values(
+        &self,
+        f: FunctionValue<'ctx>,
+        arg: &Expr,
+        clauses: &[Clause],
+        scope: &mut Scope<'ctx>,
+        nvals: usize,
+    ) -> CgResult<Vec<IntValue<'ctx>>> {
+        let vals = self.compile_case_arg(f, arg, clauses, scope)?;
+        let merge = self.ctx.append_basic_block(f, "mcase.merge");
+        let mut incoming: Vec<(Vec<IntValue<'ctx>>, BasicBlock<'ctx>)> = Vec::new();
+        self.compile_case(f, &vals, clauses, scope, Some((merge, &mut incoming, nvals)))?;
+        self.builder.position_at_end(merge);
+        let mut out = Vec::with_capacity(nvals);
+        for i in 0..nvals {
+            let phi = self
+                .builder
+                .build_phi(self.i64t, &format!("mcase.v{}", i))
+                .map_err(be)?;
+            for (vs, bb) in &incoming {
+                phi.add_incoming(&[(&vs[i], *bb)]);
+            }
+            out.push(phi.as_basic_value().into_int_value());
+        }
+        Ok(out)
+    }
+
     /// Emit tests for `pat` against `val`, branching to `fail` on mismatch.
     /// Patterns don't allocate — EXCEPT binary patterns with binary-type
     /// segments, which build sub-binaries (GC points). Wherever a sub-pattern
@@ -2713,6 +2836,31 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Pattern::Alias(v, inner) => {
                 self.bind_var(scope, v, val)?;
                 self.match_pattern(f, val, inner, scope, fail)
+            }
+            Pattern::Lit(l @ Literal::Big(_)) => {
+                // interned big-literal terms have pointer identity, but a
+                // matching value may also arrive via ==-equal biglit from
+                // another intern site — compare exactly
+                let expect = self.compile_literal(l)?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_tt_i64("mana_rt_eq_exact"),
+                        &[val.into(), expect.into()],
+                        "bigpat",
+                    )
+                    .map_err(be)?;
+                let e = call_result(call)?.into_int_value();
+                let ok = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        e,
+                        self.i64t.const_zero(),
+                        "bigpat.ok",
+                    )
+                    .map_err(be)?;
+                self.branch_test(f, ok, fail)
             }
             Pattern::Lit(Literal::Float(x)) => {
                 let call = self
@@ -5907,6 +6055,30 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("size", 1) => self.map_size_of(f, argv[0]),
+            ("iterator", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_map_iterator"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "miter",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("next", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_map_next"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "mnext",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("keys", 1) | ("values", 1) => {
                 let callee = self.rt_fn("mana_rt_map_keys", || {
                     self.i64t.fn_type(
@@ -6889,7 +7061,7 @@ fn expr_may_gc(
                 && matches!(
                     name.as_str(),
                     "put" | "remove" | "merge" | "from_list" | "to_list" | "find"
-                        | "fold" | "keys" | "values"
+                        | "fold" | "keys" | "values" | "iterator" | "next"
                 )
             {
                 return true;

@@ -8,7 +8,9 @@ defmodule ManaConformance.MixProject do
       elixir: "~> 1.14",
       elixirc_options: [debug_info: true],
       deps: [
-        {:mana, path: "../../hex/mana"}
+        {:mana, path: "../../hex/mana"},
+        # the pure Ecto layer (schema/changeset/type) — no adapters
+        {:ecto, "~> 3.13"}
       ]
     ]
   end
