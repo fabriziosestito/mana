@@ -10,7 +10,9 @@ defmodule ManaConformance.MixProject do
       deps: [
         {:mana, path: "../../hex/mana"},
         # the pure Ecto layer (schema/changeset/type) — no adapters
-        {:ecto, "~> 3.13"}
+        {:ecto, "~> 3.13"},
+        # the web stack: bandit pulls thousand_island + plug + friends
+        {:bandit, "~> 1.11"}
       ]
     ]
   end
