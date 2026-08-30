@@ -10,7 +10,8 @@ defmodule Benchmarks.MixProject do
       deps: [
         {:mana, path: "../hex/mana"},
         {:benchee, "~> 1.1"},
-        {:ecto, "~> 3.13"}
+        {:ecto, "~> 3.13"},
+      {:bandit, "~> 1.11"}
       ]
     ]
   end
