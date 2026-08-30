@@ -554,6 +554,7 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
         }
         park_if_stw(ctx);
         drain_timer_deliveries(ctx);
+        drain_io_wakes(ctx);
 
         let pid = ctx
             .run_q
@@ -2572,6 +2573,211 @@ fn timer_thread() {
                     guard = TIMER_CV.wait(guard).unwrap();
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// io reactor (mio) — sockets only; files are direct syscalls (TODO(io-pool)).
+//
+// Same discipline as the timer thread: the reactor is OUTSIDE the STW
+// protocol and never mutates process/scheduler state. It pushes (pid, sock,
+// kind) wake tokens to IO_WAKES and pokes the scheduler condvars; schedulers
+// drain at their loop top — a safepoint. Blocking syscalls MUST NOT run on
+// scheduler threads (the STW requester waits for every scheduler to reach a
+// safepoint — a blocked syscall deadlocks GC). Sockets are nonblocking:
+// scheduler threads only ever issue nonblocking syscalls and park the
+// process on WouldBlock.
+//
+// Wake protocol (no lost wakeups): a parker first writes itself into the
+// socket entry's waiter slot, ensures the socket is registered, retries the
+// syscall, and only then parks (Waiting + suspend). The reactor takes the
+// waiter and pushes a wake. If the wake arrives while the parker is still
+// Running (the tiny pre-suspend window), drain_io_wakes re-pushes the token
+// as long as the waiter slot still names that pid — it converges as soon as
+// the parker either suspends (flip succeeds) or completes and clears the
+// slot (token dropped as stale).
+
+enum SockSource {
+    Listener(mio::net::TcpListener),
+    Stream(mio::net::TcpStream),
+}
+
+/// {active, false | once | true}
+#[derive(Clone, Copy, PartialEq)]
+enum ActiveMode {
+    Passive,
+    Once,
+    Always,
+}
+
+struct SockEntry {
+    source: SockSource,
+    /// pid parked waiting for readability (recv/accept), if any
+    read_waiter: Option<usize>,
+    /// pid parked waiting for writability (send/connect), if any
+    write_waiter: Option<usize>,
+    /// registered with the reactor's poll (edge-triggered readiness is
+    /// re-armed by the kernel on new activity, and parkers only park after
+    /// WouldBlock, so edges are never missed)
+    registered: bool,
+    owner: usize,
+    active: ActiveMode,
+    /// binary (true) vs charlist (false) delivery
+    binary: bool,
+}
+
+struct SocketTable {
+    slots: Vec<Option<SockEntry>>,
+    free: Vec<usize>,
+}
+
+impl SocketTable {
+    fn insert(&mut self, e: SockEntry) -> usize {
+        match self.free.pop() {
+            Some(i) => {
+                self.slots[i] = Some(e);
+                i
+            }
+            None => {
+                self.slots.push(Some(e));
+                self.slots.len() - 1
+            }
+        }
+    }
+}
+
+static SOCKETS: std::sync::Mutex<SocketTable> = std::sync::Mutex::new(SocketTable {
+    slots: Vec::new(),
+    free: Vec::new(),
+});
+
+/// (pid, socket idx, wanted-read) wake tokens from the reactor thread.
+static IO_WAKES: SegQueue<(usize, usize, bool)> = SegQueue::new();
+/// socket indices whose sources the reactor should register with its poll.
+static REACTOR_CMDS: SegQueue<usize> = SegQueue::new();
+static REACTOR_WAKER: std::sync::OnceLock<mio::Waker> = std::sync::OnceLock::new();
+static REACTOR_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+const REACTOR_WAKE_TOKEN: mio::Token = mio::Token(usize::MAX);
+
+fn ensure_reactor(g: &'static Global) {
+    if REACTOR_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("mana-reactor".into())
+        .spawn(move || reactor_thread(g))
+        .expect("reactor thread");
+    // wait for the waker to exist so callers can always poke the reactor
+    while REACTOR_WAKER.get().is_none() {
+        std::thread::yield_now();
+    }
+}
+
+fn reactor_wake() {
+    if let Some(w) = REACTOR_WAKER.get() {
+        let _ = w.wake();
+    }
+}
+
+fn reactor_thread(g: &'static Global) {
+    let mut poll = mio::Poll::new().expect("mio poll");
+    let waker = mio::Waker::new(poll.registry(), REACTOR_WAKE_TOKEN).expect("mio waker");
+    REACTOR_WAKER.set(waker).ok();
+    let mut events = mio::Events::with_capacity(256);
+    loop {
+        // (re)register sources requested since the last pass
+        while let Some(idx) = REACTOR_CMDS.pop() {
+            let mut tab = SOCKETS.lock().unwrap();
+            let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                continue; // closed before we got to it
+            };
+            let interests = mio::Interest::READABLE | mio::Interest::WRITABLE;
+            let res = match &mut entry.source {
+                SockSource::Listener(l) => {
+                    poll.registry().register(l, mio::Token(idx), interests)
+                }
+                SockSource::Stream(s) => {
+                    poll.registry().register(s, mio::Token(idx), interests)
+                }
+            };
+            let _ = res; // AlreadyExists on a duplicate request is fine
+        }
+        if poll.poll(&mut events, None).is_err() {
+            continue; // EINTR
+        }
+        let mut woke = false;
+        for ev in events.iter() {
+            if ev.token() == REACTOR_WAKE_TOKEN {
+                continue; // command pass runs at loop top
+            }
+            let idx = ev.token().0;
+            let mut tab = SOCKETS.lock().unwrap();
+            let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                continue;
+            };
+            let closed = ev.is_read_closed() || ev.is_write_closed() || ev.is_error();
+            if ev.is_readable() || closed {
+                if let Some(pid) = entry.read_waiter.take() {
+                    IO_WAKES.push((pid, idx, true));
+                    woke = true;
+                }
+            }
+            if ev.is_writable() || closed {
+                if let Some(pid) = entry.write_waiter.take() {
+                    IO_WAKES.push((pid, idx, false));
+                    woke = true;
+                }
+            }
+        }
+        if woke {
+            for s in 0..g.n_scheds {
+                wake_sched(g, s);
+            }
+        }
+    }
+}
+
+/// Scheduler-side drain (loop-top safepoint, like timer deliveries).
+/// Wake-only: no mailbox message — the woken BIF retries its nonblocking
+/// syscall.
+fn drain_io_wakes(ctx: &mut ProcCtx) {
+    let global = ctx.global;
+    let n = IO_WAKES.len();
+    for _ in 0..n {
+        let Some((pid, idx, is_read)) = IO_WAKES.pop() else { break };
+        let Some(cell) = proc_ref(global, pid) else {
+            continue;
+        };
+        let p = unsafe { &*cell.0.get() };
+        let mut st = p.state.lock();
+        if matches!(*st, PState::Waiting(_)) {
+            *st = PState::Runnable;
+            drop(st);
+            if p.home == ctx.sched_id {
+                ctx.run_q.push_back(pid);
+            } else {
+                global.scheds[p.home].inject.push(pid);
+                wake_sched(global, p.home);
+            }
+            continue;
+        }
+        drop(st);
+        // parker not suspended yet: keep the token alive while the waiter
+        // slot still names it; drop once the op completed (stale wake)
+        let tab = SOCKETS.lock().unwrap();
+        let still_waiting = tab.slots.get(idx).and_then(|s| s.as_ref()).is_some_and(|e| {
+            if is_read {
+                e.read_waiter == Some(pid)
+            } else {
+                e.write_waiter == Some(pid)
+            }
+        });
+        drop(tab);
+        if still_waiting {
+            IO_WAKES.push((pid, idx, is_read));
         }
     }
 }
