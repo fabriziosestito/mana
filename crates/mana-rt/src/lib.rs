@@ -2625,6 +2625,8 @@ struct SockEntry {
     active: ActiveMode,
     /// binary (true) vs charlist (false) delivery
     binary: bool,
+    /// passive-recv buffer (exact-length recv accumulates here)
+    rbuf: Vec<u8>,
 }
 
 struct SocketTable {
@@ -3360,6 +3362,727 @@ impl FileTable {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// gen_tcp / inet (native cut: OTP's inet stack is never compiled)
+//
+// All syscalls are NONBLOCKING and run on the scheduler thread; WouldBlock
+// parks the process (Waiting) after arming a waiter slot + reactor
+// registration, and the reactor wakes it via IO_WAKES (see the reactor
+// section for the lost-wakeup protocol). All term arguments are converted
+// to native values BEFORE any park: a suspended coroutine's Rust locals are
+// not GC roots, so term pointers must never be used across a suspend.
+
+fn sock_handle(ctx: &mut ProcCtx, idx: usize) -> u64 {
+    let p = alloc_nursery(ctx, 3);
+    unsafe {
+        *p = (2 << 8) | KIND_TUPLE;
+        *p.add(1) = atom_intern(b"mana_socket");
+        *p.add(2) = ((idx as u64) << 3) | TAG_SMALL;
+    }
+    p as u64
+}
+
+fn sock_resolve(t: u64) -> Option<usize> {
+    if t & TAG_MASK != TAG_BOXED || t == 0 {
+        return None;
+    }
+    unsafe {
+        let p = t as *const u64;
+        if *p != (2 << 8) | KIND_TUPLE {
+            return None;
+        }
+        let tag = *p.add(1);
+        if tag & TAG_MASK != TAG_ATOM || atom_bytes(tag) != b"mana_socket" {
+            return None;
+        }
+        let idx = *p.add(2);
+        if idx & TAG_MASK != TAG_SMALL {
+            return None;
+        }
+        Some((idx as i64 >> 3) as usize)
+    }
+}
+
+/// Options both connect/listen accept; active semantics land in Phase D.
+#[derive(Clone, Copy)]
+struct TcpOpts {
+    binary: bool,
+    active: ActiveMode,
+}
+
+fn parse_tcp_opts(mut cur: u64) -> Result<TcpOpts, ()> {
+    let mut o = TcpOpts { binary: false, active: ActiveMode::Always };
+    while cur & TAG_MASK == TAG_CONS {
+        let p = (cur & !TAG_MASK) as *const u64;
+        let h = unsafe { *p };
+        if h & TAG_MASK == TAG_ATOM {
+            match atom_bytes(h) {
+                b"binary" => o.binary = true,
+                b"list" => o.binary = false,
+                _ => {} // reuseaddr etc. accepted as bare atoms too
+            }
+        } else if h & TAG_MASK == TAG_BOXED && h != 0 {
+            unsafe {
+                let t = h as *const u64;
+                if *t == (2 << 8) | KIND_TUPLE && *t.add(1) & TAG_MASK == TAG_ATOM {
+                    let v = *t.add(2);
+                    match atom_bytes(*t.add(1)) {
+                        b"active" => {
+                            o.active = if v & TAG_MASK == TAG_ATOM {
+                                match atom_bytes(v) {
+                                    b"false" => ActiveMode::Passive,
+                                    b"once" => ActiveMode::Once,
+                                    b"true" => ActiveMode::Always,
+                                    _ => return Err(()),
+                                }
+                            } else {
+                                return Err(());
+                            }
+                        }
+                        b"packet" => {
+                            // raw/0 only — TODO(packet)
+                            let raw = (v & TAG_MASK == TAG_SMALL && v >> 3 == 0)
+                                || (v & TAG_MASK == TAG_ATOM
+                                    && matches!(atom_bytes(v), b"raw" | b"0"));
+                            if !raw {
+                                return Err(());
+                            }
+                        }
+                        // reuseaddr/backlog/nodelay/mode etc: accepted
+                        _ => {}
+                    }
+                }
+            }
+        }
+        cur = unsafe { *p.add(1) };
+    }
+    Ok(o)
+}
+
+/// {A,B,C,D} tuple | binary | charlist | atom 'localhost' → IpAddr.
+fn ip_of(t: u64) -> Result<std::net::IpAddr, ()> {
+    use std::net::{IpAddr, Ipv4Addr};
+    if t & TAG_MASK == TAG_BOXED && t != 0 {
+        unsafe {
+            let p = t as *const u64;
+            if *p == (4 << 8) | KIND_TUPLE {
+                let mut o = [0u8; 4];
+                for (i, b) in o.iter_mut().enumerate() {
+                    let v = *p.add(1 + i);
+                    if v & TAG_MASK != TAG_SMALL {
+                        return Err(());
+                    }
+                    let v = v as i64 >> 3;
+                    if !(0..=255).contains(&v) {
+                        return Err(());
+                    }
+                    *b = v as u8;
+                }
+                return Ok(IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3])));
+            }
+        }
+    }
+    // hostname as chardata/atom: numeric or localhost only stays
+    // nonblocking; general getaddrinfo blocks (documented)
+    let mut bytes = Vec::new();
+    if t & TAG_MASK == TAG_ATOM {
+        bytes.extend_from_slice(atom_bytes(t));
+    } else if chardata_flatten(t, &mut bytes).is_err() {
+        return Err(());
+    }
+    let s = std::str::from_utf8(&bytes).map_err(|_| ())?;
+    if s == "localhost" {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+    s.parse().map_err(|_| ())
+}
+
+fn timeout_deadline(t: u64) -> Result<Option<std::time::Instant>, ()> {
+    if t & TAG_MASK == TAG_ATOM && atom_bytes(t) == b"infinity" {
+        return Ok(None);
+    }
+    if t & TAG_MASK == TAG_SMALL && (t as i64 >> 3) >= 0 {
+        let ms = (t as i64 >> 3) as u64;
+        return Ok(Some(std::time::Instant::now() + std::time::Duration::from_millis(ms)));
+    }
+    Err(())
+}
+
+fn closed_err(ctx: &mut ProcCtx) -> u64 {
+    pair_term(ctx, b"error", atom_intern(b"closed"))
+}
+
+/// Arm the read/write waiter + registration, then park until the reactor
+/// (or the deadline via idle_wait) wakes us. Returns false on timeout.
+/// The SOCKETS lock must NOT be held by the caller.
+fn park_on_socket(
+    ctx: &mut ProcCtx,
+    idx: usize,
+    want_read: bool,
+    deadline: Option<std::time::Instant>,
+) -> bool {
+    let pid = ctx.current;
+    {
+        let mut tab = SOCKETS.lock().unwrap();
+        let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+            return true; // closed under us: let the caller's retry observe it
+        };
+        if want_read {
+            entry.read_waiter = Some(pid);
+        } else {
+            entry.write_waiter = Some(pid);
+        }
+        if !entry.registered {
+            entry.registered = true;
+            REACTOR_CMDS.push(idx);
+        }
+    }
+    ensure_reactor(ctx.global);
+    reactor_wake();
+    if let Some(dl) = deadline {
+        if std::time::Instant::now() >= dl {
+            clear_waiter(idx, pid, want_read);
+            return false;
+        }
+    }
+    {
+        let p = cur_proc(ctx);
+        *p.state.lock() = PState::Waiting(deadline);
+    }
+    suspend_current(ctx);
+    if let Some(dl) = deadline {
+        if std::time::Instant::now() >= dl {
+            clear_waiter(idx, pid, want_read);
+            return false;
+        }
+    }
+    true
+}
+
+fn clear_waiter(idx: usize, pid: usize, want_read: bool) {
+    let mut tab = SOCKETS.lock().unwrap();
+    if let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) {
+        if want_read && entry.read_waiter == Some(pid) {
+            entry.read_waiter = None;
+        }
+        if !want_read && entry.write_waiter == Some(pid) {
+            entry.write_waiter = None;
+        }
+    }
+}
+
+// tcp op codes (codegen compile dispatch mirrors these)
+pub const T_CONNECT: u64 = 0;
+pub const T_LISTEN: u64 = 1;
+pub const T_ACCEPT: u64 = 2;
+pub const T_RECV: u64 = 3;
+pub const T_SEND: u64 = 4;
+pub const T_CLOSE: u64 = 5;
+pub const T_SHUTDOWN: u64 = 6;
+pub const T_SETOPTS: u64 = 7;
+pub const T_PEERNAME: u64 = 8;
+pub const T_SOCKNAME: u64 = 9;
+pub const T_PORT: u64 = 10;
+
+fn addr_tuple(ctx: &mut ProcCtx, addr: std::net::SocketAddr) -> u64 {
+    let small = |v: i64| ((v << 3) as u64) | TAG_SMALL;
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(_) => [0, 0, 0, 0], // TODO(ipv6)
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let a = alloc_nursery(ctx, 5);
+    unsafe {
+        *a = (4 << 8) | KIND_TUPLE;
+        for (i, o) in ip.iter().enumerate() {
+            *a.add(1 + i) = small(*o as i64);
+        }
+    }
+    fr[2] = a as u64;
+    let pair = alloc_nursery(ctx, 3);
+    unsafe {
+        *pair = (2 << 8) | KIND_TUPLE;
+        *pair.add(1) = fr[2];
+        *pair.add(2) = small(addr.port() as i64);
+    }
+    ctx.roots_head = saved;
+    pair as u64
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_tcp(
+    ctx: *mut ProcCtx,
+    op: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+) -> u64 {
+    use std::io::{Read, Write};
+    let ctx = unsafe { &mut *ctx };
+    match op {
+        T_CONNECT => {
+            // a=addr, b=port, c=opts, d=timeout
+            let Ok(ip) = ip_of(a) else { return raise_badarg(ctx) };
+            if b & TAG_MASK != TAG_SMALL {
+                return raise_badarg(ctx);
+            }
+            let port = (b as i64 >> 3) as u16;
+            let Ok(opts) = parse_tcp_opts(c) else { return raise_badarg(ctx) };
+            let Ok(deadline) = timeout_deadline(d) else { return raise_badarg(ctx) };
+            let addr = std::net::SocketAddr::new(ip, port);
+            let stream = match mio::net::TcpStream::connect(addr) {
+                Ok(s) => s,
+                Err(e) => return err_tuple(ctx, &e),
+            };
+            let idx = SOCKETS.lock().unwrap().insert(SockEntry {
+                source: SockSource::Stream(stream),
+                read_waiter: None,
+                write_waiter: None,
+                registered: false,
+                owner: ctx.current,
+                active: opts.active,
+                binary: opts.binary,
+                rbuf: Vec::new(),
+            });
+            // wait for writability, then check SO_ERROR
+            loop {
+                {
+                    let mut tab = SOCKETS.lock().unwrap();
+                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
+                    else {
+                        drop(tab);
+                        return closed_err(ctx);
+                    };
+                    let SockSource::Stream(s) = &mut entry.source else {
+                        drop(tab);
+                        return raise_badarg(ctx);
+                    };
+                    match s.peer_addr() {
+                        Ok(_) => {
+                            drop(tab);
+                            let h = sock_handle(ctx, idx);
+                            return pair_term(ctx, b"ok", h);
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::NotConnected
+                                || e.raw_os_error() == Some(libc_einprogress()) =>
+                        {
+                            // a refused connect also reports NotConnected
+                            // from peer_addr — the verdict lives in SO_ERROR
+                            if let Ok(Some(err)) = s.take_error() {
+                                tab.slots[idx] = None;
+                                tab.free.push(idx);
+                                drop(tab);
+                                return pair_term(
+                                    ctx,
+                                    b"error",
+                                    if err.raw_os_error() == Some(111) {
+                                        atom_intern(b"econnrefused")
+                                    } else {
+                                        posix_atom(&err)
+                                    },
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            let e = s
+                                .take_error()
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| {
+                                    std::io::Error::from(std::io::ErrorKind::Other)
+                                });
+                            tab.slots[idx] = None;
+                            tab.free.push(idx);
+                            drop(tab);
+                            return pair_term(
+                                ctx,
+                                b"error",
+                                if e.raw_os_error() == Some(111) {
+                                    atom_intern(b"econnrefused")
+                                } else {
+                                    posix_atom(&e)
+                                },
+                            );
+                        }
+                    }
+                }
+                if !park_on_socket(ctx, idx, false, deadline) {
+                    let mut tab = SOCKETS.lock().unwrap();
+                    tab.slots[idx] = None;
+                    tab.free.push(idx);
+                    drop(tab);
+                    return pair_term(ctx, b"error", atom_intern(b"timeout"));
+                }
+            }
+        }
+        T_LISTEN => {
+            // a=port, b=opts
+            if a & TAG_MASK != TAG_SMALL {
+                return raise_badarg(ctx);
+            }
+            let port = (a as i64 >> 3) as u16;
+            let Ok(opts) = parse_tcp_opts(b) else { return raise_badarg(ctx) };
+            let addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                port,
+            );
+            match mio::net::TcpListener::bind(addr) {
+                Ok(l) => {
+                    let idx = SOCKETS.lock().unwrap().insert(SockEntry {
+                        source: SockSource::Listener(l),
+                        read_waiter: None,
+                        write_waiter: None,
+                        registered: false,
+                        owner: ctx.current,
+                        active: opts.active,
+                        binary: opts.binary,
+                        rbuf: Vec::new(),
+                    });
+                    let h = sock_handle(ctx, idx);
+                    pair_term(ctx, b"ok", h)
+                }
+                Err(e) => err_tuple(ctx, &e),
+            }
+        }
+        T_ACCEPT => {
+            // a=lsock, b=timeout
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Ok(deadline) = timeout_deadline(b) else { return raise_badarg(ctx) };
+            loop {
+                let accepted = {
+                    let mut tab = SOCKETS.lock().unwrap();
+                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
+                    else {
+                        drop(tab);
+                        return closed_err(ctx);
+                    };
+                    let opts = TcpOpts { binary: entry.binary, active: entry.active };
+                    let SockSource::Listener(l) = &mut entry.source else {
+                        drop(tab);
+                        return raise_badarg(ctx);
+                    };
+                    match l.accept() {
+                        Ok((stream, _)) => {
+                            let owner = ctx.current;
+                            let i = tab.insert(SockEntry {
+                                source: SockSource::Stream(stream),
+                                read_waiter: None,
+                                write_waiter: None,
+                                registered: false,
+                                owner,
+                                active: opts.active,
+                                binary: opts.binary,
+                                rbuf: Vec::new(),
+                            });
+                            Some(Ok(i))
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                };
+                match accepted {
+                    Some(Ok(i)) => {
+                        clear_waiter(idx, ctx.current, true);
+                        let h = sock_handle(ctx, i);
+                        return pair_term(ctx, b"ok", h);
+                    }
+                    Some(Err(e)) => {
+                        clear_waiter(idx, ctx.current, true);
+                        return err_tuple(ctx, &e);
+                    }
+                    None => {
+                        if !park_on_socket(ctx, idx, true, deadline) {
+                            return pair_term(ctx, b"error", atom_intern(b"timeout"));
+                        }
+                    }
+                }
+            }
+        }
+        T_RECV => {
+            // a=sock, b=len, c=timeout
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            if b & TAG_MASK != TAG_SMALL || (b as i64 >> 3) < 0 {
+                return raise_badarg(ctx);
+            }
+            let want = (b as i64 >> 3) as usize;
+            let Ok(deadline) = timeout_deadline(c) else { return raise_badarg(ctx) };
+            let mut chunk = vec![0u8; 65536];
+            loop {
+                enum Step {
+                    Done(Vec<u8>, bool),
+                    Closed(bool),
+                    Park,
+                    Err(std::io::Error),
+                }
+                let step = {
+                    let mut tab = SOCKETS.lock().unwrap();
+                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
+                    else {
+                        drop(tab);
+                        return closed_err(ctx);
+                    };
+                    let binary = entry.binary;
+                    // enough buffered already?
+                    if want > 0 && entry.rbuf.len() >= want {
+                        let rest = entry.rbuf.split_off(want);
+                        let data = std::mem::replace(&mut entry.rbuf, rest);
+                        Step::Done(data, binary)
+                    } else if want == 0 && !entry.rbuf.is_empty() {
+                        let data = std::mem::take(&mut entry.rbuf);
+                        Step::Done(data, binary)
+                    } else {
+                        let SockSource::Stream(s) = &mut entry.source else {
+                            drop(tab);
+                            return raise_badarg(ctx);
+                        };
+                        match s.read(&mut chunk) {
+                            Ok(0) => Step::Closed(binary),
+                            Ok(k) => {
+                                entry.rbuf.extend_from_slice(&chunk[..k]);
+                                if want == 0 || entry.rbuf.len() >= want {
+                                    let take = if want == 0 {
+                                        entry.rbuf.len()
+                                    } else {
+                                        want
+                                    };
+                                    let rest = entry.rbuf.split_off(take);
+                                    let data =
+                                        std::mem::replace(&mut entry.rbuf, rest);
+                                    Step::Done(data, binary)
+                                } else {
+                                    Step::Park
+                                }
+                            }
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind()
+                                        == std::io::ErrorKind::Interrupted =>
+                            {
+                                Step::Park
+                            }
+                            Err(e) => Step::Err(e),
+                        }
+                    }
+                };
+                match step {
+                    Step::Done(data, binary) => {
+                        clear_waiter(idx, ctx.current, true);
+                        let term = if binary {
+                            bytes_to_new_bin(ctx, &data)
+                        } else {
+                            bytes_to_byte_list(ctx, &data)
+                        };
+                        return pair_term(ctx, b"ok", term);
+                    }
+                    Step::Closed(_) => {
+                        clear_waiter(idx, ctx.current, true);
+                        return closed_err(ctx);
+                    }
+                    Step::Err(e) => {
+                        clear_waiter(idx, ctx.current, true);
+                        return err_tuple(ctx, &e);
+                    }
+                    Step::Park => {
+                        if !park_on_socket(ctx, idx, true, deadline) {
+                            return pair_term(ctx, b"error", atom_intern(b"timeout"));
+                        }
+                    }
+                }
+            }
+        }
+        T_SEND => {
+            // a=sock, b=iodata
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let mut data = Vec::new();
+            if iolist_flatten(b, &mut data).is_err() {
+                return raise_badarg(ctx);
+            }
+            let mut off = 0usize;
+            loop {
+                let step: Result<Option<usize>, std::io::Error> = {
+                    let mut tab = SOCKETS.lock().unwrap();
+                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
+                    else {
+                        drop(tab);
+                        return closed_err(ctx);
+                    };
+                    let SockSource::Stream(s) = &mut entry.source else {
+                        drop(tab);
+                        return raise_badarg(ctx);
+                    };
+                    match s.write(&data[off..]) {
+                        Ok(k) => Ok(Some(k)),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::Interrupted =>
+                        {
+                            Ok(None)
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                match step {
+                    Ok(Some(k)) => {
+                        off += k;
+                        if off == data.len() {
+                            clear_waiter(idx, ctx.current, false);
+                            return atom_intern(b"ok");
+                        }
+                    }
+                    Ok(None) => {
+                        park_on_socket(ctx, idx, false, None);
+                    }
+                    Err(e) => {
+                        clear_waiter(idx, ctx.current, false);
+                        if e.kind() == std::io::ErrorKind::BrokenPipe
+                            || e.kind() == std::io::ErrorKind::ConnectionReset
+                        {
+                            return closed_err(ctx);
+                        }
+                        return err_tuple(ctx, &e);
+                    }
+                }
+            }
+        }
+        T_CLOSE => {
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let entry = {
+                let mut tab = SOCKETS.lock().unwrap();
+                let e = tab.slots.get_mut(idx).and_then(|s| s.take());
+                if e.is_some() {
+                    tab.free.push(idx);
+                }
+                e
+            };
+            if let Some(e) = entry {
+                // waiters retry, observe the missing entry → {error, closed}
+                if let Some(pid) = e.read_waiter {
+                    IO_WAKES.push((pid, idx, true));
+                }
+                if let Some(pid) = e.write_waiter {
+                    IO_WAKES.push((pid, idx, false));
+                }
+                for s in 0..ctx.global.n_scheds {
+                    wake_sched(ctx.global, s);
+                }
+                // dropping the source closes the fd (epoll auto-deregisters)
+            }
+            atom_intern(b"ok")
+        }
+        T_SHUTDOWN => {
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let how = if b & TAG_MASK == TAG_ATOM {
+                match atom_bytes(b) {
+                    b"read" => std::net::Shutdown::Read,
+                    b"write" => std::net::Shutdown::Write,
+                    b"read_write" => std::net::Shutdown::Both,
+                    _ => return raise_badarg(ctx),
+                }
+            } else {
+                return raise_badarg(ctx);
+            };
+            let mut tab = SOCKETS.lock().unwrap();
+            let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                drop(tab);
+                return closed_err(ctx);
+            };
+            let SockSource::Stream(s) = &mut entry.source else {
+                drop(tab);
+                return raise_badarg(ctx);
+            };
+            let res = s.shutdown(how);
+            drop(tab);
+            match res {
+                Ok(()) => atom_intern(b"ok"),
+                Err(e) => err_tuple(ctx, &e),
+            }
+        }
+        T_SETOPTS => {
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Ok(opts) = parse_tcp_opts(b) else { return raise_badarg(ctx) };
+            let has_mode_opt = |mut cur: u64, name: &[u8]| -> bool {
+                while cur & TAG_MASK == TAG_CONS {
+                    let p = (cur & !TAG_MASK) as *const u64;
+                    let h = unsafe { *p };
+                    if h & TAG_MASK == TAG_ATOM && atom_bytes(h) == name {
+                        return true;
+                    }
+                    if h & TAG_MASK == TAG_BOXED && h != 0 {
+                        unsafe {
+                            let t = h as *const u64;
+                            if *t == (2 << 8) | KIND_TUPLE
+                                && *t.add(1) & TAG_MASK == TAG_ATOM
+                                && atom_bytes(*t.add(1)) == name
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    cur = unsafe { *p.add(1) };
+                }
+                false
+            };
+            let mut tab = SOCKETS.lock().unwrap();
+            let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                drop(tab);
+                return closed_err(ctx);
+            };
+            if has_mode_opt(b, b"active") {
+                entry.active = opts.active;
+            }
+            if has_mode_opt(b, b"binary") {
+                entry.binary = true;
+            }
+            if has_mode_opt(b, b"list") {
+                entry.binary = false;
+            }
+            atom_intern(b"ok")
+        }
+        T_PEERNAME | T_SOCKNAME | T_PORT => {
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let addr = {
+                let mut tab = SOCKETS.lock().unwrap();
+                let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
+                else {
+                    drop(tab);
+                    return closed_err(ctx);
+                };
+                match (&entry.source, op) {
+                    (SockSource::Stream(s), T_PEERNAME) => s.peer_addr(),
+                    (SockSource::Stream(s), _) => s.local_addr(),
+                    (SockSource::Listener(_), T_PEERNAME) => {
+                        drop(tab);
+                        return raise_badarg(ctx);
+                    }
+                    (SockSource::Listener(l), _) => l.local_addr(),
+                }
+            };
+            match addr {
+                Ok(sa) => {
+                    if op == T_PORT {
+                        let small = ((sa.port() as i64) << 3) as u64 | TAG_SMALL;
+                        pair_term(ctx, b"ok", small)
+                    } else {
+                        let t = addr_tuple(ctx, sa);
+                        pair_term(ctx, b"ok", t)
+                    }
+                }
+                Err(e) => err_tuple(ctx, &e),
+            }
+        }
+        _ => raise_badarg(ctx),
+    }
+}
+
+fn libc_einprogress() -> i32 {
+    115 // linux EINPROGRESS
 }
 
 /// send_after/start_timer. `wrap != 0` wraps the message as

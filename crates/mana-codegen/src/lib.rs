@@ -3988,6 +3988,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if module == "maps" {
             return self.compile_maps_bif(f, name, args, scope);
         }
+        if module == "gen_tcp" || module == "inet" {
+            return self.compile_tcp_bif(f, module, name, args, scope);
+        }
         if module == "io" {
             return self.compile_io_bif(f, name, args, scope);
         }
@@ -6642,6 +6645,79 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
+    /// gen_tcp/inet cut: everything routes through mana_rt_tcp by opcode.
+    /// recv/accept/connect/send suspend the caller — GC + raise points.
+    fn compile_tcp_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        module: &str,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        // (opcode, arg slots, pad-with-infinity?)
+        let spec: Option<(u64, bool)> = match (module, name, args.len()) {
+            ("gen_tcp", "connect", 3) => Some((0, true)),
+            ("gen_tcp", "connect", 4) => Some((0, false)),
+            ("gen_tcp", "listen", 2) => Some((1, false)),
+            ("gen_tcp", "accept", 1) => Some((2, true)),
+            ("gen_tcp", "accept", 2) => Some((2, false)),
+            ("gen_tcp", "recv", 2) => Some((3, true)),
+            ("gen_tcp", "recv", 3) => Some((3, false)),
+            ("gen_tcp", "send", 2) => Some((4, false)),
+            ("gen_tcp", "close", 1) => Some((5, false)),
+            ("gen_tcp", "shutdown", 2) => Some((6, false)),
+            ("inet", "setopts", 2) => Some((7, false)),
+            ("inet", "peername", 1) => Some((8, false)),
+            ("inet", "sockname", 1) => Some((9, false)),
+            ("inet", "port", 1) => Some((10, false)),
+            _ => None,
+        };
+        let Some((op, pad_infinity)) = spec else {
+            return Err(format!("unsupported BIF {}:{}/{}", module, name, args.len()));
+        };
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let callee = self.rt_fn("mana_rt_tcp", || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        });
+        let infinity = self.atom_term("infinity")?;
+        let zero = self.i64t.const_zero();
+        let mut slots: Vec<IntValue<'ctx>> = argv.clone();
+        if pad_infinity {
+            slots.push(infinity);
+        }
+        while slots.len() < 4 {
+            slots.push(zero);
+        }
+        let call = self
+            .builder
+            .build_call(
+                callee,
+                &[
+                    self.ctx_val().into(),
+                    self.i64t.const_int(op, false).into(),
+                    slots[0].into(),
+                    slots[1].into(),
+                    slots[2].into(),
+                    slots[3].into(),
+                ],
+                "tcpop",
+            )
+            .map_err(be)?;
+        let v = call_result(call)?.into_int_value();
+        self.check_exc(f, v)
+    }
+
     /// The native io cut: stdout only, bypassing OTP's group-leader
     /// io-protocol entirely (io.erl is never compiled).
     fn compile_io_bif(
@@ -7691,6 +7767,7 @@ fn is_bif_module(m: &str) -> bool {
         m,
         "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
             | "logger" | "ets" | "application" | "file" | "math" | "re" | "timer"
+            | "gen_tcp" | "inet"
             | "erts_internal"
             | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
             | "net_kernel"
@@ -7823,7 +7900,7 @@ fn expr_may_raise(
                 "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
                     | "logger" | "ets" | "application" | "file" | "erts_internal"
                     | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
-                    | "net_kernel" | "math" | "re" | "timer"
+                    | "net_kernel" | "math" | "re" | "timer" | "gen_tcp" | "inet"
             ) {
                 return true;
             }
@@ -8071,8 +8148,11 @@ fn expr_may_gc(
                 return true;
             }
             // io:nl allocates its newline binary; unicode/re allocate results;
-            // file allocates result tuples/binaries
-            if matches!(module.as_str(), "io" | "unicode" | "re" | "timer" | "file") {
+            // file/gen_tcp/inet allocate result tuples and may suspend
+            if matches!(
+                module.as_str(),
+                "io" | "unicode" | "re" | "timer" | "file" | "gen_tcp" | "inet"
+            ) {
                 return true;
             }
             let callee_gc = module != "erlang"
