@@ -1113,6 +1113,79 @@ pub extern "C" fn mana_rt_trap_exit(ctx: *mut ProcCtx, flag: u64) -> u64 {
     }
 }
 
+/// erlang:hibernate/3 — discard the (conceptual) stack, wait for a
+/// message, then continue at apply(M, F, A). The applied function is not
+/// expected to return; if it does, the process exits normally.
+#[no_mangle]
+pub extern "C" fn mana_rt_hibernate(ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    // the args list is a heap term held across suspends — root it (the
+    // parked coroutine's root-frame chain is scanned and updated by GC)
+    let saved = ctxr.roots_head;
+    let mut fr = [0u64, 1, a];
+    fr[0] = saved;
+    ctxr.roots_head = fr.as_ptr() as u64;
+    loop {
+        let p = cur_proc(ctxr);
+        drain_ingress(p);
+        if !p.private.is_empty() {
+            break;
+        }
+        *p.state.lock() = PState::Waiting(None);
+        suspend_current(ctxr);
+    }
+    let a = fr[2];
+    ctxr.roots_head = saved;
+    let r = mana_rt_apply3(ctx, m, f, a);
+    if r == EXC_SENTINEL {
+        return r;
+    }
+    let ctxr = unsafe { &mut *ctx };
+    ctxr.exc_class = atom_intern(b"exit");
+    ctxr.exc_reason = known().normal;
+    EXC_SENTINEL
+}
+
+/// erlang:is_record/3 — tuple whose first element is Tag with Size arity.
+#[no_mangle]
+pub extern "C" fn mana_rt_is_record(t: u64, tag: u64, size: u64) -> u64 {
+    if size & TAG_MASK != TAG_SMALL || t & TAG_MASK != TAG_BOXED || t == 0 {
+        return known().false_a;
+    }
+    let want = (size as i64 >> 3) as usize;
+    unsafe {
+        let p = t as *const u64;
+        if *p & 0xff != KIND_TUPLE || (*p >> 8) as usize != want || want == 0 {
+            return known().false_a;
+        }
+        if *p.add(1) == tag {
+            known().true_a
+        } else {
+            known().false_a
+        }
+    }
+}
+
+/// erlang:process_flag/2 — trap_exit is real; the scheduler-tuning flags
+/// are accepted no-ops with plausible old values; unknown flags badarg.
+#[no_mangle]
+pub extern "C" fn mana_rt_process_flag(ctx: *mut ProcCtx, flag: u64, value: u64) -> u64 {
+    let ctxp = ctx;
+    let ctx = unsafe { &mut *ctx };
+    if flag & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    match atom_bytes(flag) {
+        b"trap_exit" => mana_rt_trap_exit(ctxp, value),
+        b"priority" => atom_intern(b"normal"),
+        b"message_queue_data" => atom_intern(b"off_heap"),
+        b"min_heap_size" | b"min_bin_vheap_size" | b"max_heap_size"
+        | b"fullsweep_after" => (0 << 3) | TAG_SMALL,
+        b"sensitive" | b"error_handler" => known().false_a,
+        _ => raise_badarg(ctx),
+    }
+}
+
 /// spawn_link/1 — link is established before the child first runs.
 #[no_mangle]
 pub extern "C" fn mana_rt_spawn_link(ctx: *mut ProcCtx, closure: u64) -> u64 {
@@ -2628,6 +2701,9 @@ struct SockEntry {
     binary: bool,
     /// passive-recv buffer (exact-length recv accumulates here)
     rbuf: Vec<u8>,
+    /// byte counters for inet:getstat
+    recv_oct: u64,
+    send_oct: u64,
 }
 
 struct SocketTable {
@@ -3591,6 +3667,8 @@ pub const T_PEERNAME: u64 = 8;
 pub const T_SOCKNAME: u64 = 9;
 pub const T_PORT: u64 = 10;
 pub const T_CONTROLLING: u64 = 11;
+pub const T_GETSTAT: u64 = 12;
+pub const T_GETOPTS: u64 = 13;
 
 fn addr_tuple(ctx: &mut ProcCtx, addr: std::net::SocketAddr) -> u64 {
     let small = |v: i64| ((v << 3) as u64) | TAG_SMALL;
@@ -3655,6 +3733,8 @@ pub extern "C" fn mana_rt_tcp(
                 active: opts.active,
                 binary: opts.binary,
                 rbuf: Vec::new(),
+                recv_oct: 0,
+                send_oct: 0,
             });
             // wait for writability, then check SO_ERROR
             loop {
@@ -3751,6 +3831,8 @@ pub extern "C" fn mana_rt_tcp(
                         active: opts.active,
                         binary: opts.binary,
                         rbuf: Vec::new(),
+                        recv_oct: 0,
+                        send_oct: 0,
                     });
                     let h = sock_handle(ctx, idx);
                     pair_term(ctx, b"ok", h)
@@ -3787,6 +3869,8 @@ pub extern "C" fn mana_rt_tcp(
                                 active: opts.active,
                                 binary: opts.binary,
                                 rbuf: Vec::new(),
+                                recv_oct: 0,
+                                send_oct: 0,
                             });
                             Some(Ok(i))
                         }
@@ -3853,6 +3937,7 @@ pub extern "C" fn mana_rt_tcp(
                         match s.read(&mut chunk) {
                             Ok(0) => Step::Closed(binary),
                             Ok(k) => {
+                                entry.recv_oct += k as u64;
                                 entry.rbuf.extend_from_slice(&chunk[..k]);
                                 if want == 0 || entry.rbuf.len() >= want {
                                     let take = if want == 0 {
@@ -3926,7 +4011,10 @@ pub extern "C" fn mana_rt_tcp(
                         return raise_badarg(ctx);
                     };
                     match s.write(&data[off..]) {
-                        Ok(k) => Ok(Some(k)),
+                        Ok(k) => {
+                            entry.send_oct += k as u64;
+                            Ok(Some(k))
+                        }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::WouldBlock
                                 || e.kind() == std::io::ErrorKind::Interrupted =>
@@ -4112,6 +4200,117 @@ pub extern "C" fn mana_rt_tcp(
                 Err(e) => err_tuple(ctx, &e),
             }
         }
+        T_GETSTAT => {
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let (recv_oct, send_oct) = {
+                let tab = SOCKETS.lock().unwrap();
+                let Some(entry) = tab.slots.get(idx).and_then(|s| s.as_ref()) else {
+                    drop(tab);
+                    return closed_err(ctx);
+                };
+                (entry.recv_oct, entry.send_oct)
+            };
+            let stats: [(&[u8], u64); 8] = [
+                (b"recv_oct", recv_oct),
+                (b"recv_cnt", 0),
+                (b"recv_max", 0),
+                (b"recv_avg", 0),
+                (b"send_oct", send_oct),
+                (b"send_cnt", 0),
+                (b"send_max", 0),
+                (b"send_avg", 0),
+            ];
+            let saved = ctx.roots_head;
+            let mut fr = [0u64, 2, NIL, NIL];
+            fr[0] = saved;
+            ctx.roots_head = fr.as_ptr() as u64;
+            for (name, v) in stats.iter().rev() {
+                let t = alloc_nursery(ctx, 3);
+                unsafe {
+                    *t = (2 << 8) | KIND_TUPLE;
+                    *t.add(1) = atom_intern(name);
+                    *t.add(2) = ((*v as i64) << 3) as u64 | TAG_SMALL;
+                }
+                fr[3] = t as u64;
+                let cell = alloc_nursery(ctx, 2);
+                unsafe {
+                    *cell = fr[3];
+                    *cell.add(1) = fr[2];
+                }
+                fr[2] = cell as u64 | TAG_CONS;
+            }
+            let list = fr[2];
+            ctx.roots_head = saved;
+            pair_term(ctx, b"ok", list)
+        }
+        T_GETOPTS => {
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let (active, binary) = {
+                let tab = SOCKETS.lock().unwrap();
+                let Some(entry) = tab.slots.get(idx).and_then(|s| s.as_ref()) else {
+                    drop(tab);
+                    return closed_err(ctx);
+                };
+                (entry.active, entry.binary)
+            };
+            // answer the asked-for option names we model; skip unknowns
+            let mut wanted: Vec<&'static [u8]> = Vec::new();
+            let mut cur = b;
+            while cur & TAG_MASK == TAG_CONS {
+                let p = (cur & !TAG_MASK) as *const u64;
+                let o = unsafe { *p };
+                if o & TAG_MASK == TAG_ATOM {
+                    match atom_bytes(o) {
+                        b"active" => wanted.push(b"active"),
+                        b"mode" => wanted.push(b"mode"),
+                        b"packet" => wanted.push(b"packet"),
+                        b"nodelay" => wanted.push(b"nodelay"),
+                        b"keepalive" => wanted.push(b"keepalive"),
+                        b"reuseaddr" => wanted.push(b"reuseaddr"),
+                        _ => {}
+                    }
+                }
+                cur = unsafe { *p.add(1) };
+            }
+            let saved = ctx.roots_head;
+            let mut fr = [0u64, 2, NIL, NIL];
+            fr[0] = saved;
+            ctx.roots_head = fr.as_ptr() as u64;
+            for name in wanted.iter().rev() {
+                let val = match *name {
+                    b"active" => match active {
+                        ActiveMode::Passive => known().false_a,
+                        ActiveMode::Once => atom_intern(b"once"),
+                        ActiveMode::Always => known().true_a,
+                    },
+                    b"mode" => {
+                        if binary {
+                            atom_intern(b"binary")
+                        } else {
+                            atom_intern(b"list")
+                        }
+                    }
+                    b"packet" => TAG_SMALL, // small 0
+                    _ => known().true_a, // nodelay/keepalive/reuseaddr
+                };
+                let t = alloc_nursery(ctx, 3);
+                unsafe {
+                    *t = (2 << 8) | KIND_TUPLE;
+                    *t.add(1) = atom_intern(name);
+                    *t.add(2) = val;
+                }
+                fr[3] = t as u64;
+                let cell = alloc_nursery(ctx, 2);
+                unsafe {
+                    *cell = fr[3];
+                    *cell.add(1) = fr[2];
+                }
+                fr[2] = cell as u64 | TAG_CONS;
+            }
+            let list = fr[2];
+            ctx.roots_head = saved;
+            pair_term(ctx, b"ok", list)
+        }
         _ => raise_badarg(ctx),
     }
 }
@@ -4231,6 +4430,7 @@ fn active_pump(ctx: &mut ProcCtx, idx: usize) {
                         Ev::Closed(owner)
                     }
                     Ok(k) => {
+                        entry.recv_oct += k as u64;
                         if once {
                             entry.active = ActiveMode::Passive;
                         }
@@ -4272,6 +4472,392 @@ fn active_pump(ctx: &mut ProcCtx, idx: usize) {
             Ev::Quiet => return,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// erlang:decode_packet/3 — http_bin/httph_bin only (Bandit's HTTP/1 parser).
+// Stateless per call, mirroring erts packet_parser shapes; the
+// Conf.DecodePacket conformance program pins every shape against BEAM.
+
+/// erts' known-header table: atom text + the index reported in the
+/// http_header tuple's second element.
+const HTTP_FIELDS: &[&str] = &[
+    "Cache-Control",
+    "Connection",
+    "Date",
+    "Pragma",
+    "Transfer-Encoding",
+    "Upgrade",
+    "Via",
+    "Accept",
+    "Accept-Charset",
+    "Accept-Encoding",
+    "Accept-Language",
+    "Authorization",
+    "From",
+    "Host",
+    "If-Modified-Since",
+    "If-Match",
+    "If-None-Match",
+    "If-Range",
+    "If-Unmodified-Since",
+    "Max-Forwards",
+    "Proxy-Authorization",
+    "Range",
+    "Referer",
+    "User-Agent",
+    "Age",
+    "Location",
+    "Proxy-Authenticate",
+    "Public",
+    "Retry-After",
+    "Server",
+    "Vary",
+    "Warning",
+    "Www-Authenticate",
+    "Allow",
+    "Content-Base",
+    "Content-Encoding",
+    "Content-Language",
+    "Content-Length",
+    "Content-Location",
+    "Content-Md5",
+    "Content-Range",
+    "Content-Type",
+    "Etag",
+    "Expires",
+    "Last-Modified",
+    "Accept-Ranges",
+    "Set-Cookie",
+    "Set-Cookie2",
+    "X-Forwarded-For",
+    "Cookie",
+    "Keep-Alive",
+    "Proxy-Connection",
+];
+
+const HTTP_METHODS: &[&str] = &["OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE"];
+
+/// Canonical-case a header name the way erts does: capitalize the first
+/// letter of every dash-separated token, lowercase the rest.
+fn canonical_field(name: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len());
+    let mut start_of_token = true;
+    for &b in name {
+        if b == b'-' {
+            out.push(b'-');
+            start_of_token = true;
+        } else if start_of_token {
+            out.push(b.to_ascii_uppercase());
+            start_of_token = false;
+        } else {
+            out.push(b.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+fn small_of(v: i64) -> u64 {
+    ((v << 3) as u64) | TAG_SMALL
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_decode_packet(ctx: *mut ProcCtx, ty: u64, bin: u64, _opts: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if ty & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    let Some((bp, blen)) = bin_parts(bin) else {
+        return raise_badarg(ctx);
+    };
+    let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(bp, blen) }.to_vec();
+    match atom_bytes(ty) {
+        b"http_bin" => dp_http(ctx, &bytes),
+        b"httph_bin" => dp_httph(ctx, &bytes),
+        _ => raise_badarg(ctx),
+    }
+}
+
+fn dp_more(ctx: &mut ProcCtx) -> u64 {
+    pair_term(ctx, b"more", atom_intern(b"undefined"))
+}
+
+/// {ok, Packet, Rest} with Packet rooted across the Rest allocation.
+fn dp_ok(ctx: &mut ProcCtx, packet: u64, rest: &[u8]) -> u64 {
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, NIL, NIL];
+    fr[0] = saved;
+    fr[2] = packet;
+    ctx.roots_head = fr.as_ptr() as u64;
+    fr[3] = bytes_to_new_bin(ctx, rest);
+    let p = alloc_nursery(ctx, 4);
+    unsafe {
+        *p = (3 << 8) | KIND_TUPLE;
+        *p.add(1) = atom_intern(b"ok");
+        *p.add(2) = fr[2];
+        *p.add(3) = fr[3];
+    }
+    ctx.roots_head = saved;
+    p as u64
+}
+
+fn dp_http_error(ctx: &mut ProcCtx, line: &[u8], rest: &[u8]) -> u64 {
+    let lb = bytes_to_new_bin(ctx, line);
+    let err = pair_term(ctx, b"http_error", lb); // roots lb internally
+    dp_ok(ctx, err, rest)
+}
+
+/// Take one line (up to and including \r\n or \n). Returns (line_without
+/// terminator, rest_index) or None if incomplete.
+fn dp_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
+    let nl = bytes.iter().position(|&b| b == b'\n')?;
+    let line = if nl > 0 && bytes[nl - 1] == b'\r' {
+        &bytes[..nl - 1]
+    } else {
+        &bytes[..nl]
+    };
+    Some((line, nl + 1))
+}
+
+fn dp_http(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+    let Some((line, rest_at)) = dp_line(bytes) else {
+        return dp_more(ctx);
+    };
+    let rest = &bytes[rest_at..];
+    let full_line = &bytes[..rest_at];
+    // response line?
+    if line.starts_with(b"HTTP/") {
+        return dp_response(ctx, line, full_line, rest);
+    }
+    // request line: METHOD SP URI [SP HTTP/x.y]
+    let mut parts = line.splitn(3, |&b| b == b' ');
+    let method = parts.next().unwrap_or(b"");
+    let Some(uri) = parts.next() else {
+        return dp_http_error(ctx, full_line, rest);
+    };
+    let version = parts.next();
+    if method.is_empty() || uri.is_empty() {
+        return dp_http_error(ctx, full_line, rest);
+    }
+    let ver = match version {
+        None => (0i64, 9i64),
+        Some(v) => match dp_version(v) {
+            Some(v) => v,
+            None => return dp_http_error(ctx, full_line, rest),
+        },
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 3, NIL, NIL, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    // method: known atom or binary
+    fr[2] = if let Some(name) = HTTP_METHODS.iter().find(|&&m| m.as_bytes() == method) {
+        atom_intern(name.as_bytes())
+    } else {
+        bytes_to_new_bin(ctx, method)
+    };
+    fr[3] = dp_uri(ctx, uri);
+    let vt = alloc_nursery(ctx, 3);
+    unsafe {
+        *vt = (2 << 8) | KIND_TUPLE;
+        *vt.add(1) = small_of(ver.0);
+        *vt.add(2) = small_of(ver.1);
+    }
+    fr[4] = vt as u64;
+    let req = alloc_nursery(ctx, 5);
+    unsafe {
+        *req = (4 << 8) | KIND_TUPLE;
+        *req.add(1) = atom_intern(b"http_request");
+        *req.add(2) = fr[2];
+        *req.add(3) = fr[3];
+        *req.add(4) = fr[4];
+    }
+    ctx.roots_head = saved;
+    dp_ok(ctx, req as u64, rest)
+}
+
+fn dp_version(v: &[u8]) -> Option<(i64, i64)> {
+    let v = v.strip_prefix(b"HTTP/")?;
+    let dot = v.iter().position(|&b| b == b'.')?;
+    let major = std::str::from_utf8(&v[..dot]).ok()?.parse::<i64>().ok()?;
+    let minor = std::str::from_utf8(&v[dot + 1..]).ok()?.parse::<i64>().ok()?;
+    Some((major, minor))
+}
+
+fn dp_response(ctx: &mut ProcCtx, line: &[u8], full_line: &[u8], rest: &[u8]) -> u64 {
+    let mut parts = line.splitn(3, |&b| b == b' ');
+    let ver = parts.next().unwrap_or(b"");
+    let Some(vt) = dp_version(ver) else {
+        return dp_http_error(ctx, full_line, rest);
+    };
+    let Some(status) = parts.next() else {
+        return dp_http_error(ctx, full_line, rest);
+    };
+    let Ok(code) = std::str::from_utf8(status).unwrap_or("x").parse::<i64>() else {
+        return dp_http_error(ctx, full_line, rest);
+    };
+    let phrase = parts.next().unwrap_or(b"");
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, NIL, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let vtt = alloc_nursery(ctx, 3);
+    unsafe {
+        *vtt = (2 << 8) | KIND_TUPLE;
+        *vtt.add(1) = small_of(vt.0);
+        *vtt.add(2) = small_of(vt.1);
+    }
+    fr[2] = vtt as u64;
+    fr[3] = bytes_to_new_bin(ctx, phrase);
+    let resp = alloc_nursery(ctx, 5);
+    unsafe {
+        *resp = (4 << 8) | KIND_TUPLE;
+        *resp.add(1) = atom_intern(b"http_response");
+        *resp.add(2) = fr[2];
+        *resp.add(3) = small_of(code);
+        *resp.add(4) = fr[3];
+    }
+    ctx.roots_head = saved;
+    dp_ok(ctx, resp as u64, rest)
+}
+
+fn dp_uri(ctx: &mut ProcCtx, uri: &[u8]) -> u64 {
+    if uri == b"*" {
+        return atom_intern(b"*");
+    }
+    let lower: Vec<u8> = uri.to_ascii_lowercase();
+    for (scheme, name) in [(b"http://".as_slice(), &b"http"[..]), (b"https://", b"https")] {
+        if lower.starts_with(scheme) {
+            let after = &uri[scheme.len()..];
+            let path_at = after
+                .iter()
+                .position(|&b| b == b'/')
+                .unwrap_or(after.len());
+            let hostport = &after[..path_at];
+            let path: &[u8] = if path_at == after.len() { b"/" } else { &after[path_at..] };
+            let (host, port) = match hostport.iter().position(|&b| b == b':') {
+                Some(c) => {
+                    let p = std::str::from_utf8(&hostport[c + 1..])
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok());
+                    (&hostport[..c], p)
+                }
+                None => (hostport, None),
+            };
+            let saved = ctx.roots_head;
+            let mut fr = [0u64, 2, NIL, NIL];
+            fr[0] = saved;
+            ctx.roots_head = fr.as_ptr() as u64;
+            fr[2] = bytes_to_new_bin(ctx, host);
+            fr[3] = bytes_to_new_bin(ctx, path);
+            let t = alloc_nursery(ctx, 6);
+            unsafe {
+                *t = (5 << 8) | KIND_TUPLE;
+                *t.add(1) = atom_intern(b"absoluteURI");
+                *t.add(2) = atom_intern(name);
+                *t.add(3) = fr[2];
+                *t.add(4) = match port {
+                    Some(p) => small_of(p),
+                    None => atom_intern(b"undefined"),
+                };
+                *t.add(5) = fr[3];
+            }
+            ctx.roots_head = saved;
+            return t as u64;
+        }
+    }
+    if let Some(pos) = uri.windows(3).position(|w| w == b"://") {
+        let saved = ctx.roots_head;
+        let mut fr = [0u64, 2, NIL, NIL];
+        fr[0] = saved;
+        ctx.roots_head = fr.as_ptr() as u64;
+        fr[2] = bytes_to_new_bin(ctx, &uri[..pos]);
+        fr[3] = bytes_to_new_bin(ctx, &uri[pos + 3..]);
+        let t = alloc_nursery(ctx, 4);
+        unsafe {
+            *t = (3 << 8) | KIND_TUPLE;
+            *t.add(1) = atom_intern(b"scheme");
+            *t.add(2) = fr[2];
+            *t.add(3) = fr[3];
+        }
+        ctx.roots_head = saved;
+        return t as u64;
+    }
+    if uri.first() == Some(&b'/') {
+        let p = bytes_to_new_bin(ctx, uri);
+        return pair_term(ctx, b"abs_path", p);
+    }
+    // anything else (unknown methods' tokens etc.): the bare binary
+    bytes_to_new_bin(ctx, uri)
+}
+
+fn dp_httph(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+    let Some((line, mut rest_at)) = dp_line(bytes) else {
+        return dp_more(ctx);
+    };
+    if line.is_empty() {
+        return dp_ok(ctx, atom_intern(b"http_eoh"), &bytes[rest_at..]);
+    }
+    if rest_at == bytes.len() {
+        // a complete header line could still be extended by an obs-fold
+        // continuation — BEAM waits for at least one more byte
+        return dp_more(ctx);
+    }
+    let full_line = &bytes[..rest_at];
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return dp_http_error(ctx, full_line, &bytes[rest_at..]);
+    };
+    let name = &line[..colon];
+    let mut value: Vec<u8> = line[colon + 1..]
+        .iter()
+        .copied()
+        .skip_while(|&b| b == b' ' || b == b'\t')
+        .collect();
+    // obs-fold: continuation lines start with SP/HT and extend the value
+    // RAW — BEAM preserves the CRLF and the leading whitespace verbatim
+    while rest_at < bytes.len() && (bytes[rest_at] == b' ' || bytes[rest_at] == b'\t') {
+        let Some((cont, next_at)) = dp_line(&bytes[rest_at..]) else {
+            return dp_more(ctx);
+        };
+        value.extend_from_slice(b"\r\n");
+        value.extend_from_slice(cont);
+        rest_at += next_at;
+    }
+    let rest = &bytes[rest_at..];
+    let canon = canonical_field(name);
+    let (idx, field_term_is_atom) = match HTTP_FIELDS
+        .iter()
+        .position(|&f| f.as_bytes() == canon.as_slice())
+    {
+        Some(i) => (i as i64 + 1, true),
+        None => (0, false),
+    };
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, NIL, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    fr[2] = if field_term_is_atom {
+        atom_intern(HTTP_FIELDS[(idx - 1) as usize].as_bytes())
+    } else {
+        bytes_to_new_bin(ctx, &canon)
+    };
+    fr[3] = bytes_to_new_bin(ctx, &value);
+    // 4th element: the field name as received (original case) — OTP 26+
+    let orig = bytes_to_new_bin(ctx, name);
+    let mut fr2 = [0u64, 1, orig];
+    fr2[0] = ctx.roots_head;
+    ctx.roots_head = fr2.as_ptr() as u64;
+    let h = alloc_nursery(ctx, 6);
+    unsafe {
+        *h = (5 << 8) | KIND_TUPLE;
+        *h.add(1) = atom_intern(b"http_header");
+        *h.add(2) = small_of(idx);
+        *h.add(3) = fr[2];
+        *h.add(4) = fr2[2];
+        *h.add(5) = fr[3];
+    }
+    ctx.roots_head = saved;
+    dp_ok(ctx, h as u64, rest)
 }
 
 /// send_after/start_timer. `wrap != 0` wraps the message as
@@ -8087,6 +8673,37 @@ pub extern "C" fn mana_rt_map_take(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
     t as u64
 }
 
+/// maps:update_with/3 — apply Fun to the existing value (badkey on miss).
+#[no_mangle]
+pub extern "C" fn mana_rt_maps_update_with(ctx: *mut ProcCtx, key: u64, fun: u64, m: u64) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    let Some((p, n)) = map_parts(m) else {
+        return raise_map_err(ctxr, true, m);
+    };
+    if map_index(p, n, key).is_err() {
+        return raise_map_err(ctxr, false, key);
+    }
+    let old = mana_rt_map_pat_get(m, key);
+    let saved = ctxr.roots_head;
+    let mut fr = [0u64, 2, key, m];
+    fr[0] = saved;
+    ctxr.roots_head = fr.as_ptr() as u64;
+    let c1 = alloc_nursery(ctxr, 2);
+    unsafe {
+        *c1 = old;
+        *c1.add(1) = NIL;
+    }
+    let newv = mana_rt_apply_fun(ctx, fun, c1 as u64 | TAG_CONS);
+    if newv == EXC_SENTINEL {
+        ctxr.roots_head = saved;
+        return EXC_SENTINEL;
+    }
+    let key2 = fr[2];
+    let m2 = fr[3];
+    ctxr.roots_head = saved;
+    mana_rt_map_put(ctx, key2, newv, m2)
+}
+
 /// maps:merge_with/3 — merge with a conflict fun (calls back into compiled
 /// code; everything rooted around the callbacks).
 #[no_mangle]
@@ -8297,6 +8914,41 @@ pub extern "C" fn mana_rt_ets_delete(_ctx: *mut ProcCtx, tab: u64, key: u64) -> 
         }
     }
     known().true_a
+}
+
+/// ets:lookup_element/3 — badarg on missing table/key (Bandit.Clock's
+/// date_header rescues the resulting ArgumentError to compute a fallback).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_lookup_element(
+    ctx: *mut ProcCtx,
+    tab: u64,
+    key: u64,
+    pos: u64,
+) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if pos & TAG_MASK != TAG_SMALL || (pos as i64 >> 3) < 1 {
+        return raise_badarg(ctx);
+    }
+    let n = (pos as i64 >> 3) as usize;
+    let guard = ETS_STORE.lock().unwrap();
+    let found = guard
+        .as_ref()
+        .and_then(|rows| kv_find(rows, tab, key).map(|i| rows[i].2));
+    drop(guard);
+    let Some(tuple) = found else {
+        return raise_badarg(ctx);
+    };
+    unsafe {
+        let p = tuple as *const u64;
+        if tuple & TAG_MASK != TAG_BOXED || *p & 0xff != KIND_TUPLE {
+            return raise_badarg(ctx);
+        }
+        let arity = (*p >> 8) as usize;
+        if n > arity {
+            return raise_badarg(ctx);
+        }
+        *p.add(n)
+    }
 }
 
 /// application env — same store under a reserved table tag (0b111 is never

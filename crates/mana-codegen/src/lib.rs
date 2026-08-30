@@ -4450,16 +4450,27 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 Ok(r)
             }
             ("process_flag", 2) => {
-                // only trap_exit is supported; the flag name is ignored
+                // dispatch on the flag name: trap_exit is real, the rest
+                // are accepted no-ops returning a plausible old value
                 let call = self
                     .builder
                     .build_call(
-                        self.rt_pt_i64("mana_rt_trap_exit"),
-                        &[self.ctx_val().into(), argv[1].into()],
+                        self.rt_fn("mana_rt_process_flag", || {
+                            self.i64t.fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
                         "prev",
                     )
                     .map_err(be)?;
-                Ok(call_result(call)?.into_int_value())
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
             }
             ("exit", 2) => {
                 let call = self
@@ -4512,6 +4523,80 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("get_module_info", 1) => Ok(self.nil()),
+            ("hibernate", 3) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_fn("mana_rt_hibernate", || {
+                            self.i64t.fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "hib",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("is_record", 3) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_fn("mana_rt_is_record", || {
+                            self.i64t.fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[argv[0].into(), argv[1].into(), argv[2].into()],
+                        "isrec",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("decode_packet", 3) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_fn("mana_rt_decode_packet", || {
+                            self.i64t.fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "dpkt",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("band", 2) | ("bor", 2) | ("bxor", 2) => {
                 let opcode = match name {
                     "band" => 8u64, // AR_BAND
@@ -6365,6 +6450,19 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     "ets",
                 )
                 .map_err(be)?,
+            ("lookup_element", 3) => self
+                .builder
+                .build_call(
+                    quad("mana_rt_ets_lookup_element"),
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(),
+                        argv[1].into(),
+                        argv[2].into(),
+                    ],
+                    "ets",
+                )
+                .map_err(be)?,
             ("delete", 2) => self
                 .builder
                 .build_call(
@@ -6672,6 +6770,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ("inet", "peername", 1) => Some((8, false)),
             ("inet", "sockname", 1) => Some((9, false)),
             ("inet", "port", 1) => Some((10, false)),
+            ("inet", "getstat", 1) => Some((12, false)),
+            ("inet", "getstat", 2) => Some((12, false)),
+            ("inet", "getopts", 2) => Some((13, false)),
             _ => None,
         };
         let Some((op, pad_infinity)) = spec else {
@@ -7042,6 +7143,34 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         self.rt_ptt_i64("mana_rt_map_take"),
                         &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
                         "mtake",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("update_with", 3) => {
+                let callee = self.rt_fn("mana_rt_maps_update_with", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                        ],
+                        "muw",
                     )
                     .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
@@ -7926,6 +8055,9 @@ fn expr_may_raise(
                         | ("bsr", 2)
                         | ("bnot", 1)
                         | ("get_module_info", 2)
+                        | ("decode_packet", 3)
+                        | ("process_flag", 2)
+                        | ("hibernate", 3)
                         | ("+", 1)
                         | ("-", 1)
                         | ("float", 1)
@@ -8112,6 +8244,8 @@ fn expr_may_gc(
                 && matches!(
                     (name.as_str(), args.len()),
                     ("setelement", 3)
+                        | ("decode_packet", 3)
+                        | ("hibernate", 3)
                         | ("++", 2)
                         | ("--", 2)
                         | ("binary_part", 3)
@@ -8143,7 +8277,7 @@ fn expr_may_gc(
                     name.as_str(),
                     "put" | "remove" | "merge" | "from_list" | "to_list" | "find"
                         | "fold" | "keys" | "values" | "iterator" | "next"
-                        | "merge_with" | "take" | "update"
+                        | "merge_with" | "take" | "update" | "update_with"
                 )
             {
                 return true;
@@ -8802,6 +8936,19 @@ fn collect_dyn_names(e: &Expr, pairs: &mut HashSet<(String, usize)>, dyn_any: &m
         }
         Expr::Lit(_) | Expr::Var(_) | Expr::FunRef { .. } => {}
         Expr::Tuple(items) | Expr::Values(items) => {
+            // {Mod, Fun, Args} literal tuples (supervisor child specs,
+            // callback tuples) are applied dynamically: seed the
+            // (fun, arity) pair — it only takes effect on modules that are
+            // already dynamic candidates, so incidental 3-tuples are inert
+            if items.len() == 3 {
+                if let (Expr::Lit(Literal::Atom(_)), Expr::Lit(Literal::Atom(fa))) =
+                    (&items[0], &items[1])
+                {
+                    if let Some(n) = static_list_len(&items[2]) {
+                        pairs.insert((fa.clone(), n));
+                    }
+                }
+            }
             items.iter().for_each(|i| collect_dyn_names(i, pairs, dyn_any))
         }
         Expr::Cons(h, t) => {
