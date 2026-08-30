@@ -1146,6 +1146,17 @@ pub extern "C" fn mana_rt_hibernate(ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -
     EXC_SENTINEL
 }
 
+/// erlang:iolist_size/1.
+#[no_mangle]
+pub extern "C" fn mana_rt_iolist_size(ctx: *mut ProcCtx, t: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut out = Vec::new();
+    if iolist_flatten(t, &mut out).is_err() {
+        return raise_badarg(ctx);
+    }
+    ((out.len() as i64) << 3) as u64 | TAG_SMALL
+}
+
 /// erlang:is_record/3 — tuple whose first element is Tag with Size arity.
 #[no_mangle]
 pub extern "C" fn mana_rt_is_record(t: u64, tag: u64, size: u64) -> u64 {
@@ -3510,6 +3521,15 @@ fn parse_tcp_opts(mut cur: u64) -> Result<TcpOpts, ()> {
                 if *t == (2 << 8) | KIND_TUPLE && *t.add(1) & TAG_MASK == TAG_ATOM {
                     let v = *t.add(2);
                     match atom_bytes(*t.add(1)) {
+                        b"mode" => {
+                            if v & TAG_MASK == TAG_ATOM {
+                                match atom_bytes(v) {
+                                    b"binary" => o.binary = true,
+                                    b"list" => o.binary = false,
+                                    _ => return Err(()),
+                                }
+                            }
+                        }
                         b"active" => {
                             o.active = if v & TAG_MASK == TAG_ATOM {
                                 match atom_bytes(v) {
@@ -5000,6 +5020,31 @@ pub extern "C" fn mana_rt_pd_erase(ctx: *mut ProcCtx, k: u64) -> u64 {
 }
 
 /// The whole dictionary as [{K, V}] — for get/0 and process_info.
+/// erlang:get_keys/0 — list of pdict keys.
+#[no_mangle]
+pub extern "C" fn mana_rt_pd_keys(ctx: *mut ProcCtx) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let cell = proc_ref(ctx.global, ctx.current).expect("live current process");
+    let p = unsafe { proc_mut(cell) };
+    let keys: Vec<u64> = p.pdict.lock().iter().map(|&(k, _)| k).collect();
+    // pdict values are promoted at put — keys are shared-safe; the list
+    // cells still need the acc rooted across allocs
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for &k in keys.iter().rev() {
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = k;
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[2]
+}
+
 fn pdict_to_list(ctx: &mut ProcCtx, pid: usize) -> u64 {
     let entries: Vec<(u64, u64)> = match proc_ref(ctx.global, pid) {
         Some(cell) => unsafe { proc_mut(cell) }.pdict.lock().clone(),

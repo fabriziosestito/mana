@@ -1330,6 +1330,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 ("binary", "compile_pattern", 1) => ("", 0, &[]),
                 // Elixir.Float decomposes IEEE bits with sub-bit segments
                 // (TODO(bitstring)); precision ops go native instead
+                // os.erl's time functions are nif_error stubs (real BIFs
+                // on BEAM); 2^30... the /0 const is 1_000_000_000 Hz =
+                // our native unit (nanoseconds)
+                ("os", "system_time", 0) => {
+                    ("mana_rt_system_time", 0, &[(1_000_000_000u64 << 3) | 0b001])
+                }
+                ("os", "system_time", 1) => ("mana_rt_system_time", 0, &[]),
                 ("Elixir.System", "cmd", 2) => ("mana_rt_system_cmd", 0, &[NIL_C]),
                 ("Elixir.System", "cmd", 3) => ("mana_rt_system_cmd", 0, &[]),
                 ("Elixir.Float", "round", 2) => ("mana_rt_float_prec", 0, &[0]),
@@ -4054,7 +4061,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if matches!(
             module,
             "erts_internal" | "elixir_erl" | "erl_eval" | "beam_lib" | "global"
-                | "global_group" | "net_kernel"
+                | "global_group" | "net_kernel" | "zlib"
         ) {
             // BEAM/compiler/distribution guts: compile the call as a runtime
             // raise instead of poisoning the whole caller — reached code
@@ -4523,6 +4530,29 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("get_module_info", 1) => Ok(self.nil()),
+            ("get_keys", 0) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_p_i64("mana_rt_pd_keys"),
+                        &[self.ctx_val().into()],
+                        "pdkeys",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("iolist_size", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_iolist_size"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "iosz",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("hibernate", 3) => {
                 let call = self
                     .builder
@@ -7898,7 +7928,7 @@ fn is_bif_module(m: &str) -> bool {
         "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
             | "logger" | "ets" | "application" | "file" | "math" | "re" | "timer"
             | "gen_tcp" | "inet"
-            | "erts_internal"
+            | "erts_internal" | "zlib"
             | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
             | "net_kernel"
     )
@@ -8031,6 +8061,7 @@ fn expr_may_raise(
                     | "logger" | "ets" | "application" | "file" | "erts_internal"
                     | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
                     | "net_kernel" | "math" | "re" | "timer" | "gen_tcp" | "inet"
+                    | "zlib"
             ) {
                 return true;
             }
@@ -8058,6 +8089,7 @@ fn expr_may_raise(
                         | ("decode_packet", 3)
                         | ("process_flag", 2)
                         | ("hibernate", 3)
+                        | ("iolist_size", 1)
                         | ("+", 1)
                         | ("-", 1)
                         | ("float", 1)
@@ -8246,6 +8278,7 @@ fn expr_may_gc(
                     ("setelement", 3)
                         | ("decode_packet", 3)
                         | ("hibernate", 3)
+                        | ("get_keys", 0)
                         | ("++", 2)
                         | ("--", 2)
                         | ("binary_part", 3)
