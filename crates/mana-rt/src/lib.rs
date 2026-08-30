@@ -555,6 +555,7 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
         park_if_stw(ctx);
         drain_timer_deliveries(ctx);
         drain_io_wakes(ctx);
+        drain_io_active(ctx);
 
         let pid = ctx
             .run_q
@@ -2725,6 +2726,10 @@ fn reactor_thread(g: &'static Global) {
                 if let Some(pid) = entry.read_waiter.take() {
                     IO_WAKES.push((pid, idx, true));
                     woke = true;
+                } else if entry.active != ActiveMode::Passive {
+                    // no parked reader: schedule an active-mode pump
+                    IO_ACTIVE.push(idx);
+                    woke = true;
                 }
             }
             if ev.is_writable() || closed {
@@ -3585,6 +3590,7 @@ pub const T_SETOPTS: u64 = 7;
 pub const T_PEERNAME: u64 = 8;
 pub const T_SOCKNAME: u64 = 9;
 pub const T_PORT: u64 = 10;
+pub const T_CONTROLLING: u64 = 11;
 
 fn addr_tuple(ctx: &mut ProcCtx, addr: std::net::SocketAddr) -> u64 {
     let small = |v: i64| ((v << 3) as u64) | TAG_SMALL;
@@ -3666,6 +3672,7 @@ pub extern "C" fn mana_rt_tcp(
                     match s.peer_addr() {
                         Ok(_) => {
                             drop(tab);
+                            ensure_registered_active(ctx, idx);
                             let h = sock_handle(ctx, idx);
                             return pair_term(ctx, b"ok", h);
                         }
@@ -3790,6 +3797,7 @@ pub extern "C" fn mana_rt_tcp(
                 match accepted {
                     Some(Ok(i)) => {
                         clear_waiter(idx, ctx.current, true);
+                        ensure_registered_active(ctx, i);
                         let h = sock_handle(ctx, i);
                         return pair_term(ctx, b"ok", h);
                     }
@@ -4034,8 +4042,11 @@ pub extern "C" fn mana_rt_tcp(
                 drop(tab);
                 return closed_err(ctx);
             };
+            let mut activated = false;
             if has_mode_opt(b, b"active") {
+                let was = entry.active;
                 entry.active = opts.active;
+                activated = was == ActiveMode::Passive && opts.active != ActiveMode::Passive;
             }
             if has_mode_opt(b, b"binary") {
                 entry.binary = true;
@@ -4043,6 +4054,30 @@ pub extern "C" fn mana_rt_tcp(
             if has_mode_opt(b, b"list") {
                 entry.binary = false;
             }
+            drop(tab);
+            if activated {
+                // deliver anything already buffered (or an edge the kernel
+                // already reported) — the pump no-ops if the socket is quiet
+                ensure_registered_active(ctx, idx);
+                IO_ACTIVE.push(idx);
+                for s in 0..ctx.global.n_scheds {
+                    wake_sched(ctx.global, s);
+                }
+            }
+            atom_intern(b"ok")
+        }
+        T_CONTROLLING => {
+            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            if b & 0xF != PID_TAG4 {
+                return raise_badarg(ctx);
+            }
+            let pid = (b >> 4) as usize;
+            let mut tab = SOCKETS.lock().unwrap();
+            let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                drop(tab);
+                return closed_err(ctx);
+            };
+            entry.owner = pid;
             atom_intern(b"ok")
         }
         T_PEERNAME | T_SOCKNAME | T_PORT => {
@@ -4083,6 +4118,160 @@ pub extern "C" fn mana_rt_tcp(
 
 fn libc_einprogress() -> i32 {
     115 // linux EINPROGRESS
+}
+
+// ---- active mode ({active, once | true}) ----
+//
+// The reactor never reads sockets: on a readable event for an active socket
+// with no parked reader it enqueues the index here; a scheduler drains at
+// its loop top, performs the nonblocking reads, and delivers real
+// {tcp, Sock, Data} / {tcp_closed, Sock} messages to the owner (built in
+// the shared old space — push_and_wake requires shared-safe terms).
+static IO_ACTIVE: SegQueue<usize> = SegQueue::new();
+
+fn shared_bin(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+    let words = 1 + bytes.len().div_ceil(8);
+    let p = alloc_shared(ctx, words);
+    unsafe {
+        *p = ((bytes.len() as u64) << 8) | KIND_BIN;
+        if words > 1 {
+            *p.add(words - 1) = 0; // zero the padding tail word
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(1) as *mut u8, bytes.len());
+    }
+    p as u64
+}
+
+fn shared_byte_list(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+    let mut tail = NIL;
+    for &b in bytes.iter().rev() {
+        let cell = alloc_shared(ctx, 2);
+        unsafe {
+            *cell = ((b as u64) << 3) | TAG_SMALL;
+            *cell.add(1) = tail;
+        }
+        tail = cell as u64 | TAG_CONS;
+    }
+    tail
+}
+
+fn shared_sock_handle(ctx: &mut ProcCtx, idx: usize) -> u64 {
+    shared_tuple(
+        ctx,
+        &[atom_intern(b"mana_socket"), ((idx as u64) << 3) | TAG_SMALL],
+    )
+}
+
+/// Register an active socket with the reactor if it isn't yet (sockets that
+/// never park would otherwise never get events).
+fn ensure_registered_active(ctx: &mut ProcCtx, idx: usize) {
+    let mut need = false;
+    {
+        let mut tab = SOCKETS.lock().unwrap();
+        if let Some(e) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) {
+            if e.active != ActiveMode::Passive {
+                if !e.registered {
+                    e.registered = true;
+                    need = true;
+                }
+            }
+        }
+    }
+    if need {
+        REACTOR_CMDS.push(idx);
+        ensure_reactor(ctx.global);
+        reactor_wake();
+    }
+}
+
+/// Drain pending active-mode sockets (scheduler loop top, a safepoint).
+fn drain_io_active(ctx: &mut ProcCtx) {
+    let n = IO_ACTIVE.len();
+    for _ in 0..n {
+        let Some(idx) = IO_ACTIVE.pop() else { break };
+        active_pump(ctx, idx);
+    }
+}
+
+fn active_pump(ctx: &mut ProcCtx, idx: usize) {
+    use std::io::Read;
+    let mut chunk = vec![0u8; 65536];
+    loop {
+        enum Ev {
+            Data(Vec<u8>, usize, bool, bool), // bytes, owner, binary, once
+            Closed(usize),
+            Quiet,
+        }
+        // read + state transitions under the lock; deliver outside it
+        // (push_and_wake takes state locks — never nest under SOCKETS)
+        let ev = {
+            let mut tab = SOCKETS.lock().unwrap();
+            let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                return;
+            };
+            if entry.active == ActiveMode::Passive {
+                return; // deactivated (or tcp_closed already sent)
+            }
+            let owner = entry.owner;
+            let binary = entry.binary;
+            let once = entry.active == ActiveMode::Once;
+            if !entry.rbuf.is_empty() {
+                let data = std::mem::take(&mut entry.rbuf);
+                if once {
+                    entry.active = ActiveMode::Passive;
+                }
+                Ev::Data(data, owner, binary, once)
+            } else {
+                let SockSource::Stream(s) = &mut entry.source else {
+                    return; // listeners have no active data
+                };
+                match s.read(&mut chunk) {
+                    Ok(0) => {
+                        entry.active = ActiveMode::Passive; // tcp_closed once
+                        Ev::Closed(owner)
+                    }
+                    Ok(k) => {
+                        if once {
+                            entry.active = ActiveMode::Passive;
+                        }
+                        Ev::Data(chunk[..k].to_vec(), owner, binary, once)
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        Ev::Quiet
+                    }
+                    Err(_) => {
+                        entry.active = ActiveMode::Passive;
+                        Ev::Closed(owner)
+                    }
+                }
+            }
+        };
+        match ev {
+            Ev::Data(bytes, owner, binary, once) => {
+                let handle = shared_sock_handle(ctx, idx);
+                let payload = if binary {
+                    shared_bin(ctx, &bytes)
+                } else {
+                    shared_byte_list(ctx, &bytes)
+                };
+                let msg = shared_tuple(ctx, &[atom_intern(b"tcp"), handle, payload]);
+                push_and_wake(ctx, owner, msg);
+                if once {
+                    return;
+                }
+            }
+            Ev::Closed(owner) => {
+                let handle = shared_sock_handle(ctx, idx);
+                let msg = shared_tuple(ctx, &[atom_intern(b"tcp_closed"), handle]);
+                push_and_wake(ctx, owner, msg);
+                return;
+            }
+            Ev::Quiet => return,
+        }
+    }
 }
 
 /// send_after/start_timer. `wrap != 0` wraps the message as

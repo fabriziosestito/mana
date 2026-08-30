@@ -6667,6 +6667,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ("gen_tcp", "send", 2) => Some((4, false)),
             ("gen_tcp", "close", 1) => Some((5, false)),
             ("gen_tcp", "shutdown", 2) => Some((6, false)),
+            ("gen_tcp", "controlling_process", 2) => Some((11, false)),
             ("inet", "setopts", 2) => Some((7, false)),
             ("inet", "peername", 1) => Some((8, false)),
             ("inet", "sockname", 1) => Some((9, false)),

@@ -76,6 +76,79 @@ defmodule Conf.Tcp do
     :ok = :gen_tcp.close(l)
     IO.puts(inspect(is_pid(server)))
 
+    # active mode: {tcp, S, Data} / {tcp_closed, S} as real messages
+    {:ok, l4} = :gen_tcp.listen(0, [:binary, {:active, false}])
+    {:ok, port4} = :inet.port(l4)
+
+    spawn(fn ->
+      {:ok, s} = :gen_tcp.accept(l4)
+      :ok = :gen_tcp.send(s, "one")
+      # wait for the go-ahead so the two messages can't coalesce
+      {:ok, "go"} = :gen_tcp.recv(s, 2)
+      :ok = :gen_tcp.send(s, "two")
+      {:ok, "go"} = :gen_tcp.recv(s, 2)
+      :ok = :gen_tcp.close(s)
+    end)
+
+    {:ok, c4} = :gen_tcp.connect({127, 0, 0, 1}, port4, [:binary, {:active, :once}])
+
+    receive do
+      {:tcp, ^c4, data} -> IO.puts(inspect({:active_once, data}))
+    end
+
+    # active once consumed: no further tcp messages until re-armed
+    receive do
+      {:tcp, ^c4, _} -> IO.puts("unexpected")
+    after
+      100 -> IO.puts(inspect(:quiet))
+    end
+
+    :ok = :gen_tcp.send(c4, "go")
+    :ok = :inet.setopts(c4, [{:active, true}])
+
+    receive do
+      {:tcp, ^c4, data} -> IO.puts(inspect({:active_true, data}))
+    end
+
+    :ok = :gen_tcp.send(c4, "go")
+
+    receive do
+      {:tcp_closed, ^c4} -> IO.puts(inspect(:tcp_closed))
+    end
+
+    :ok = :gen_tcp.close(c4)
+    :ok = :gen_tcp.close(l4)
+
+    # controlling_process: messages follow the new owner
+    {:ok, l5} = :gen_tcp.listen(0, [:binary, {:active, false}])
+    {:ok, port5} = :inet.port(l5)
+
+    spawn(fn ->
+      {:ok, s} = :gen_tcp.accept(l5)
+      :ok = :gen_tcp.send(s, "for-child")
+      :ok = :gen_tcp.close(s)
+    end)
+
+    {:ok, c5} = :gen_tcp.connect({127, 0, 0, 1}, port5, [:binary, {:active, false}])
+
+    child =
+      spawn(fn ->
+        receive do
+          {:tcp, s, data} ->
+            send(parent, {:child_got, data})
+            :gen_tcp.close(s)
+        end
+      end)
+
+    :ok = :gen_tcp.controlling_process(c5, child)
+    :ok = :inet.setopts(c5, [{:active, :once}])
+
+    receive do
+      {:child_got, data} -> IO.puts(inspect({:child_got, data}))
+    end
+
+    :ok = :gen_tcp.close(l5)
+
     :ok
   end
 end
