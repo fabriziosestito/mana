@@ -148,6 +148,18 @@ When asked to open a PR:
 
 ## Gotchas
 
+- **No blocking syscall may run on a scheduler thread.** The STW requester
+  waits for every scheduler to reach a safepoint (loop top / alloc slow
+  path); a scheduler stuck in a blocking syscall stalls GC for its whole
+  duration. Sockets are therefore NONBLOCKING (mio reactor thread + parked
+  processes; the reactor never touches process state — it pushes wake
+  tokens/messages drained at scheduler safepoints, same discipline as the
+  timer thread). File ops and stdout are the documented exception: direct
+  syscalls, µs-scale on local disks — TODO(io-pool) is the real fix. Packet
+  modes beyond raw are TODO(packet). File/socket handles are
+  `{mana_file, N}` / `{mana_socket, N}` tuples, not ports — `is_port/1` is
+  false on them (documented divergence; only user code ever sees them).
+
 - **The build cache must key EVERY codegen input.** manac keeps a
   content-addressed object cache (Go's build-cache model) under the OS user
   cache dir (`~/.cache/mana`, `~/Library/Caches/mana`, `%LOCALAPPDATA%\mana`;
