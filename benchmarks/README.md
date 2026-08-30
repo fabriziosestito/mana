@@ -10,7 +10,8 @@ two console reports side by side.
 
 Suites: `Bench.Classic` (fib, list churn, maps, binaries), `Bench.Str`
 (unicode/binary string paths), `Bench.Ecto` (the changeset pipeline —
-the milestone scoreboard). `Bench.EctoLoop` is the profiling vehicle for
+the milestone scoreboard), `Bench.Io` (file round-trips, TCP loopback
+echo). `Bench.EctoLoop` is the profiling vehicle for
 the changeset pipeline: a plain 50k-iteration loop with no benchee
 machinery, wired to `make bench-profile` (wall time + callgrind).
 
@@ -25,6 +26,9 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | changeset valid | 2.9 µs | 1.9 µs | 2026-08-29, after the perf campaign |
 | changeset invalid | 2.6 µs | 1.8 µs | 2026-08-29, after the perf campaign |
 | query build+inspect | 68 µs | 35 µs | 2026-08-29, Ecto.Query milestone starting number |
+| file write+read 1KB | 6.7 µs | 42.9 µs | 2026-08-30, I/O milestone (direct syscalls vs prim_file) |
+| file write+read 64KB | 20.8 µs | 48.4 µs | 2026-08-30, I/O milestone |
+| tcp connect+echo64+close | 72.9 µs | 106.9 µs | 2026-08-30, I/O milestone |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction

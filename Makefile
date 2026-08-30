@@ -13,7 +13,7 @@ test-conformance: build
 	cd test/conformance && MANA_BIN=$(BIN) mix test
 
 # run every benchmark suite natively and on BEAM; SUITE=Classic|Str|Ecto
-SUITE ?= Classic Str Ecto
+SUITE ?= Classic Str Ecto Io
 bench: build-release
 	@cd benchmarks && for s in $(SUITE); do \
 	  echo "==== Bench.$$s (mana) ===="; \
