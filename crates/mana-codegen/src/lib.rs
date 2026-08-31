@@ -265,6 +265,15 @@ pub fn compile_program(
     let t = std::time::Instant::now();
     let raise_set = compute_may_raise(mods, &reachable);
     let raise_s = t.elapsed().as_secs_f64();
+    // per-module include sets, built once (reachable is tens of thousands
+    // of entries — a per-module filter scan is quadratic)
+    let mut includes: HashMap<&str, HashSet<FunName>> = HashMap::new();
+    for (module, f) in &reachable {
+        includes
+            .entry(module.as_str())
+            .or_default()
+            .insert(f.clone());
+    }
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("creating {}: {}", out_dir.display(), e))?;
@@ -286,14 +295,9 @@ pub fn compile_program(
         .par_iter()
         .enumerate()
         .map(|(mi, m)| -> CgResult<Option<PathBuf>> {
-            let include: HashSet<FunName> = reachable
-                .iter()
-                .filter(|(module, _)| module == &m.name)
-                .map(|(_, f)| f.clone())
-                .collect();
-            if include.is_empty() {
+            let Some(include) = includes.get(m.name.as_str()) else {
                 return Ok(None);
-            }
+            };
             let entry_here = (m.name == entry_mod).then_some(entry);
             let tk = std::time::Instant::now();
             let key = cache.map(|c| {
@@ -8251,16 +8255,20 @@ fn pattern_spill_sites(p: &Pattern) -> usize {
 }
 
 /// Modules implemented natively (never compiled from beams).
+/// Modules implemented natively by the runtime — never compiled from beams,
+/// never chased as dependencies. The mix driver reads this list via
+/// `manac --print-bif-modules` (single source of truth for its closure BFS).
+pub const BIF_MODULES: &[&str] = &[
+    "erlang", "maps", "io", "unicode", "persistent_term", "code", "io_lib",
+    "logger", "ets", "application", "file", "math", "re", "timer",
+    "gen_tcp", "inet", "crypto",
+    "erts_internal", "zlib",
+    "elixir_erl", "erl_eval", "beam_lib", "global", "global_group",
+    "net_kernel",
+];
+
 fn is_bif_module(m: &str) -> bool {
-    matches!(
-        m,
-        "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
-            | "logger" | "ets" | "application" | "file" | "math" | "re" | "timer"
-            | "gen_tcp" | "inet" | "crypto"
-            | "erts_internal" | "zlib"
-            | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
-            | "net_kernel"
-    )
+    BIF_MODULES.contains(&m)
 }
 
 fn is_raise(primop: &str) -> bool {
@@ -9039,6 +9047,9 @@ fn reachable_funs(
     // (module_info) stays out — the runtime answers it; __info__ compiles
     // (get_module_info BIF backs its attributes/compile clauses).
     let module_names: HashSet<&str> = mods.iter().map(|m| m.name.as_str()).collect();
+    let mod_by_name: HashMap<&str, &Module> =
+        mods.iter().map(|m| (m.name.as_str(), m)).collect();
+    let seed_set: HashSet<&str> = seed_exports.iter().map(|s| s.as_str()).collect();
     // Dynamic-dispatch seeding: a module is a candidate target when its
     // name atom appears in reachable code (protocol impl tables, dispatch
     // lists). Which of its exports are roots depends on how dispatch names
@@ -9064,19 +9075,25 @@ fn reachable_funs(
     let mut dyn_modules: HashSet<String> = HashSet::new();
     let mut module_atoms: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut seeded: HashSet<(String, FunName)> = HashSet::new();
+    // seeding-scan deltas (see the incremental-seeding note in the loop)
+    let mut new_mentioned: Vec<String> = Vec::new();
+    let mut new_dyn: Vec<String> = Vec::new();
+    let mut new_pairs: Vec<(String, usize)> = Vec::new();
     while let Some((module, fname)) = work.pop() {
         if !seen.insert((module.clone(), fname.clone())) {
             continue;
         }
-        if seed_exports.iter().any(|s| s == &module) {
-            mentioned.insert(module.clone());
+        if seed_set.contains(module.as_str()) && mentioned.insert(module.clone()) {
+            new_mentioned.push(module.clone());
         }
         let fun = defs[&(module.as_str(), &fname)];
         let mut atoms = BTreeSet::new();
         collect_atoms(&fun.body, &mut atoms);
         for a in atoms {
             if module_names.contains(a.as_str()) {
-                mentioned.insert(a.clone());
+                if mentioned.insert(a.clone()) {
+                    new_mentioned.push(a.clone());
+                }
                 module_atoms.entry(module.clone()).or_default().insert(a);
             } else if a.starts_with("Elixir.") {
                 // possibly a dispatch target whose beam was never pulled
@@ -9091,7 +9108,7 @@ fn reachable_funs(
         let mut arg_pairs = Vec::new();
         collect_atom_arg_pairs(&fun.body, &mut arg_pairs);
         for (pm, pf) in arg_pairs {
-            if let Some(target) = mods.iter().find(|x| x.name == pm) {
+            if let Some(target) = mod_by_name.get(pm.as_str()) {
                 for (df, _) in &target.definitions {
                     if df.name == pf && seeded.insert((pm.clone(), df.clone())) {
                         work.push((pm.clone(), df.clone()));
@@ -9100,40 +9117,90 @@ fn reachable_funs(
             }
         }
         let mut fun_dyn = false;
-        collect_dyn_names(&fun.body, &mut dyn_pairs, &mut fun_dyn, &mut tuple_heads);
-        if fun_dyn && dyn_modules.insert(module.clone()) {
-            if let Some(atoms) = module_atoms.get(&module) {
-                mentioned_dyn.extend(atoms.iter().cloned());
+        let mut item_pairs: HashSet<(String, usize)> = HashSet::new();
+        collect_dyn_names(&fun.body, &mut item_pairs, &mut fun_dyn, &mut tuple_heads);
+        for p in item_pairs {
+            if dyn_pairs.insert(p.clone()) {
+                new_pairs.push(p);
             }
+        }
+        if fun_dyn {
+            dyn_modules.insert(module.clone());
         }
         if dyn_modules.contains(&module) {
             if let Some(atoms) = module_atoms.get(&module) {
-                mentioned_dyn.extend(atoms.iter().cloned());
+                for a in atoms {
+                    if mentioned_dyn.insert(a.clone()) {
+                        new_dyn.push(a.clone());
+                    }
+                }
             }
         }
-        for a in &mentioned {
-            // full seeding stays Elixir-only (Erlang infra mentions each
-            // other constantly — full-seeding gen/global pulls all of OTP);
-            // pair seeding (dynamically-named functions) applies everywhere
-            // application-own modules (--seed-exports) get FULL export
-            // retention once touched — configs/templates dispatch into
-            // them by runtime-built atoms no static analysis can see.
-            // Untouched ones stay pruned (each conformance program must
-            // not drag in its siblings' closures).
-            let full = (mentioned_dyn.contains(a) && a.starts_with("Elixir."))
-                || seed_exports.iter().any(|s| s == a);
-            let m = mods.iter().find(|m| &m.name == a).unwrap();
-            for ex in &m.exports {
-                if ex.name == "module_info" {
+        // Incremental seeding. The old form rescanned every mentioned
+        // module's exports on every work item; all the inputs (mentioned,
+        // mentioned_dyn, dyn_pairs) only ever grow, so processing just the
+        // deltas reaches the identical least fixpoint.
+        // full seeding stays Elixir-only (Erlang infra mentions each
+        // other constantly — full-seeding gen/global pulls all of OTP);
+        // pair seeding (dynamically-named functions) applies everywhere.
+        // Application-own modules (--seed-exports) get FULL export
+        // retention once touched — configs/templates dispatch into
+        // them by runtime-built atoms no static analysis can see.
+        // Untouched ones stay pruned (each conformance program must
+        // not drag in its siblings' closures).
+        while !(new_mentioned.is_empty() && new_dyn.is_empty() && new_pairs.is_empty()) {
+            // a module newly mentioned: seed per its current full status
+            for a in std::mem::take(&mut new_mentioned) {
+                let full = (mentioned_dyn.contains(&a) && a.starts_with("Elixir."))
+                    || seed_set.contains(a.as_str());
+                let m = mod_by_name[a.as_str()];
+                for ex in &m.exports {
+                    if ex.name == "module_info" {
+                        continue;
+                    }
+                    if !(full || dyn_pairs.contains(&(ex.name.clone(), ex.arity))) {
+                        continue;
+                    }
+                    if defs.contains_key(&(m.name.as_str(), ex))
+                        && seeded.insert((m.name.clone(), ex.clone()))
+                    {
+                        work.push((m.name.clone(), ex.clone()));
+                    }
+                }
+            }
+            // a mentioned module upgraded to full (named by a dyn-dispatch
+            // module): seed every export
+            for a in std::mem::take(&mut new_dyn) {
+                if !(a.starts_with("Elixir.") && mentioned.contains(&a)) {
                     continue;
                 }
-                if !(full || dyn_pairs.contains(&(ex.name.clone(), ex.arity))) {
+                let m = mod_by_name[a.as_str()];
+                for ex in &m.exports {
+                    if ex.name == "module_info" {
+                        continue;
+                    }
+                    if defs.contains_key(&(m.name.as_str(), ex))
+                        && seeded.insert((m.name.clone(), ex.clone()))
+                    {
+                        work.push((m.name.clone(), ex.clone()));
+                    }
+                }
+            }
+            // a new literally-named (fun, arity) pair: seed it in every
+            // mentioned module that exports it
+            for (pf, pa) in std::mem::take(&mut new_pairs) {
+                if pf == "module_info" {
                     continue;
                 }
-                if defs.contains_key(&(m.name.as_str(), ex))
-                    && seeded.insert((m.name.clone(), ex.clone()))
-                {
-                    work.push((m.name.clone(), ex.clone()));
+                let exn = FunName { name: pf, arity: pa };
+                for a in &mentioned {
+                    let m = mod_by_name[a.as_str()];
+                    if m.exports.contains(&exn)
+                        && defs.contains_key(&(m.name.as_str(), &exn))
+                        && seeded.insert((m.name.clone(), exn.clone()))
+                    {
+                        work.push((m.name.clone(), exn.clone()));
+                    }
                 }
             }
         }
@@ -9148,7 +9215,7 @@ fn reachable_funs(
                 Edge::RemoteAnyArity(m, _) if is_bif_module(&m) => continue,
                 Edge::RemoteAnyArity(m, fa) => {
                     if have_module.contains(m.as_str()) {
-                        if let Some(target) = mods.iter().find(|x| x.name == m) {
+                        if let Some(target) = mod_by_name.get(m.as_str()) {
                             for (df, _) in &target.definitions {
                                 if df.name == fa {
                                     work.push((m.clone(), df.clone()));

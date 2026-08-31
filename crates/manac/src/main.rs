@@ -49,6 +49,14 @@ fn run() -> Result<(), String> {
                 entry_spec = Some(args.next().ok_or("--entry requires [MODULE:]FUN/ARITY")?)
             }
             "--emit-ir" => emit_ir = true,
+            // the runtime-implemented module list, for the mix driver's
+            // dependency-closure BFS (one line per module)
+            "--print-bif-modules" => {
+                for m in mana_codegen::BIF_MODULES {
+                    println!("{}", m);
+                }
+                return Ok(());
+            }
             // application-own modules: every export stays a root (deps are
             // pruned; the app is wired by config atoms and template names)
             "--seed-exports" => seed_exports
