@@ -231,6 +231,7 @@ pub struct CompileStats {
 
 pub fn compile_program(
     mods: &[Module],
+    source_hashes: &[[u8; 32]],
     entry_mod: &str,
     entry: &FunName,
     out_dir: &Path,
@@ -239,6 +240,7 @@ pub fn compile_program(
     cache: Option<&ObjCache>,
     seed_exports: &[String],
 ) -> CgResult<(Vec<PathBuf>, CompileStats)> {
+    assert_eq!(mods.len(), source_hashes.len());
     if entry.arity != 0 {
         return Err(format!(
             "entry function {}/{} must have arity 0",
@@ -282,7 +284,8 @@ pub fn compile_program(
     let codegen_ns = std::sync::atomic::AtomicU64::new(0);
     let objs: Vec<PathBuf> = pool.install(|| mods
         .par_iter()
-        .map(|m| -> CgResult<Option<PathBuf>> {
+        .enumerate()
+        .map(|(mi, m)| -> CgResult<Option<PathBuf>> {
             let include: HashSet<FunName> = reachable
                 .iter()
                 .filter(|(module, _)| module == &m.name)
@@ -294,7 +297,16 @@ pub fn compile_program(
             let entry_here = (m.name == entry_mod).then_some(entry);
             let tk = std::time::Instant::now();
             let key = cache.map(|c| {
-                action_key(c, m, &include, entry_here, &gc_set, &raise_set, &missing_mods)
+                action_key(
+                    c,
+                    m,
+                    &source_hashes[mi],
+                    &include,
+                    entry_here,
+                    &gc_set,
+                    &raise_set,
+                    &missing_mods,
+                )
             });
             key_ns.fetch_add(
                 tk.elapsed().as_nanos() as u64,
@@ -365,6 +377,7 @@ pub fn compile_program(
 fn action_key(
     cache: &ObjCache,
     m: &Module,
+    source_hash: &[u8; 32],
     include: &HashSet<FunName>,
     entry_here: Option<&FunName>,
     gc_set: &GcSet,
@@ -373,13 +386,14 @@ fn action_key(
 ) -> blake3::Hash {
     let debug_key = std::env::var("MANA_DEBUG_KEY").ok().filter(|d| d == &m.name);
     let mut h = blake3::Hasher::new();
-    h.update(b"mana-action-v1\0");
+    h.update(b"mana-action-v2\0");
     h.update(&cache.tool_hash);
     // target + codegen config (constants today; keyed for the day they move)
     h.update(TargetMachine::get_default_triple().as_str().to_bytes());
     h.update(b"O2/PIC\0");
-    // the AST's Debug form is deterministic (Vec-based, no hash containers)
-    h.update(format!("{:?}", m).as_bytes());
+    // the AST is a pure function of the source text given tool_hash (the
+    // parser lives in the manac binary), so the source hash keys it
+    h.update(source_hash);
     h.update(b"\0include\0");
     let mut inc: Vec<String> = include
         .iter()

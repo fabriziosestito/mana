@@ -166,7 +166,8 @@ When asked to open a PR:
   `MANA_CACHE_DIR` overrides, `MANA_NO_CACHE=1` disables, `MANA_DEBUG_CACHE=1`
   prints hits/misses, `MANA_DEBUG_KEY=<module>` dumps one module's key
   inputs). A module's key hashes: the manac binary itself (rebuilding the
-  compiler invalidates everything), target+config, the module's AST, its
+  compiler invalidates everything), target+config, the module's .core source
+  text (the AST is a pure function of it given the tool hash), its
   include set, the (gc, raise) verdict of every remote callee, referenced
   missing modules, and the entry flag. If you add ANY new input that
   influences emitted code (a flag, an environment toggle, a new analysis),

@@ -70,6 +70,7 @@ fn run() -> Result<(), String> {
     // Parse every input; failures are only fatal if the module is needed.
     let t_total = std::time::Instant::now();
     let mut modules: Vec<mana_syntax::Module> = Vec::new();
+    let mut source_hashes: Vec<[u8; 32]> = Vec::new();
     let mut poisoned: HashMap<String, String> = HashMap::new();
     for input in &inputs {
         let core_path = match input.extension().and_then(|e| e.to_str()) {
@@ -80,7 +81,10 @@ fn run() -> Result<(), String> {
         let src = std::fs::read_to_string(&core_path)
             .map_err(|e| format!("reading {}: {}", core_path.display(), e))?;
         match mana_syntax::parse_module(&src) {
-            Ok(m) => modules.push(m),
+            Ok(m) => {
+                modules.push(m);
+                source_hashes.push(*blake3::hash(src.as_bytes()).as_bytes());
+            }
             Err(e) => {
                 // module name is unknown when parsing fails; key by file stem
                 let name = core_path
@@ -108,6 +112,7 @@ fn run() -> Result<(), String> {
     let cache = obj_cache(emit_ir)?;
     let (objs, stats) = mana_codegen::compile_program(
         &modules,
+        &source_hashes,
         &entry_mod,
         &entry,
         &obj_dir,
