@@ -93,11 +93,17 @@ defmodule Mix.Tasks.Mana.Compile do
   # cache and retry. Only modules the entry actually reaches get pulled in.
   defp compile_loop(manac, mod, fun, arity, app, cores, out, tried, fuel, seed_args) do
     args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ seed_args ++ cores
+    t0 = System.monotonic_time(:millisecond)
     {output, status} = System.cmd(manac, args, stderr_to_stdout: true)
 
     if System.get_env("MANA_DEBUG_LOOP") do
+      ms = System.monotonic_time(:millisecond) - t0
       chars = Enum.count(cores, &String.contains?(&1, "Chars.Integer"))
-      IO.puts("mana-loop: status=#{status} cores=#{length(cores)} chars_int=#{chars} fuel=#{fuel}")
+      time = Enum.find(String.split(output, "\n"), &String.starts_with?(&1, "manac: time:"))
+
+      IO.puts(
+        "mana-loop: status=#{status} cores=#{length(cores)} chars_int=#{chars} fuel=#{fuel} ms=#{ms}#{if time, do: " | " <> time, else: ""}"
+      )
     end
 
     cond do

@@ -217,6 +217,18 @@ fn filetime_touch(p: &Path) -> std::io::Result<()> {
     f.set_len(len)
 }
 
+/// Phase timings for one compile_program run. key/codegen are summed across
+/// Rayon workers (CPU time, not wall).
+pub struct CompileStats {
+    pub reach_s: f64,
+    pub gc_s: f64,
+    pub raise_s: f64,
+    pub key_s: f64,
+    pub codegen_s: f64,
+    pub hits: usize,
+    pub misses: usize,
+}
+
 pub fn compile_program(
     mods: &[Module],
     entry_mod: &str,
@@ -226,7 +238,7 @@ pub fn compile_program(
     poisoned: &HashMap<String, String>,
     cache: Option<&ObjCache>,
     seed_exports: &[String],
-) -> CgResult<Vec<PathBuf>> {
+) -> CgResult<(Vec<PathBuf>, CompileStats)> {
     if entry.arity != 0 {
         return Err(format!(
             "entry function {}/{} must have arity 0",
@@ -241,10 +253,16 @@ pub fn compile_program(
             }
         }
     }
+    let t = std::time::Instant::now();
     let (reachable, missing_mods) =
         reachable_funs(mods, entry_mod, entry, poisoned, seed_exports)?;
+    let reach_s = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
     let gc_set = compute_may_gc(mods, &reachable);
+    let gc_s = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
     let raise_set = compute_may_raise(mods, &reachable);
+    let raise_s = t.elapsed().as_secs_f64();
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("creating {}: {}", out_dir.display(), e))?;
@@ -260,6 +278,8 @@ pub fn compile_program(
         .map_err(|e| format!("thread pool: {}", e))?;
     let hits = std::sync::atomic::AtomicUsize::new(0);
     let misses = std::sync::atomic::AtomicUsize::new(0);
+    let key_ns = std::sync::atomic::AtomicU64::new(0);
+    let codegen_ns = std::sync::atomic::AtomicU64::new(0);
     let objs: Vec<PathBuf> = pool.install(|| mods
         .par_iter()
         .map(|m| -> CgResult<Option<PathBuf>> {
@@ -272,15 +292,21 @@ pub fn compile_program(
                 return Ok(None);
             }
             let entry_here = (m.name == entry_mod).then_some(entry);
+            let tk = std::time::Instant::now();
             let key = cache.map(|c| {
                 action_key(c, m, &include, entry_here, &gc_set, &raise_set, &missing_mods)
             });
+            key_ns.fetch_add(
+                tk.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if let (Some(c), Some(key)) = (cache, key.as_ref()) {
                 if let Some(cached) = c.get(key) {
                     hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(Some(cached));
                 }
             }
+            let tc = std::time::Instant::now();
             let context = Context::create();
             let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
             *cg.missing_modules.borrow_mut() = missing_mods.clone();
@@ -294,6 +320,10 @@ pub fn compile_program(
                 .map_err(|e| format!("LLVM verifier ({}): {}", m.name, e))?;
             let obj = out_dir.join(format!("{}.o", sanitize(&m.name)));
             cg.emit_object(&obj)?;
+            codegen_ns.fetch_add(
+                tc.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if cache.map(|c| c.debug).unwrap_or(false) {
                 eprintln!("manac: cache miss: {}", m.name);
@@ -307,17 +337,26 @@ pub fn compile_program(
         .into_iter()
         .flatten()
         .collect();
+    let hits = hits.load(std::sync::atomic::Ordering::Relaxed);
+    let misses = misses.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(c) = cache {
         if c.debug {
-            eprintln!(
-                "manac: cache: {} hits, {} misses",
-                hits.load(std::sync::atomic::Ordering::Relaxed),
-                misses.load(std::sync::atomic::Ordering::Relaxed)
-            );
+            eprintln!("manac: cache: {} hits, {} misses", hits, misses);
         }
         c.trim();
     }
-    Ok(objs)
+    Ok((
+        objs,
+        CompileStats {
+            reach_s,
+            gc_s,
+            raise_s,
+            key_s: key_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+            codegen_s: codegen_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+            hits,
+            misses,
+        },
+    ))
 }
 
 /// The action key for one module's object: a blake3 hash over every input

@@ -68,6 +68,7 @@ fn run() -> Result<(), String> {
     }
 
     // Parse every input; failures are only fatal if the module is needed.
+    let t_total = std::time::Instant::now();
     let mut modules: Vec<mana_syntax::Module> = Vec::new();
     let mut poisoned: HashMap<String, String> = HashMap::new();
     for input in &inputs {
@@ -98,13 +99,14 @@ fn run() -> Result<(), String> {
     if modules.is_empty() {
         return Err("no input module could be parsed".into());
     }
+    let parse_s = t_total.elapsed().as_secs_f64();
 
     let (entry_mod, entry) = resolve_entry(entry_spec.as_deref(), &modules[0].name)?;
 
     let out = output.unwrap_or_else(|| PathBuf::from(&entry_mod));
     let obj_dir = std::env::temp_dir().join(format!("manac-{}", std::process::id()));
     let cache = obj_cache(emit_ir)?;
-    let objs = mana_codegen::compile_program(
+    let (objs, stats) = mana_codegen::compile_program(
         &modules,
         &entry_mod,
         &entry,
@@ -115,9 +117,25 @@ fn run() -> Result<(), String> {
         &seed_exports,
     )?;
 
+    let t_link = std::time::Instant::now();
     let link_result = link(&objs, &out);
+    let link_s = t_link.elapsed().as_secs_f64();
     let _ = std::fs::remove_dir_all(&obj_dir);
     link_result?;
+    eprintln!(
+        "manac: time: parse={:.2}s/{} reach={:.2}s gc={:.2}s raise={:.2}s key={:.2}s codegen={:.2}s (hit={} miss={}) link={:.2}s total={:.2}s",
+        parse_s,
+        inputs.len(),
+        stats.reach_s,
+        stats.gc_s,
+        stats.raise_s,
+        stats.key_s,
+        stats.codegen_s,
+        stats.hits,
+        stats.misses,
+        link_s,
+        t_total.elapsed().as_secs_f64()
+    );
     println!("{}", out.display());
     Ok(())
 }
