@@ -221,7 +221,16 @@ When asked to open a PR:
   state flip, condvar wake. Same-scheduler sends are zero-copy (local
   minors scan local mailboxes); cross-scheduler payloads are **promoted to
   the shared old space at send** (young parts copied once; old parts always
-  zero-copy). Minors are scheduler-local; majors stop the world (schedulers
+  zero-copy). **There is no remembered set**: anything the runtime stores
+  into old space or cross-process state (`shared_tuple` fields, spawn
+  pending tuples, `pending_kill` exit reasons) must be `promote_term`-ed
+  first — an old→young pointer is invisible to minors and dangles after
+  one. And the major walk must cover *live shared* state (pdict,
+  pending_kill) of RUNNING processes too — only their saved_* fields are
+  stale (`walk_proc_shared_roots`). Both were shipped bugs; the soak that
+  catches this class is `Smoke.Phx` (10k keep-alive requests) plus the
+  `MANA_NURSERY_WORDS=4096` stress pin. Minors are scheduler-local; majors
+  stop the world (schedulers
   park at safepoints: scheduler loop + alloc slow path). **Yield points are
   a subset of GC points**: reduction checks (ctx word 5) only at framed
   entries after params are rooted — never add preemption where a live term
