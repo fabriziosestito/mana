@@ -67,35 +67,68 @@ fn run() -> Result<(), String> {
         return Err("no input files (try --help)".into());
     }
 
-    // Parse every input; failures are only fatal if the module is needed.
+    // Parse every input in parallel; failures are only fatal if the module
+    // is needed. Order is preserved: modules[0] is the default entry module
+    // and link order follows input order. Workers get deep stacks — AST
+    // walkers and the parser recurse per list cell on stdlib literals.
     let t_total = std::time::Instant::now();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .stack_size(256 * 1024 * 1024)
+        .build()
+        .map_err(|e| format!("thread pool: {}", e))?;
+    use rayon::prelude::*;
+    let parsed: Vec<Result<(mana_syntax::Module, [u8; 32]), (String, String)>> =
+        pool.install(|| {
+            inputs
+                .par_iter()
+                .map(|input| {
+                    let core_path = match input.extension().and_then(|e| e.to_str()) {
+                        Some("core") => input.clone(),
+                        Some("erl") => erl_to_core(input)
+                            .map_err(|e| (String::new(), e))?,
+                        _ => {
+                            return Err((
+                                String::new(),
+                                format!("{}: input must be .erl or .core", input.display()),
+                            ))
+                        }
+                    };
+                    let src = std::fs::read_to_string(&core_path)
+                        .map_err(|e| {
+                            (String::new(), format!("reading {}: {}", core_path.display(), e))
+                        })?;
+                    match mana_syntax::parse_module(&src) {
+                        Ok(m) => Ok((m, *blake3::hash(src.as_bytes()).as_bytes())),
+                        Err(e) => {
+                            // module name is unknown when parsing fails; key
+                            // by file stem
+                            let name = core_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            eprintln!(
+                                "manac: warning: skipping {} (parse error: {})",
+                                core_path.display(),
+                                e
+                            );
+                            Err((name, e))
+                        }
+                    }
+                })
+                .collect()
+        });
     let mut modules: Vec<mana_syntax::Module> = Vec::new();
     let mut source_hashes: Vec<[u8; 32]> = Vec::new();
     let mut poisoned: HashMap<String, String> = HashMap::new();
-    for input in &inputs {
-        let core_path = match input.extension().and_then(|e| e.to_str()) {
-            Some("core") => input.clone(),
-            Some("erl") => erl_to_core(input)?,
-            _ => return Err(format!("{}: input must be .erl or .core", input.display())),
-        };
-        let src = std::fs::read_to_string(&core_path)
-            .map_err(|e| format!("reading {}: {}", core_path.display(), e))?;
-        match mana_syntax::parse_module(&src) {
-            Ok(m) => {
+    for r in parsed {
+        match r {
+            Ok((m, h)) => {
                 modules.push(m);
-                source_hashes.push(*blake3::hash(src.as_bytes()).as_bytes());
+                source_hashes.push(h);
             }
-            Err(e) => {
-                // module name is unknown when parsing fails; key by file stem
-                let name = core_path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                eprintln!(
-                    "manac: warning: skipping {} (parse error: {})",
-                    core_path.display(),
-                    e
-                );
+            // empty name = a hard I/O or usage error, not a parse poison
+            Err((name, e)) if name.is_empty() => return Err(e),
+            Err((name, e)) => {
                 poisoned.insert(name, e);
             }
         }
