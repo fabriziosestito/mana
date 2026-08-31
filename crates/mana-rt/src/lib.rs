@@ -95,6 +95,17 @@ pub const KIND_BIN: u64 = 5;
 pub const KIND_BIGLIT: u64 = 6;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
+
+/// MANA_NURSERY_WORDS overrides the initial nursery size AND pins it
+/// (adaptive growth disabled) — a GC-stress knob for shaking out rooting
+/// bugs: tiny nurseries make every allocation path face constant minors.
+fn nursery_words_override() -> Option<usize> {
+    std::env::var("MANA_NURSERY_WORDS").ok()?.parse().ok()
+}
+
+fn initial_nursery_words() -> usize {
+    nursery_words_override().unwrap_or(NURSERY_WORDS)
+}
 const OLD_CHUNK_WORDS: usize = 64 * 1024;
 const OLD_LIMIT_INIT: usize = 4 * OLD_CHUNK_WORDS;
 /// Reservation only — anonymous pages commit lazily on first touch.
@@ -427,16 +438,17 @@ pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
 }
 
 fn new_sched_ctx(global: &'static Global, sched_id: usize) -> *mut ProcCtx {
-    let nursery = alloc_space(NURSERY_WORDS);
+    let nwords = initial_nursery_words();
+    let nursery = alloc_space(nwords);
     let ctx = Box::into_raw(Box::new(ProcCtx {
         heap_top: nursery,
-        heap_end: unsafe { nursery.add(NURSERY_WORDS) },
+        heap_end: unsafe { nursery.add(nwords) },
         roots_head: 0,
         exc_class: 0,
         exc_reason: 0,
         reductions: REDUCTIONS_PER_SLICE,
         nursery_start: nursery,
-        nursery_words: NURSERY_WORDS,
+        nursery_words: nwords,
         global,
         sched_id,
         run_q: VecDeque::new(),
@@ -813,6 +825,9 @@ fn push_and_wake(ctx: &mut ProcCtx, id: usize, msg: u64) {
 /// Deliver an exit signal to `target`. `forced` = exit(Pid, kill).
 fn exit_signal(ctx: &mut ProcCtx, from_pid: usize, target: usize, reason: u64, forced: bool) {
     let g = ctx.global;
+    // the reason lands in old-space tuples and cross-scheduler pending_kill:
+    // young terms would be missed by minors (no remembered set)
+    let reason = promote_term(ctx, reason);
     let Some(cell) = proc_ref(g, target) else {
         return;
     };
@@ -846,6 +861,8 @@ fn exit_signal(ctx: &mut ProcCtx, from_pid: usize, target: usize, reason: u64, f
 /// A process is gone: notify monitors, propagate to links, free the slot.
 fn process_death(ctx: &mut ProcCtx, pid: usize, reason: u64) {
     let g = ctx.global;
+    // the reason goes into old-space DOWN tuples and exit signals
+    let reason = promote_term(ctx, reason);
     let Some(cell) = proc_ref(g, pid) else {
         return;
     };
@@ -1846,14 +1863,18 @@ pub extern "C" fn mana_rt_spawn_monitor(ctx: *mut ProcCtx, closure: u64) -> u64 
 /// pending tuple in the shared old space and registers the process.
 fn spawn_mfa_inner(ctx: &mut ProcCtx, m: u64, f: u64, args: u64) -> u64 {
     let global = ctx.global;
-    // root the inputs while allocating the pending tuple
+    // deep-promote the args first: shared_tuple requires old/eternal/immediate
+    // items, and a young args list referenced from the old-space pending tuple
+    // would be missed by minors (no remembered set) and dangle.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 3, m, f, args];
     fr[0] = saved;
     ctx.roots_head = fr.as_ptr() as u64;
-    let tup = shared_tuple(ctx, &[fr[2], fr[3], fr[4]]);
+    fr[2] = promote_term(ctx, fr[2]);
+    fr[3] = promote_term(ctx, fr[3]);
+    fr[4] = promote_term(ctx, fr[4]);
+    let pending = shared_tuple(ctx, &[fr[2], fr[3], fr[4]]);
     ctx.roots_head = saved;
-    let pending = promote_term(ctx, tup);
     let home = if global.n_scheds == 1 {
         0
     } else {
@@ -6118,7 +6139,10 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
     } else {
         0
     };
-    if grow_to > 0 {
+    // the stress pin (MANA_NURSERY_WORDS) suppresses adaptive growth but
+    // must still honor requests that cannot fit the pinned nursery
+    let must_grow = words * 2 > ctx.nursery_words;
+    if grow_to > 0 && (nursery_words_override().is_none() || must_grow) {
         unsafe { free_space(ctx.nursery_start, ctx.nursery_words) };
         let nursery = alloc_space(grow_to);
         ctx.nursery_start = nursery;
@@ -6156,17 +6180,25 @@ unsafe fn walk_proc_roots(p: &mut Process, mut f: impl FnMut(*mut u64)) {
         f(&mut p.saved_exc_class as *mut u64);
         f(&mut p.saved_exc_reason as *mut u64);
         f(&mut p.pending_closure as *mut u64);
-        {
-            let mut pd = p.pdict.lock();
-            for (k, v) in pd.iter_mut() {
-                f(k as *mut u64);
-                f(v as *mut u64);
-            }
+    }
+    walk_proc_shared_roots(p, f);
+}
+
+/// Live shared state that stays valid even while the process is swapped in:
+/// the pdict and a pending exit reason. Unlike the saved_* fields these must
+/// be forwarded for RUNNING processes too — majors free every old chunk, and
+/// pd_put promotes into old space.
+fn walk_proc_shared_roots(p: &mut Process, mut f: impl FnMut(*mut u64)) {
+    {
+        let mut pd = p.pdict.lock();
+        for (k, v) in pd.iter_mut() {
+            f(k as *mut u64);
+            f(v as *mut u64);
         }
-        let mut ls = p.lstate.lock();
-        if ls.pending_kill != 0 {
-            f(&mut ls.pending_kill as *mut u64);
-        }
+    }
+    let mut ls = p.lstate.lock();
+    if ls.pending_kill != 0 {
+        f(&mut ls.pending_kill as *mut u64);
     }
 }
 
@@ -6208,6 +6240,13 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
                 }
                 if id != ctx.current {
                     walk_proc_roots(p, |s| {
+                        *s = forward_minor(ctx, &mut old, *s, &mut worklist);
+                    });
+                } else {
+                    // pd_put promotes, so this is normally a pass-through;
+                    // it keeps the pdict correct even if a nursery term ever
+                    // lands there.
+                    walk_proc_shared_roots(p, |s| {
                         *s = forward_minor(ctx, &mut old, *s, &mut worklist);
                     });
                 }
@@ -6452,6 +6491,13 @@ fn major_collect_stw(ctx: &mut ProcCtx) {
                 let p = proc_mut(cell);
                 if !running.contains(&id) {
                     walk_proc_roots(p, |s| {
+                        *s = forward_major(*s, from, &mut top, &mut worklist);
+                    });
+                } else {
+                    // running: saved_* fields are stale, but the pdict and
+                    // pending_kill are live and hold old-space terms — the
+                    // from-space is about to be freed.
+                    walk_proc_shared_roots(p, |s| {
                         *s = forward_major(*s, from, &mut top, &mut worklist);
                     });
                 }
@@ -8245,6 +8291,14 @@ pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -
         return raise_badarg(ctx);
     }
     let Ok((argv, n)) = unpack_args(args) else {
+        if std::env::var_os("MANA_DEBUG_BADARG").is_some() {
+            eprintln!(
+                "mana: apply3 bad args list for {}:{} (args {:#x})",
+                String::from_utf8_lossy(atom_bytes(m)),
+                String::from_utf8_lossy(atom_bytes(f)),
+                args
+            );
+        }
         return raise_badarg(ctx);
     };
     let Some(&code) = export_table().get(&(m, f, n as u64)) else {
