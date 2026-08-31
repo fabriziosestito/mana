@@ -12,7 +12,9 @@ defmodule ManaConformance.MixProject do
         # the pure Ecto layer (schema/changeset/type) — no adapters
         {:ecto, "~> 3.13"},
         # the web stack: bandit pulls thousand_island + plug + friends
-        {:bandit, "~> 1.11"}
+        {:bandit, "~> 1.11"},
+        # the scaffolded Phoenix app (mix phx.new, landing-page gate)
+        {:phx_app, path: "../../examples/phoenix/phx_app"}
       ]
     ]
   end
