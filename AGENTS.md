@@ -177,6 +177,28 @@ When asked to open a PR:
   renames, safe for concurrent compiles. The mix task keeps a parallel
   cross-project CORE cache (`<user cache>/mana/cores/<elixir>-otp<otp>/`,
   via `:filename.basedir`) — dumped stdlib Core Erlang keyed by beam mtime.
+- **Compile speed architecture (the compile-speed milestone).** Three
+  layers keep warm builds at hash+link:
+  1. **Analysis summaries** (`<cache>/summary/`, keyed by tool_hash +
+     source blake3): per-fun edges/atoms/dyn-seeding inputs + condensed
+     (base, deps) effect facts. On a summary hit the .core is NOT parsed;
+     the AST is re-materialized (re-read, hash-VERIFIED, re-parsed) only on
+     an object-cache miss. Summaries are produced by the same collectors
+     the analysis consumes — never hand-sync the two. `MANA_CHECK_ANALYSIS=1`
+     re-runs the reference AST walkers and panics on any divergence;
+     `MANA_DEBUG_REACH` dumps the sorted reachable set for diffing.
+  2. **Effect fixpoints are condensed**: expr_may_gc/raise exist twice — the
+     reference boolean walkers and the cond_* condensers (arm-for-arm
+     mirrors; the erlang BIF effect lists are shared fns `erlang_may_gc`/
+     `erlang_may_raise`). Change them TOGETHER, then run the suite under
+     MANA_CHECK_ANALYSIS=1.
+  3. **The mix driver runs one round warm**: `out/manifest` memoizes the
+     last successful build's core list (toolchain-keyed); chase pulls
+     expand through the beam ImpT import closure (`Mana.Closure`, cut list
+     from `manac --print-bif-modules`) so one round absorbs a whole static
+     subgraph; the shared core-cache glob is never passed to manac.
+  `manac: time: parse=… reach=… gc=… raise=… key=… codegen=… link=…` prints
+  on every run — watch it before optimizing anything.
 - **Never delete half-built LLVM basic blocks.** Erasing a block that
   another block still branches to leaves dangling references (LLVM's erase
   does not fix up uses) and manifests as glibc heap corruption in manac
