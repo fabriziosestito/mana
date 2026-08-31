@@ -11,9 +11,12 @@ two console reports side by side.
 Suites: `Bench.Classic` (fib, list churn, maps, binaries), `Bench.Str`
 (unicode/binary string paths), `Bench.Ecto` (the changeset pipeline —
 the milestone scoreboard), `Bench.Io` (file round-trips, TCP loopback
-echo), `Bench.Http` (compiled Bandit+Plug serving HTTP/1.1). `Bench.EctoLoop` is the profiling vehicle for
+echo), `Bench.Http` (compiled Bandit+Plug serving HTTP/1.1), `Bench.Phx`
+(the scaffolded Phoenix app's landing page). `Bench.EctoLoop` is the profiling vehicle for
 the changeset pipeline: a plain 50k-iteration loop with no benchee
 machinery, wired to `make bench-profile` (wall time + callgrind).
+`Smoke.Phx` is not a benchmark: 10k keep-alive requests against the
+Phoenix landing page, the GC soak test (pairs with `MANA_NURSERY_WORDS`).
 
 Numbers are machine-dependent; the reports are for comparison, not
 conformance. Memory/reduction collection stays off (BEAM-internal tracing).
@@ -31,6 +34,8 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | tcp connect+echo64+close | 72.9 µs | 106.9 µs | 2026-08-30, I/O milestone |
 | http GET, new conn | 192 µs | 260 µs | 2026-08-30, Bandit milestone (mana 1.35x faster) |
 | http GET, keepalive | 130 µs | 73 µs | 2026-08-30, Bandit milestone (parsing-bound — sub-binary views are the known lever) |
+| phx landing, new conn | 770 µs | 384 µs | 2026-08-31, Phoenix tier-1 first recorded run |
+| phx landing, keepalive | 576 µs | 211 µs | 2026-08-31, Phoenix tier-1 first recorded run (render+session+CSRF on top of the Bandit gap) |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction
