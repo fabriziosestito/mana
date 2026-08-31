@@ -61,6 +61,20 @@ use inkwell::OptimizationLevel;
 
 use mana_syntax::{ApplyTarget, Clause, Expr, Fun, FunName, Literal, MapAssoc, Module, Pattern};
 
+mod summary;
+pub use summary::{summarize, ModuleSummary, SUMMARY_FORMAT};
+
+/// One compilation input: its summary always present (from the summary
+/// cache or freshly computed); the AST only if this run parsed it. Codegen
+/// re-reads and re-parses on an object-cache miss when `ast` is None (the
+/// re-read verifies `source_hash` — modify-during-compile is a hard error).
+pub struct ModuleUnit {
+    pub path: PathBuf,
+    pub source_hash: [u8; 32],
+    pub summary: ModuleSummary,
+    pub ast: Option<Module>,
+}
+
 const TAG_SMALL: u64 = 0b001;
 const TAG_ATOM: u64 = 0b010;
 const NIL: u64 = 0b011;
@@ -206,6 +220,7 @@ impl ObjCache {
                 }
             }
         }
+        self.trim_summaries(cutoff);
         let _ = std::fs::write(&stamp, b"");
     }
 }
@@ -230,8 +245,7 @@ pub struct CompileStats {
 }
 
 pub fn compile_program(
-    mods: &[Module],
-    source_hashes: &[[u8; 32]],
+    units: &[ModuleUnit],
     entry_mod: &str,
     entry: &FunName,
     out_dir: &Path,
@@ -240,7 +254,6 @@ pub fn compile_program(
     cache: Option<&ObjCache>,
     seed_exports: &[String],
 ) -> CgResult<(Vec<PathBuf>, CompileStats)> {
-    assert_eq!(mods.len(), source_hashes.len());
     if entry.arity != 0 {
         return Err(format!(
             "entry function {}/{} must have arity 0",
@@ -249,21 +262,34 @@ pub fn compile_program(
     }
     {
         let mut names = HashSet::new();
-        for m in mods {
-            if !names.insert(&m.name) {
-                return Err(format!("module '{}' provided more than once", m.name));
+        for u in units {
+            if !names.insert(&u.summary.name) {
+                return Err(format!(
+                    "module '{}' provided more than once",
+                    u.summary.name
+                ));
             }
         }
     }
     let t = std::time::Instant::now();
     let (reachable, missing_mods) =
-        reachable_funs(mods, entry_mod, entry, poisoned, seed_exports)?;
+        reachable_funs(units, entry_mod, entry, poisoned, seed_exports)?;
     let reach_s = t.elapsed().as_secs_f64();
+    if std::env::var_os("MANA_DEBUG_REACH").is_some() {
+        let mut v: Vec<String> = reachable
+            .iter()
+            .map(|(m, f)| format!("{}:{}/{}", m, f.name, f.arity))
+            .collect();
+        v.sort();
+        for l in &v {
+            eprintln!("manac: reach {}", l);
+        }
+    }
     let t = std::time::Instant::now();
-    let gc_set = compute_may_gc(mods, &reachable);
+    let gc_set = compute_may_gc(units, &reachable);
     let gc_s = t.elapsed().as_secs_f64();
     let t = std::time::Instant::now();
-    let raise_set = compute_may_raise(mods, &reachable);
+    let raise_set = compute_may_raise(units, &reachable);
     let raise_s = t.elapsed().as_secs_f64();
     // per-module include sets, built once (reachable is tens of thousands
     // of entries — a per-module filter scan is quadratic)
@@ -291,21 +317,21 @@ pub fn compile_program(
     let misses = std::sync::atomic::AtomicUsize::new(0);
     let key_ns = std::sync::atomic::AtomicU64::new(0);
     let codegen_ns = std::sync::atomic::AtomicU64::new(0);
-    let objs: Vec<PathBuf> = pool.install(|| mods
+    let objs: Vec<PathBuf> = pool.install(|| units
         .par_iter()
-        .enumerate()
-        .map(|(mi, m)| -> CgResult<Option<PathBuf>> {
-            let Some(include) = includes.get(m.name.as_str()) else {
+        .map(|u| -> CgResult<Option<PathBuf>> {
+            let mname = u.summary.name.as_str();
+            let Some(include) = includes.get(mname) else {
                 return Ok(None);
             };
-            let entry_here = (m.name == entry_mod).then_some(entry);
+            let entry_here = (mname == entry_mod).then_some(entry);
             let tk = std::time::Instant::now();
             let key = cache.map(|c| {
                 action_key(
                     c,
-                    m,
-                    &source_hashes[mi],
-                    &include,
+                    &u.summary,
+                    &u.source_hash,
+                    include,
                     entry_here,
                     &gc_set,
                     &raise_set,
@@ -323,11 +349,30 @@ pub fn compile_program(
                 }
             }
             let tc = std::time::Instant::now();
+            // object-cache miss: now (and only now) the AST is needed. If
+            // this run didn't parse it, re-read + verify + parse here.
+            let reparsed: Module;
+            let m: &Module = match &u.ast {
+                Some(m) => m,
+                None => {
+                    let src = std::fs::read_to_string(&u.path)
+                        .map_err(|e| format!("re-reading {}: {}", u.path.display(), e))?;
+                    if blake3::hash(src.as_bytes()).as_bytes() != &u.source_hash {
+                        return Err(format!(
+                            "{}: file content changed during the build",
+                            u.path.display()
+                        ));
+                    }
+                    reparsed = mana_syntax::parse_module(&src)
+                        .map_err(|e| format!("re-parsing {}: {}", u.path.display(), e))?;
+                    &reparsed
+                }
+            };
             let context = Context::create();
             let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
             *cg.missing_modules.borrow_mut() = missing_mods.clone();
             cg.is_entry_module.set(entry_here.is_some());
-            cg.compile(m, &include, entry_here)?;
+            cg.compile(m, include, entry_here)?;
             if dump_ir {
                 eprintln!("{}", cg.module.print_to_string().to_string());
             }
@@ -380,7 +425,7 @@ pub fn compile_program(
 /// are sorted before hashing.
 fn action_key(
     cache: &ObjCache,
-    m: &Module,
+    m: &ModuleSummary,
     source_hash: &[u8; 32],
     include: &HashSet<FunName>,
     entry_here: Option<&FunName>,
@@ -423,13 +468,10 @@ fn action_key(
     // compile as stubs)
     let mut dep_lines: Vec<String> = Vec::new();
     for fname in include {
-        if let Some((_, fun)) = m.definitions.iter().find(|(f, _)| f == fname) {
-            let mut edges = Vec::new();
-            let mut lb = HashSet::new();
-            collect_edges(&fun.body, &mut edges, &mut lb);
-            for e in edges {
+        if let Some(fun) = m.funs.iter().find(|f| &f.name == fname) {
+            for e in &fun.edges {
                 if let Edge::Remote(tm, tf) = e {
-                    if is_bif_module(&tm) {
+                    if is_bif_module(tm) {
                         continue;
                     }
                     let key = (tm.clone(), tf.clone());
@@ -8434,64 +8476,78 @@ fn erlang_may_gc(name: &str, arity: usize) -> bool {
 // ---- GC-effect analysis ----
 
 /// Fixpoint: which reachable functions may trigger a collection.
-/// Each function's body is condensed ONCE into (base, deps) — both effect
-/// traversals are pure monotone ORs over set-membership lookups, so
-/// `base || deps ∩ set != ∅` is exact — then a worklist fixpoint runs over
-/// the condensed graph. MANA_CHECK_ANALYSIS=1 cross-checks against the
-/// original per-iteration walkers.
-fn compute_may_gc(mods: &[Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
-    let defs: HashMap<(&str, &FunName), &Fun> = mods
+/// Per-function (base, deps) condensations come straight from the module
+/// summaries — both effect traversals are pure monotone ORs over
+/// set-membership lookups, so `base || deps ∩ set != ∅` is exact — and a
+/// worklist fixpoint runs over the condensed graph. MANA_CHECK_ANALYSIS=1
+/// cross-checks against the original per-iteration AST walkers (requires
+/// every unit to carry its AST — the driver disables the summary cache
+/// under the flag).
+fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)>) -> GcSet {
+    let defs: HashMap<(&str, &FunName), &summary::FunSummary> = units
         .iter()
-        .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
+        .flat_map(|u| {
+            u.summary
+                .funs
+                .iter()
+                .map(move |f| ((u.summary.name.as_str(), &f.name), f))
+        })
         .collect();
-    let conds: HashMap<(String, FunName), (bool, BTreeSet<(String, FunName)>)> = reachable
+    let conds: HashMap<(String, FunName), (bool, Vec<(String, FunName)>)> = reachable
         .iter()
         .filter_map(|(m, f)| {
-            let fun = defs.get(&(m.as_str(), f))?;
-            let mut base = false;
-            let mut deps = BTreeSet::new();
-            let mut letrec = HashSet::new();
-            cond_may_gc(&fun.body, m, &mut letrec, &mut base, &mut deps);
-            Some(((m.clone(), f.clone()), (base, deps)))
+            let fs = defs.get(&(m.as_str(), f))?;
+            Some(((m.clone(), f.clone()), (fs.gc_base, fs.gc_deps.clone())))
         })
         .collect();
     let set = effect_fixpoint(conds);
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
-        let slow = compute_may_gc_slow(mods, reachable);
-        check_analysis_equal("may_gc", &set, &slow);
+        if let Some(mods) = all_asts(units) {
+            let slow = compute_may_gc_slow(&mods, reachable);
+            check_analysis_equal("may_gc", &set, &slow);
+        }
     }
     set
 }
 
 /// Fixpoint: which reachable functions may raise an exception.
-fn compute_may_raise(mods: &[Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
-    let defs: HashMap<(&str, &FunName), &Fun> = mods
+fn compute_may_raise(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)>) -> GcSet {
+    let defs: HashMap<(&str, &FunName), &summary::FunSummary> = units
         .iter()
-        .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
+        .flat_map(|u| {
+            u.summary
+                .funs
+                .iter()
+                .map(move |f| ((u.summary.name.as_str(), &f.name), f))
+        })
         .collect();
-    let conds: HashMap<(String, FunName), (bool, BTreeSet<(String, FunName)>)> = reachable
+    let conds: HashMap<(String, FunName), (bool, Vec<(String, FunName)>)> = reachable
         .iter()
         .filter_map(|(m, f)| {
-            let fun = defs.get(&(m.as_str(), f))?;
-            let mut base = false;
-            let mut deps = BTreeSet::new();
-            let mut letrec = HashSet::new();
-            cond_may_raise(&fun.body, m, &mut letrec, &mut base, &mut deps);
-            Some(((m.clone(), f.clone()), (base, deps)))
+            let fs = defs.get(&(m.as_str(), f))?;
+            Some(((m.clone(), f.clone()), (fs.raise_base, fs.raise_deps.clone())))
         })
         .collect();
     let set = effect_fixpoint(conds);
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
-        let slow = compute_may_raise_slow(mods, reachable);
-        check_analysis_equal("may_raise", &set, &slow);
+        if let Some(mods) = all_asts(units) {
+            let slow = compute_may_raise_slow(&mods, reachable);
+            check_analysis_equal("may_raise", &set, &slow);
+        }
     }
     set
+}
+
+/// The parsed ASTs of every unit, or None if any unit came from a summary
+/// hit (check mode needs the reference walkers).
+fn all_asts(units: &[ModuleUnit]) -> Option<Vec<&Module>> {
+    units.iter().map(|u| u.ast.as_ref()).collect()
 }
 
 /// Least fixpoint of `f ∈ set ⇔ base(f) || deps(f) ∩ set ≠ ∅` via reverse
 /// edges: when a function turns true, only its dependents get revisited.
 fn effect_fixpoint(
-    conds: HashMap<(String, FunName), (bool, BTreeSet<(String, FunName)>)>,
+    conds: HashMap<(String, FunName), (bool, Vec<(String, FunName)>)>,
 ) -> GcSet {
     let mut rdeps: HashMap<(String, FunName), Vec<(String, FunName)>> = HashMap::new();
     let mut set: GcSet = GcSet::new();
@@ -8537,7 +8593,7 @@ fn check_analysis_equal(what: &str, fast: &GcSet, slow: &GcSet) {
     }
 }
 
-fn compute_may_gc_slow(mods: &[Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
+fn compute_may_gc_slow(mods: &[&Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
     let defs: HashMap<(&str, &FunName), &Fun> = mods
         .iter()
         .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
@@ -8564,7 +8620,7 @@ fn compute_may_gc_slow(mods: &[Module], reachable: &HashSet<(String, FunName)>) 
     }
 }
 
-fn compute_may_raise_slow(mods: &[Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
+fn compute_may_raise_slow(mods: &[&Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
     let defs: HashMap<(&str, &FunName), &Fun> = mods
         .iter()
         .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
@@ -9381,7 +9437,8 @@ fn pattern_vars(p: &Pattern, out: &mut Vec<String>) {
 
 // ---- reachability ----
 
-enum Edge {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Edge {
     Local(FunName),
     Remote(String, FunName),
     /// literal M:F named in a spawn/apply argument position where the
@@ -9391,17 +9448,22 @@ enum Edge {
 }
 
 fn reachable_funs(
-    mods: &[Module],
+    units: &[ModuleUnit],
     entry_mod: &str,
     entry: &FunName,
     poisoned: &HashMap<String, String>,
     seed_exports: &[String],
 ) -> CgResult<(HashSet<(String, FunName)>, HashSet<String>)> {
-    let defs: HashMap<(&str, &FunName), &Fun> = mods
+    let defs: HashMap<(&str, &FunName), &summary::FunSummary> = units
         .iter()
-        .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
+        .flat_map(|u| {
+            u.summary
+                .funs
+                .iter()
+                .map(move |f| ((u.summary.name.as_str(), &f.name), f))
+        })
         .collect();
-    let have_module: HashSet<&str> = mods.iter().map(|m| m.name.as_str()).collect();
+    let have_module: HashSet<&str> = units.iter().map(|u| u.summary.name.as_str()).collect();
 
     if !defs.contains_key(&(entry_mod, entry)) {
         if !have_module.contains(entry_mod) {
@@ -9411,13 +9473,14 @@ fn reachable_funs(
                 have_module.iter().copied().collect::<Vec<_>>().join(", ")
             ));
         }
-        let known: Vec<String> = mods
+        let known: Vec<String> = units
             .iter()
-            .find(|m| m.name == entry_mod)
-            .map(|m| {
-                m.definitions
+            .find(|u| u.summary.name == entry_mod)
+            .map(|u| {
+                u.summary
+                    .funs
                     .iter()
-                    .map(|(f, _)| format!("{}/{}", f.name, f.arity))
+                    .map(|f| format!("{}/{}", f.name.name, f.name.arity))
                     .collect()
             })
             .unwrap_or_default();
@@ -9440,9 +9503,11 @@ fn reachable_funs(
     // required (Kernel etc.) keep full pruning. Reflection exports
     // (module_info) stays out — the runtime answers it; __info__ compiles
     // (get_module_info BIF backs its attributes/compile clauses).
-    let module_names: HashSet<&str> = mods.iter().map(|m| m.name.as_str()).collect();
-    let mod_by_name: HashMap<&str, &Module> =
-        mods.iter().map(|m| (m.name.as_str(), m)).collect();
+    let module_names: HashSet<&str> = units.iter().map(|u| u.summary.name.as_str()).collect();
+    let mod_by_name: HashMap<&str, &ModuleSummary> = units
+        .iter()
+        .map(|u| (u.summary.name.as_str(), &u.summary))
+        .collect();
     let seed_set: HashSet<&str> = seed_exports.iter().map(|s| s.as_str()).collect();
     // Dynamic-dispatch seeding: a module is a candidate target when its
     // name atom appears in reachable code (protocol impl tables, dispatch
@@ -9481,44 +9546,43 @@ fn reachable_funs(
             new_mentioned.push(module.clone());
         }
         let fun = defs[&(module.as_str(), &fname)];
-        let mut atoms = BTreeSet::new();
-        collect_atoms(&fun.body, &mut atoms);
-        for a in atoms {
+        for a in &fun.atoms {
             if module_names.contains(a.as_str()) {
                 if mentioned.insert(a.clone()) {
                     new_mentioned.push(a.clone());
                 }
-                module_atoms.entry(module.clone()).or_default().insert(a);
+                module_atoms
+                    .entry(module.clone())
+                    .or_default()
+                    .insert(a.clone());
             } else if a.starts_with("Elixir.") {
                 // possibly a dispatch target whose beam was never pulled
                 // (consolidated protocol impls); the driver decides
                 // whether a beam exists for it
-                missing_dyn.insert(a);
+                missing_dyn.insert(a.clone());
             }
         }
         // (ModuleAtom, FunAtom) appearing as consecutive literal call args
         // is MFA-shaped data flow (proc_lib:start_link(gen, init_it, ...)):
         // seed every defined arity of the named function
-        let mut arg_pairs = Vec::new();
-        collect_atom_arg_pairs(&fun.body, &mut arg_pairs);
-        for (pm, pf) in arg_pairs {
+        for (pm, pf) in &fun.arg_pairs {
             if let Some(target) = mod_by_name.get(pm.as_str()) {
-                for (df, _) in &target.definitions {
-                    if df.name == pf && seeded.insert((pm.clone(), df.clone())) {
-                        work.push((pm.clone(), df.clone()));
+                for df in &target.funs {
+                    if df.name.name == *pf && seeded.insert((pm.clone(), df.name.clone())) {
+                        work.push((pm.clone(), df.name.clone()));
                     }
                 }
             }
         }
-        let mut fun_dyn = false;
-        let mut item_pairs: HashSet<(String, usize)> = HashSet::new();
-        collect_dyn_names(&fun.body, &mut item_pairs, &mut fun_dyn, &mut tuple_heads);
-        for p in item_pairs {
+        for h in &fun.tuple_heads {
+            tuple_heads.insert(h.clone());
+        }
+        for p in &fun.dyn_pairs {
             if dyn_pairs.insert(p.clone()) {
-                new_pairs.push(p);
+                new_pairs.push(p.clone());
             }
         }
-        if fun_dyn {
+        if fun.fun_dyn {
             dyn_modules.insert(module.clone());
         }
         if dyn_modules.contains(&module) {
@@ -9598,28 +9662,25 @@ fn reachable_funs(
                 }
             }
         }
-        let mut edges = Vec::new();
-        let mut letrec_bound = HashSet::new();
-        collect_edges(&fun.body, &mut edges, &mut letrec_bound);
-        for edge in edges {
+        for edge in &fun.edges {
             let (tmod, tfun) = match edge {
-                Edge::Local(f) => (module.clone(), f),
-                Edge::Remote(m, _) if is_bif_module(&m) => continue, // BIF
-                Edge::Remote(m, f) => (m, f),
-                Edge::RemoteAnyArity(m, _) if is_bif_module(&m) => continue,
+                Edge::Local(f) => (module.clone(), f.clone()),
+                Edge::Remote(m, _) if is_bif_module(m) => continue, // BIF
+                Edge::Remote(m, f) => (m.clone(), f.clone()),
+                Edge::RemoteAnyArity(m, _) if is_bif_module(m) => continue,
                 Edge::RemoteAnyArity(m, fa) => {
                     if have_module.contains(m.as_str()) {
                         if let Some(target) = mod_by_name.get(m.as_str()) {
-                            for (df, _) in &target.definitions {
-                                if df.name == fa {
-                                    work.push((m.clone(), df.clone()));
+                            for df in &target.funs {
+                                if df.name.name == *fa {
+                                    work.push((m.clone(), df.name.clone()));
                                 }
                             }
                         }
                     } else {
                         // an uncompiled module named in a dynamic MFA — the
                         // driver may be able to pull its beam
-                        missing_dyn.insert(m);
+                        missing_dyn.insert(m.clone());
                     }
                     continue;
                 }

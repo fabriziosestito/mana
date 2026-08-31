@@ -75,65 +75,87 @@ fn run() -> Result<(), String> {
         return Err("no input files (try --help)".into());
     }
 
-    // Parse every input in parallel; failures are only fatal if the module
-    // is needed. Order is preserved: modules[0] is the default entry module
-    // and link order follows input order. Workers get deep stacks — AST
-    // walkers and the parser recurse per list cell on stdlib literals.
+    // Load every input in parallel: read + hash, then either a summary-cache
+    // hit (no parse — the AST is only re-materialized on an object-cache
+    // miss) or parse + summarize + publish. Failures are only fatal if the
+    // module is needed. Order is preserved: units[0] is the default entry
+    // module and link order follows input order. Workers get deep stacks —
+    // AST walkers and the parser recurse per list cell on stdlib literals.
     let t_total = std::time::Instant::now();
+    let cache = obj_cache(emit_ir)?;
+    // the reference-walker cross-check needs every AST present
+    let force_ast = std::env::var_os("MANA_CHECK_ANALYSIS").is_some();
     let pool = rayon::ThreadPoolBuilder::new()
         .stack_size(256 * 1024 * 1024)
         .build()
         .map_err(|e| format!("thread pool: {}", e))?;
     use rayon::prelude::*;
-    let parsed: Vec<Result<(mana_syntax::Module, [u8; 32]), (String, String)>> =
-        pool.install(|| {
-            inputs
-                .par_iter()
-                .map(|input| {
-                    let core_path = match input.extension().and_then(|e| e.to_str()) {
-                        Some("core") => input.clone(),
-                        Some("erl") => erl_to_core(input)
-                            .map_err(|e| (String::new(), e))?,
-                        _ => {
-                            return Err((
-                                String::new(),
-                                format!("{}: input must be .erl or .core", input.display()),
-                            ))
-                        }
-                    };
-                    let src = std::fs::read_to_string(&core_path)
-                        .map_err(|e| {
-                            (String::new(), format!("reading {}: {}", core_path.display(), e))
-                        })?;
-                    match mana_syntax::parse_module(&src) {
-                        Ok(m) => Ok((m, *blake3::hash(src.as_bytes()).as_bytes())),
-                        Err(e) => {
-                            // module name is unknown when parsing fails; key
-                            // by file stem
-                            let name = core_path
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            eprintln!(
-                                "manac: warning: skipping {} (parse error: {})",
-                                core_path.display(),
-                                e
-                            );
-                            Err((name, e))
-                        }
+    let loaded: Vec<Result<mana_codegen::ModuleUnit, (String, String)>> = pool.install(|| {
+        inputs
+            .par_iter()
+            .map(|input| {
+                let core_path = match input.extension().and_then(|e| e.to_str()) {
+                    Some("core") => input.clone(),
+                    Some("erl") => erl_to_core(input).map_err(|e| (String::new(), e))?,
+                    _ => {
+                        return Err((
+                            String::new(),
+                            format!("{}: input must be .erl or .core", input.display()),
+                        ))
                     }
-                })
-                .collect()
-        });
-    let mut modules: Vec<mana_syntax::Module> = Vec::new();
-    let mut source_hashes: Vec<[u8; 32]> = Vec::new();
+                };
+                let src = std::fs::read_to_string(&core_path).map_err(|e| {
+                    (String::new(), format!("reading {}: {}", core_path.display(), e))
+                })?;
+                let source_hash = *blake3::hash(src.as_bytes()).as_bytes();
+                if !force_ast {
+                    if let Some(sum) =
+                        cache.as_ref().and_then(|c| c.get_summary(&source_hash))
+                    {
+                        return Ok(mana_codegen::ModuleUnit {
+                            path: core_path,
+                            source_hash,
+                            summary: sum,
+                            ast: None,
+                        });
+                    }
+                }
+                match mana_syntax::parse_module(&src) {
+                    Ok(m) => {
+                        let summary = mana_codegen::summarize(&m);
+                        if let Some(c) = cache.as_ref() {
+                            c.put_summary(&source_hash, &summary);
+                        }
+                        Ok(mana_codegen::ModuleUnit {
+                            path: core_path,
+                            source_hash,
+                            summary,
+                            ast: Some(m),
+                        })
+                    }
+                    Err(e) => {
+                        // module name is unknown when parsing fails; key
+                        // by file stem
+                        let name = core_path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "manac: warning: skipping {} (parse error: {})",
+                            core_path.display(),
+                            e
+                        );
+                        Err((name, e))
+                    }
+                }
+            })
+            .collect()
+    });
+    let mut units: Vec<mana_codegen::ModuleUnit> = Vec::new();
     let mut poisoned: HashMap<String, String> = HashMap::new();
-    for r in parsed {
+    for r in loaded {
         match r {
-            Ok((m, h)) => {
-                modules.push(m);
-                source_hashes.push(h);
-            }
+            Ok(u) => units.push(u),
             // empty name = a hard I/O or usage error, not a parse poison
             Err((name, e)) if name.is_empty() => return Err(e),
             Err((name, e)) => {
@@ -141,19 +163,17 @@ fn run() -> Result<(), String> {
             }
         }
     }
-    if modules.is_empty() {
+    if units.is_empty() {
         return Err("no input module could be parsed".into());
     }
     let parse_s = t_total.elapsed().as_secs_f64();
 
-    let (entry_mod, entry) = resolve_entry(entry_spec.as_deref(), &modules[0].name)?;
+    let (entry_mod, entry) = resolve_entry(entry_spec.as_deref(), &units[0].summary.name)?;
 
     let out = output.unwrap_or_else(|| PathBuf::from(&entry_mod));
     let obj_dir = std::env::temp_dir().join(format!("manac-{}", std::process::id()));
-    let cache = obj_cache(emit_ir)?;
     let (objs, stats) = mana_codegen::compile_program(
-        &modules,
-        &source_hashes,
+        &units,
         &entry_mod,
         &entry,
         &obj_dir,
