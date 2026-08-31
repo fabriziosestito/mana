@@ -1146,6 +1146,547 @@ pub extern "C" fn mana_rt_hibernate(ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -
     EXC_SENTINEL
 }
 
+/// os:getenv/1 (nif_error stub in os.erl — real BIF on BEAM).
+#[no_mangle]
+pub extern "C" fn mana_rt_os_getenv(ctx: *mut ProcCtx, name: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut bytes = Vec::new();
+    if chardata_flatten(name, &mut bytes).is_err() {
+        return raise_badarg(ctx);
+    }
+    let Ok(name) = String::from_utf8(bytes) else {
+        return raise_badarg(ctx);
+    };
+    match std::env::var(&name) {
+        Ok(v) => bytes_to_byte_list(ctx, v.as_bytes()),
+        Err(_) => known().false_a,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External Term Format (term_to_binary/binary_to_term) — the data subset:
+// smalls, atoms, nil, lists (byte lists as STRING_EXT like BEAM), tuples,
+// maps, floats, binaries. Pids/refs/funs are badarg (TODO(etf)); this
+// encoder is also the wire format planned for mana_dist.
+
+fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
+    match t & TAG_MASK {
+        TAG_SMALL => {
+            let v = t as i64 >> 3;
+            if (0..=255).contains(&v) {
+                out.push(97);
+                out.push(v as u8);
+            } else if (i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                out.push(98);
+                out.extend_from_slice(&(v as i32).to_be_bytes());
+            } else {
+                // SMALL_BIG_EXT for the 61-bit smalls beyond i32
+                let (sign, mag) = if v < 0 { (1u8, (-(v as i128)) as u64) } else { (0, v as u64) };
+                let bytes = mag.to_le_bytes();
+                let n = bytes.iter().rposition(|&b| b != 0).map_or(1, |i| i + 1);
+                out.push(110);
+                out.push(n as u8);
+                out.push(sign);
+                out.extend_from_slice(&bytes[..n]);
+            }
+        }
+        TAG_ATOM => {
+            let b = atom_bytes(t);
+            if b.len() <= 255 {
+                out.push(119); // SMALL_ATOM_UTF8_EXT
+                out.push(b.len() as u8);
+            } else {
+                out.push(118);
+                out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+            }
+            out.extend_from_slice(b);
+        }
+        _ if t == NIL => out.push(106),
+        TAG_CONS => {
+            // proper byte lists ≤ 65535 encode as STRING_EXT (BEAM parity)
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut cur = t;
+            let mut is_string = true;
+            let mut len = 0usize;
+            while cur & TAG_MASK == TAG_CONS {
+                let p = (cur & !TAG_MASK) as *const u64;
+                let h = unsafe { *p };
+                len += 1;
+                if is_string && h & TAG_MASK == TAG_SMALL && (0..=255).contains(&(h as i64 >> 3)) {
+                    bytes.push((h as i64 >> 3) as u8);
+                } else {
+                    is_string = false;
+                }
+                cur = unsafe { *p.add(1) };
+            }
+            if is_string && cur == NIL && len <= 65535 {
+                out.push(107);
+                out.extend_from_slice(&(len as u16).to_be_bytes());
+                out.extend_from_slice(&bytes);
+                return Ok(());
+            }
+            out.push(108); // LIST_EXT
+            out.extend_from_slice(&(len as u32).to_be_bytes());
+            let mut cur = t;
+            while cur & TAG_MASK == TAG_CONS {
+                let p = (cur & !TAG_MASK) as *const u64;
+                etf_encode(unsafe { *p }, out)?;
+                cur = unsafe { *p.add(1) };
+            }
+            etf_encode(cur, out)?; // tail (NIL for proper lists)
+        }
+        TAG_BOXED if t != 0 => unsafe {
+            let p = t as *const u64;
+            match *p & 0xff {
+                KIND_TUPLE => {
+                    let n = (*p >> 8) as usize;
+                    if n <= 255 {
+                        out.push(104);
+                        out.push(n as u8);
+                    } else {
+                        out.push(105);
+                        out.extend_from_slice(&(n as u32).to_be_bytes());
+                    }
+                    for i in 1..=n {
+                        etf_encode(*p.add(i), out)?;
+                    }
+                }
+                KIND_MAP => {
+                    let n = (*p >> 8) as usize;
+                    out.push(116);
+                    out.extend_from_slice(&(n as u32).to_be_bytes());
+                    for i in 0..n {
+                        etf_encode(*p.add(1 + i), out)?;
+                        etf_encode(*p.add(1 + n + i), out)?;
+                    }
+                }
+                KIND_FLOAT => {
+                    out.push(70);
+                    let bits = *p.add(1);
+                    out.extend_from_slice(&bits.to_be_bytes());
+                }
+                KIND_BIN => {
+                    let len = (*p >> 8) as usize;
+                    out.push(109);
+                    out.extend_from_slice(&(len as u32).to_be_bytes());
+                    out.extend_from_slice(std::slice::from_raw_parts(
+                        p.add(1) as *const u8,
+                        len,
+                    ));
+                }
+                _ => return Err(()),
+            }
+        },
+        _ => return Err(()), // pids/refs — TODO(etf)
+    }
+    Ok(())
+}
+
+struct EtfDec<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> EtfDec<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ()> {
+        if self.pos + n > self.buf.len() {
+            return Err(());
+        }
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, ()> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, ()> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, ()> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+}
+
+/// Decode one term. `safe` refuses atoms not already interned. All heap
+/// results are built with the partial term rooted via a caller frame —
+/// here we allocate bottom-up and root intermediates in Rust Vecs of
+/// ETERNAL-safe? No: we allocate in the nursery; every recursive result
+/// is immediately stored into its parent allocation, and parents are
+/// allocated AFTER children — children must be rooted across the parent
+/// alloc. We use a per-call stack frame for the child list.
+fn etf_decode(ctx: &mut ProcCtx, d: &mut EtfDec, safe: bool) -> Result<u64, ()> {
+    let tag = d.u8()?;
+    match tag {
+        97 => Ok(((d.u8()? as i64) << 3) as u64 | TAG_SMALL),
+        98 => {
+            let v = i32::from_be_bytes(d.take(4)?.try_into().unwrap()) as i64;
+            Ok(((v << 3) as u64) | TAG_SMALL)
+        }
+        110 => {
+            let n = d.u8()? as usize;
+            let sign = d.u8()?;
+            let mag = d.take(n)?;
+            if n > 8 {
+                return Err(()); // TODO(bignum)
+            }
+            let mut v: u64 = 0;
+            for (i, &b) in mag.iter().enumerate() {
+                v |= (b as u64) << (8 * i);
+            }
+            let v = if sign == 1 { -(v as i64) } else { v as i64 };
+            if v >> 60 != 0 && v >> 60 != -1 {
+                return Err(());
+            }
+            Ok(((v << 3) as u64) | TAG_SMALL)
+        }
+        118 | 119 | 100 | 115 => {
+            let n = if tag == 119 || tag == 115 {
+                d.u8()? as usize
+            } else {
+                d.u16()? as usize
+            };
+            let name = d.take(n)?;
+            if safe && !atom_exists(name) {
+                return Err(());
+            }
+            Ok(atom_intern(name))
+        }
+        106 => Ok(NIL),
+        107 => {
+            let n = d.u16()? as usize;
+            let bytes = d.take(n)?.to_vec();
+            Ok(bytes_to_byte_list(ctx, &bytes))
+        }
+        108 => {
+            let n = d.u32()? as usize;
+            // per-call root frame: [prev, len, children...] in a Vec whose
+            // capacity is fixed up front (the buffer must never move)
+            let saved = ctx.roots_head;
+            let mut fr: Vec<u64> = Vec::with_capacity(3 + n);
+            fr.push(saved);
+            fr.push(0);
+            ctx.roots_head = fr.as_ptr() as u64;
+            for _ in 0..n {
+                let item = match etf_decode(ctx, d, safe) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        ctx.roots_head = saved;
+                        return Err(());
+                    }
+                };
+                fr.push(item);
+                fr[1] += 1;
+            }
+            let tail = match etf_decode(ctx, d, safe) {
+                Ok(v) => v,
+                Err(()) => {
+                    ctx.roots_head = saved;
+                    return Err(());
+                }
+            };
+            fr.push(tail);
+            fr[1] += 1;
+            let mut list = fr[2 + n];
+            for i in (0..n).rev() {
+                let cell = alloc_nursery(ctx, 2);
+                unsafe {
+                    *cell = fr[2 + i];
+                    *cell.add(1) = list;
+                }
+                list = cell as u64 | TAG_CONS;
+                fr[2 + n] = list; // keep the partial list rooted
+            }
+            ctx.roots_head = saved;
+            Ok(list)
+        }
+        104 | 105 => {
+            let n = if tag == 104 { d.u8()? as usize } else { d.u32()? as usize };
+            let saved = ctx.roots_head;
+            let mut fr: Vec<u64> = Vec::with_capacity(2 + n);
+            fr.push(saved);
+            fr.push(0);
+            ctx.roots_head = fr.as_ptr() as u64;
+            for _ in 0..n {
+                let item = match etf_decode(ctx, d, safe) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        ctx.roots_head = saved;
+                        return Err(());
+                    }
+                };
+                fr.push(item);
+                fr[1] += 1;
+            }
+            let t = alloc_nursery(ctx, 1 + n);
+            unsafe {
+                *t = ((n as u64) << 8) | KIND_TUPLE;
+                for i in 0..n {
+                    *t.add(1 + i) = fr[2 + i];
+                }
+            }
+            ctx.roots_head = saved;
+            Ok(t as u64)
+        }
+        116 => {
+            let n = d.u32()? as usize;
+            let saved = ctx.roots_head;
+            let mut fr: Vec<u64> = Vec::with_capacity(2 + 2 * n);
+            fr.push(saved);
+            fr.push(0);
+            ctx.roots_head = fr.as_ptr() as u64;
+            for _ in 0..(2 * n) {
+                let item = match etf_decode(ctx, d, safe) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        ctx.roots_head = saved;
+                        return Err(());
+                    }
+                };
+                fr.push(item);
+                fr[1] += 1;
+            }
+            let m = alloc_nursery(ctx, 1 + 2 * n);
+            unsafe {
+                *m = ((n as u64) << 8) | KIND_MAP;
+                for i in 0..n {
+                    *m.add(1 + i) = fr[2 + 2 * i];
+                    *m.add(1 + n + i) = fr[2 + 2 * i + 1];
+                }
+            }
+            ctx.roots_head = saved;
+            Ok(mana_rt_map_norm(m as u64))
+        }
+        70 => {
+            let bits = u64::from_be_bytes(d.take(8)?.try_into().unwrap());
+            let f = f64::from_bits(bits);
+            let ctxp = ctx as *mut ProcCtx;
+            Ok(box_float(unsafe { &mut *ctxp }, f))
+        }
+        109 => {
+            let n = d.u32()? as usize;
+            let bytes = d.take(n)?.to_vec();
+            Ok(bytes_to_new_bin(ctx, &bytes))
+        }
+        _ => Err(()),
+    }
+}
+
+fn atom_exists(name: &[u8]) -> bool {
+    atom_table_lock().read().unwrap().contains_key(name)
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_term_to_binary(ctx: *mut ProcCtx, t: u64, _opts: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut out = vec![131u8];
+    if etf_encode(t, &mut out).is_err() {
+        return raise_badarg(ctx);
+    }
+    bytes_to_new_bin(ctx, &out)
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_binary_to_term(ctx: *mut ProcCtx, bin: u64, opts: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some((bp, blen)) = bin_parts(bin) else {
+        return raise_badarg(ctx);
+    };
+    let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(bp, blen) }.to_vec();
+    let mut safe = false;
+    let mut used = false;
+    let mut cur = opts;
+    while cur & TAG_MASK == TAG_CONS {
+        let p = (cur & !TAG_MASK) as *const u64;
+        let o = unsafe { *p };
+        if o & TAG_MASK == TAG_ATOM {
+            match atom_bytes(o) {
+                b"safe" => safe = true,
+                b"used" => used = true,
+                _ => {}
+            }
+        }
+        cur = unsafe { *p.add(1) };
+    }
+    if bytes.first() != Some(&131) {
+        return raise_badarg(ctx);
+    }
+    let mut d = EtfDec { buf: &bytes, pos: 1 };
+    let r = etf_decode(ctx, &mut d, safe);
+    let Ok(term) = r else {
+        return raise_badarg(ctx);
+    };
+    if used {
+        let saved = ctx.roots_head;
+        let mut fr = [0u64, 1, term];
+        fr[0] = saved;
+        ctx.roots_head = fr.as_ptr() as u64;
+        let t = alloc_nursery(ctx, 3);
+        unsafe {
+            *t = (2 << 8) | KIND_TUPLE;
+            *t.add(1) = fr[2];
+            *t.add(2) = ((d.pos as i64) << 3) as u64 | TAG_SMALL;
+        }
+        ctx.roots_head = saved;
+        return t as u64;
+    }
+    term
+}
+
+// ---------------------------------------------------------------------------
+// crypto (native cut: crypto.erl's NIF stubs are never compiled) — the
+// subset Plug.Crypto/Phoenix sessions need.
+
+pub const C_RAND: u64 = 0;
+pub const C_HASH: u64 = 1;
+pub const C_MAC: u64 = 2;
+pub const C_EXOR: u64 = 3;
+pub const C_PBKDF2: u64 = 4;
+
+fn crypto_bin_arg(t: u64) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::new();
+    iolist_flatten(t, &mut out).map(|_| out)
+}
+
+fn crypto_hash(alg: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    use sha1::Digest;
+    match alg {
+        b"sha" => Some(sha1::Sha1::digest(data).to_vec()),
+        b"sha224" => Some(sha2::Sha224::digest(data).to_vec()),
+        b"sha256" => Some(sha2::Sha256::digest(data).to_vec()),
+        b"sha384" => Some(sha2::Sha384::digest(data).to_vec()),
+        b"sha512" => Some(sha2::Sha512::digest(data).to_vec()),
+        _ => None,
+    }
+}
+
+fn crypto_hmac(alg: &[u8], key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    use hmac::{Hmac, Mac};
+    macro_rules! mac {
+        ($t:ty) => {{
+            let mut m = <Hmac<$t> as Mac>::new_from_slice(key).ok()?;
+            m.update(data);
+            Some(m.finalize().into_bytes().to_vec())
+        }};
+    }
+    match alg {
+        b"sha" => mac!(sha1::Sha1),
+        b"sha224" => mac!(sha2::Sha224),
+        b"sha256" => mac!(sha2::Sha256),
+        b"sha384" => mac!(sha2::Sha384),
+        b"sha512" => mac!(sha2::Sha512),
+        _ => None,
+    }
+}
+
+/// RFC 2898 PBKDF2 over our HMAC.
+fn crypto_pbkdf2(
+    alg: &[u8],
+    pass: &[u8],
+    salt: &[u8],
+    iters: u64,
+    keylen: usize,
+) -> Option<Vec<u8>> {
+    let hlen = crypto_hmac(alg, pass, b"")?.len();
+    let blocks = keylen.div_ceil(hlen);
+    let mut out = Vec::with_capacity(blocks * hlen);
+    for i in 1..=blocks as u32 {
+        let mut block_in = salt.to_vec();
+        block_in.extend_from_slice(&i.to_be_bytes());
+        let mut u = crypto_hmac(alg, pass, &block_in)?;
+        let mut t = u.clone();
+        for _ in 1..iters {
+            u = crypto_hmac(alg, pass, &u)?;
+            for (ti, ui) in t.iter_mut().zip(u.iter()) {
+                *ti ^= ui;
+            }
+        }
+        out.extend_from_slice(&t);
+    }
+    out.truncate(keylen);
+    Some(out)
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_crypto(
+    ctx: *mut ProcCtx,
+    op: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    match op {
+        C_RAND => {
+            if a & TAG_MASK != TAG_SMALL || (a as i64 >> 3) < 0 {
+                return raise_badarg(ctx);
+            }
+            let n = (a as i64 >> 3) as usize;
+            let mut buf = vec![0u8; n];
+            if getrandom::getrandom(&mut buf).is_err() {
+                return raise_badarg(ctx);
+            }
+            bytes_to_new_bin(ctx, &buf)
+        }
+        C_HASH => {
+            if a & TAG_MASK != TAG_ATOM {
+                return raise_badarg(ctx);
+            }
+            let Ok(data) = crypto_bin_arg(b) else { return raise_badarg(ctx) };
+            match crypto_hash(atom_bytes(a), &data) {
+                Some(h) => bytes_to_new_bin(ctx, &h),
+                None => raise_badarg(ctx),
+            }
+        }
+        C_MAC => {
+            // mac(hmac, Alg, Key, Data)
+            if a & TAG_MASK != TAG_ATOM
+                || atom_bytes(a) != b"hmac"
+                || b & TAG_MASK != TAG_ATOM
+            {
+                return raise_badarg(ctx);
+            }
+            let (Ok(key), Ok(data)) = (crypto_bin_arg(c), crypto_bin_arg(d)) else {
+                return raise_badarg(ctx);
+            };
+            match crypto_hmac(atom_bytes(b), &key, &data) {
+                Some(h) => bytes_to_new_bin(ctx, &h),
+                None => raise_badarg(ctx),
+            }
+        }
+        C_EXOR => {
+            let (Ok(x), Ok(y)) = (crypto_bin_arg(a), crypto_bin_arg(b)) else {
+                return raise_badarg(ctx);
+            };
+            if x.len() != y.len() {
+                return raise_badarg(ctx);
+            }
+            let out: Vec<u8> = x.iter().zip(y.iter()).map(|(p, q)| p ^ q).collect();
+            bytes_to_new_bin(ctx, &out)
+        }
+        C_PBKDF2 => {
+            // pbkdf2_hmac(Alg, Pass, Salt, Iterations, KeyLen)
+            if a & TAG_MASK != TAG_ATOM
+                || d & TAG_MASK != TAG_SMALL
+                || e & TAG_MASK != TAG_SMALL
+            {
+                return raise_badarg(ctx);
+            }
+            let (Ok(pass), Ok(salt)) = (crypto_bin_arg(b), crypto_bin_arg(c)) else {
+                return raise_badarg(ctx);
+            };
+            let iters = (d as i64 >> 3).max(1) as u64;
+            let keylen = (e as i64 >> 3).max(0) as usize;
+            match crypto_pbkdf2(atom_bytes(a), &pass, &salt, iters, keylen) {
+                Some(k) => bytes_to_new_bin(ctx, &k),
+                None => raise_badarg(ctx),
+            }
+        }
+        _ => raise_badarg(ctx),
+    }
+}
+
 /// erlang:iolist_size/1.
 #[no_mangle]
 pub extern "C" fn mana_rt_iolist_size(ctx: *mut ProcCtx, t: u64) -> u64 {
@@ -1155,6 +1696,87 @@ pub extern "C" fn mana_rt_iolist_size(ctx: *mut ProcCtx, t: u64) -> u64 {
         return raise_badarg(ctx);
     }
     ((out.len() as i64) << 3) as u64 | TAG_SMALL
+}
+
+/// erlang:phash2/1,2 — structural term hash. Values are STABLE for this
+/// runtime but do NOT match BEAM's phash2 (documented divergence; callers
+/// use it for sharding/ids, not persisted values).
+fn phash2_term(t: u64, h: &mut u64) {
+    fn mix(h: &mut u64, v: u64) {
+        *h = (*h ^ v).wrapping_mul(0x100000001b3); // FNV-ish
+    }
+    match t & TAG_MASK {
+        TAG_SMALL => mix(h, t),
+        TAG_ATOM => {
+            mix(h, 2);
+            for &b in atom_bytes(t) {
+                mix(h, b as u64);
+            }
+        }
+        _ if t == NIL => mix(h, 3),
+        TAG_CONS => {
+            let mut cur = t;
+            while cur & TAG_MASK == TAG_CONS {
+                let p = (cur & !TAG_MASK) as *const u64;
+                phash2_term(unsafe { *p }, h);
+                cur = unsafe { *p.add(1) };
+            }
+            mix(h, 4);
+            if cur != NIL {
+                phash2_term(cur, h);
+            }
+        }
+        TAG_BOXED if t != 0 => unsafe {
+            let p = t as *const u64;
+            let kind = *p & 0xff;
+            mix(h, 5 + kind);
+            match kind {
+                KIND_TUPLE | KIND_MAP => {
+                    let words = payload_words(*p);
+                    for i in 1..=words {
+                        phash2_term(*p.add(i), h);
+                    }
+                }
+                KIND_FLOAT => mix(h, *p.add(1)),
+                KIND_BIN => {
+                    for &b in std::slice::from_raw_parts(
+                        p.add(1) as *const u8,
+                        (*p >> 8) as usize,
+                    ) {
+                        mix(h, b as u64);
+                    }
+                }
+                _ => mix(h, *p),
+            }
+        },
+        _ => mix(h, t), // pids etc: identity word
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mana_rt_phash2(ctx: *mut ProcCtx, t: u64, range: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let modulus = if range == 0 {
+        1u64 << 27 // phash2/1 default range
+    } else {
+        if range & TAG_MASK != TAG_SMALL || (range as i64 >> 3) <= 0 {
+            return raise_badarg(ctx);
+        }
+        (range as i64 >> 3) as u64
+    };
+    let mut h: u64 = 0xcbf29ce484222325;
+    phash2_term(t, &mut h);
+    (((h % modulus) as i64) << 3) as u64 | TAG_SMALL
+}
+
+/// erlang:unique_integer/0,1 — a global counter (uniqueness only; the
+/// positive/monotonic option atoms are all satisfied by counting up).
+static UNIQUE_INTEGER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+#[no_mangle]
+pub extern "C" fn mana_rt_unique_integer(_ctx: *mut ProcCtx) -> u64 {
+    let v = UNIQUE_INTEGER.fetch_add(1, Ordering::Relaxed);
+    ((v << 3) as u64) | TAG_SMALL
 }
 
 /// erlang:is_record/3 — tuple whose first element is Tag with Size arity.
@@ -3075,6 +3697,7 @@ pub const F_LIST_DIR: u64 = 12;
 pub const F_FILE_INFO: u64 = 13;
 pub const F_FILE_INFO2: u64 = 14;
 pub const F_COPY: u64 = 15;
+pub const F_GET_CWD: u64 = 16;
 
 #[no_mangle]
 pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u64) -> u64 {
@@ -3428,6 +4051,14 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             ctx.roots_head = saved;
             pair_term(ctx, b"ok", p as u64)
         }
+        F_GET_CWD => match std::env::current_dir() {
+            Ok(p) => {
+                let bytes = p.as_os_str().as_encoded_bytes().to_vec();
+                let l = bytes_to_byte_list(ctx, &bytes);
+                pair_term(ctx, b"ok", l)
+            }
+            Err(e) => err_tuple(ctx, &e),
+        },
         F_COPY => {
             let (Ok(from), Ok(to)) = (path_of(a), path_of(b)) else {
                 return raise_badarg(ctx);
@@ -8749,6 +9380,110 @@ pub extern "C" fn mana_rt_maps_update_with(ctx: *mut ProcCtx, key: u64, fun: u64
     mana_rt_map_put(ctx, key2, newv, m2)
 }
 
+/// maps:update_with/4 — like /3 but inserts Init when the key is absent.
+#[no_mangle]
+pub extern "C" fn mana_rt_maps_update_with4(
+    ctx: *mut ProcCtx,
+    key: u64,
+    fun: u64,
+    init: u64,
+    m: u64,
+) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    let Some((p, n)) = map_parts(m) else {
+        return raise_map_err(ctxr, true, m);
+    };
+    if map_index(p, n, key).is_err() {
+        return mana_rt_map_put(ctx, key, init, m);
+    }
+    mana_rt_maps_update_with(ctx, key, fun, m)
+}
+
+/// maps:with/2 / maps:without/2 — key-list subset / complement.
+#[no_mangle]
+pub extern "C" fn mana_rt_maps_with(ctx: *mut ProcCtx, keys: u64, m: u64, keep: u64) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    let Some((_, _)) = map_parts(m) else {
+        return raise_map_err(ctxr, true, m);
+    };
+    // collect wanted keys (immediates or heap terms; compared by eq_exact)
+    let mut want: Vec<u64> = Vec::new();
+    let mut cur = keys;
+    while cur & TAG_MASK == TAG_CONS {
+        let p = (cur & !TAG_MASK) as *const u64;
+        want.push(unsafe { *p });
+        cur = unsafe { *p.add(1) };
+    }
+    let saved = ctxr.roots_head;
+    let mut fr = [0u64, 2, m, NIL];
+    fr[0] = saved;
+    ctxr.roots_head = fr.as_ptr() as u64;
+    // build result by folding put over matching pairs (m stays rooted)
+    let mut acc = {
+        let e = alloc_nursery(ctxr, 1);
+        unsafe { *e = KIND_MAP }; // empty map header
+        e as u64
+    };
+    fr[3] = acc;
+    let n = map_parts(fr[2]).unwrap().1;
+    for i in 0..n {
+        let (p, _) = map_parts(fr[2]).unwrap();
+        let (k, v) = unsafe { (*p.add(1 + i), *p.add(1 + n + i)) };
+        let matched = want.iter().any(|&w| mana_rt_eq_exact(w, k) == 1);
+        let include = if keep != 0 { matched } else { !matched };
+        if include {
+            let r = mana_rt_map_put(ctx, k, v, fr[3]);
+            if r == EXC_SENTINEL {
+                ctxr.roots_head = saved;
+                return EXC_SENTINEL;
+            }
+            fr[3] = r;
+        }
+    }
+    acc = fr[3];
+    ctxr.roots_head = saved;
+    acc
+}
+
+/// maps:foreach/2 — Fun(K, V) per pair, returns ok.
+#[no_mangle]
+pub extern "C" fn mana_rt_maps_foreach(ctx: *mut ProcCtx, fun: u64, m: u64) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    if map_parts(m).is_none() {
+        return raise_map_err(ctxr, true, m);
+    }
+    let saved = ctxr.roots_head;
+    let mut fr = [0u64, 2, fun, m];
+    fr[0] = saved;
+    ctxr.roots_head = fr.as_ptr() as u64;
+    let n = map_parts(fr[3]).unwrap().1;
+    for i in 0..n {
+        let (p, _) = map_parts(fr[3]).unwrap();
+        let (k, v) = unsafe { (*p.add(1 + i), *p.add(1 + n + i)) };
+        let mut fr2 = [0u64, 2, k, v];
+        fr2[0] = ctxr.roots_head;
+        ctxr.roots_head = fr2.as_ptr() as u64;
+        let c2 = alloc_nursery(ctxr, 2);
+        unsafe {
+            *c2 = fr2[3];
+            *c2.add(1) = NIL;
+        }
+        let c1 = alloc_nursery(ctxr, 2);
+        unsafe {
+            *c1 = fr2[2];
+            *c1.add(1) = c2 as u64 | TAG_CONS;
+        }
+        ctxr.roots_head = fr2[0];
+        let r = mana_rt_apply_fun(ctx, fr[2], c1 as u64 | TAG_CONS);
+        if r == EXC_SENTINEL {
+            ctxr.roots_head = saved;
+            return EXC_SENTINEL;
+        }
+    }
+    ctxr.roots_head = saved;
+    atom_intern(b"ok")
+}
+
 /// maps:merge_with/3 — merge with a conflict fun (calls back into compiled
 /// code; everything rooted around the callbacks).
 #[no_mangle]
@@ -8961,6 +9696,310 @@ pub extern "C" fn mana_rt_ets_delete(_ctx: *mut ProcCtx, tab: u64, key: u64) -> 
     known().true_a
 }
 
+/// Restricted ets match pattern: literals (eq_exact), '_' wildcard,
+/// '$N' captures. Captures append to `caps` tagged with N.
+fn ets_match_term(pat: u64, val: u64, caps: &mut Vec<(i64, u64)>) -> bool {
+    if pat & TAG_MASK == TAG_ATOM {
+        let b = atom_bytes(pat);
+        if b == b"_" {
+            return true;
+        }
+        if b.len() >= 2 && b[0] == b'$' && b[1..].iter().all(|c| c.is_ascii_digit()) {
+            let n: i64 = std::str::from_utf8(&b[1..]).unwrap().parse().unwrap_or(0);
+            caps.push((n, val));
+            return true;
+        }
+        return pat == val;
+    }
+    if pat & TAG_MASK == TAG_BOXED && pat != 0 && val & TAG_MASK == TAG_BOXED && val != 0 {
+        unsafe {
+            let (pp, vp) = (pat as *const u64, val as *const u64);
+            if *pp & 0xff == KIND_TUPLE && *vp & 0xff == KIND_TUPLE {
+                let n = (*pp >> 8) as usize;
+                if (*vp >> 8) as usize != n {
+                    return false;
+                }
+                for i in 1..=n {
+                    if !ets_match_term(*pp.add(i), *vp.add(i), caps) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+    }
+    if pat & TAG_MASK == TAG_CONS && val & TAG_MASK == TAG_CONS {
+        unsafe {
+            let (pp, vp) = ((pat & !TAG_MASK) as *const u64, (val & !TAG_MASK) as *const u64);
+            return ets_match_term(*pp, *vp, caps)
+                && ets_match_term(*pp.add(1), *vp.add(1), caps);
+        }
+    }
+    mana_rt_eq_exact(pat, val) == 1
+}
+
+/// ets:match/2 — list of capture lists ('$N' order), insertion order.
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_match(ctx: *mut ProcCtx, tab: u64, pattern: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let rows: Vec<u64> = {
+        let guard = ETS_STORE.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(t, _, _)| mana_rt_eq_exact(*t, tab) == 1)
+                    .map(|&(_, _, v)| v)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // rows are eternal (deep-copied at insert) — safe across allocs
+    let mut matches: Vec<Vec<u64>> = Vec::new();
+    for row in rows {
+        let mut caps: Vec<(i64, u64)> = Vec::new();
+        if ets_match_term(pattern, row, &mut caps) {
+            caps.sort_by_key(|&(n, _)| n);
+            matches.push(caps.into_iter().map(|(_, v)| v).collect());
+        }
+    }
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, NIL, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for caps in matches.iter().rev() {
+        let mut inner = NIL;
+        for &v in caps.iter().rev() {
+            let cell = alloc_nursery(ctx, 2);
+            unsafe {
+                *cell = v;
+                *cell.add(1) = inner;
+            }
+            inner = cell as u64 | TAG_CONS;
+        }
+        fr[3] = inner;
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = fr[3];
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+    }
+    let out = fr[2];
+    ctx.roots_head = saved;
+    out
+}
+
+/// Known-table registry (eternal name terms) — ets:info existence checks.
+static ETS_TABLES: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// ets:new/2 — registers the (named) table; options ignored (TODO(ets)).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_new(_ctx: *mut ProcCtx, name: u64) -> u64 {
+    let mut tabs = ETS_TABLES.lock().unwrap();
+    if !tabs.iter().any(|&t| mana_rt_eq_exact(t, name) == 1) {
+        tabs.push(eternal_deep_copy(name));
+    }
+    name
+}
+
+/// ets:info/1 → undefined for unknown tables, [] otherwise (existence
+/// checks only — Phoenix.Config's cache probe).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_info(_ctx: *mut ProcCtx, tab: u64) -> u64 {
+    let tabs = ETS_TABLES.lock().unwrap();
+    if tabs.iter().any(|&t| mana_rt_eq_exact(t, tab) == 1) {
+        NIL
+    } else {
+        known().undefined
+    }
+}
+
+/// ets:match_delete/2 — drop matching rows.
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_match_delete(_ctx: *mut ProcCtx, tab: u64, pattern: u64) -> u64 {
+    let mut guard = ETS_STORE.lock().unwrap();
+    if let Some(rows) = guard.as_mut() {
+        rows.retain(|&(t, _, v)| {
+            if mana_rt_eq_exact(t, tab) != 1 {
+                return true;
+            }
+            let mut caps = Vec::new();
+            !ets_match_term(pattern, v, &mut caps)
+        });
+    }
+    known().true_a
+}
+
+/// Match-spec BODY term substitution: '$N' → capture, '$_' → object,
+/// '$$' → all captures, {X} (arity-1 tuple) → tuple-escape of X.
+fn ets_subst_body(ctx: &mut ProcCtx, body: u64, caps: &[(i64, u64)], obj: u64) -> u64 {
+    if body & TAG_MASK == TAG_ATOM {
+        let b = atom_bytes(body);
+        if b == b"$_" {
+            return obj;
+        }
+        if b == b"$$" {
+            let mut list = NIL;
+            let mut sorted: Vec<&(i64, u64)> = caps.iter().collect();
+            sorted.sort_by_key(|&&(n, _)| n);
+            for &&(_, v) in sorted.iter().rev() {
+                let cell = alloc_nursery(ctx, 2);
+                unsafe {
+                    *cell = v;
+                    *cell.add(1) = list;
+                }
+                list = cell as u64 | TAG_CONS;
+            }
+            return list;
+        }
+        if b.len() >= 2 && b[0] == b'$' && b[1..].iter().all(|c| c.is_ascii_digit()) {
+            let n: i64 = std::str::from_utf8(&b[1..]).unwrap().parse().unwrap_or(0);
+            if let Some(&(_, v)) = caps.iter().find(|&&(cn, _)| cn == n) {
+                return v;
+            }
+        }
+        return body;
+    }
+    if body & TAG_MASK == TAG_BOXED && body != 0 {
+        unsafe {
+            let p = body as *const u64;
+            if *p & 0xff == KIND_TUPLE && (*p >> 8) == 1 {
+                // {X}: tuple escape — X built literally (with substitution)
+                let inner = *p.add(1);
+                if inner & TAG_MASK == TAG_BOXED
+                    && inner != 0
+                    && *(inner as *const u64) & 0xff == KIND_TUPLE
+                {
+                    let ip = inner as *const u64;
+                    let n = (*ip >> 8) as usize;
+                    // substitute fields first (rooted), then build
+                    let saved = ctx.roots_head;
+                    let mut fields: Vec<u64> = Vec::with_capacity(n);
+                    let mut fr = vec![0u64; 2 + n];
+                    fr[0] = saved;
+                    fr[1] = n as u64;
+                    ctx.roots_head = fr.as_ptr() as u64;
+                    for i in 0..n {
+                        let ip = inner as *const u64; // re-derive (may move? inner unrooted!)
+                        let fv = ets_subst_body(ctx, *ip.add(1 + i), caps, obj);
+                        fr[2 + i] = fv;
+                        fields.push(0);
+                    }
+                    let t = alloc_nursery(ctx, 1 + n);
+                    unsafe {
+                        *t = ((n as u64) << 8) | KIND_TUPLE;
+                        for i in 0..n {
+                            *t.add(1 + i) = fr[2 + i];
+                        }
+                    }
+                    let _ = fields;
+                    ctx.roots_head = saved;
+                    return t as u64;
+                }
+            }
+        }
+    }
+    body
+}
+
+/// ets:select/2 — restricted match specs [{Head, [], [Body]}] (no guards).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_select(ctx: *mut ProcCtx, tab: u64, spec: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    // parse the spec list: [{Head, Guards, [Body]}]
+    let mut clauses: Vec<(u64, u64)> = Vec::new(); // (head, body)
+    let mut cur = spec;
+    while cur & TAG_MASK == TAG_CONS {
+        let p = (cur & !TAG_MASK) as *const u64;
+        let clause = unsafe { *p };
+        cur = unsafe { *p.add(1) };
+        if clause & TAG_MASK != TAG_BOXED || clause == 0 {
+            return raise_badarg(ctx);
+        }
+        unsafe {
+            let cp = clause as *const u64;
+            if *cp != (3 << 8) | KIND_TUPLE {
+                return raise_badarg(ctx);
+            }
+            let guards = *cp.add(2);
+            if guards != NIL {
+                return raise_badarg(ctx); // TODO(ets): guards
+            }
+            let body_list = *cp.add(3);
+            if body_list & TAG_MASK != TAG_CONS {
+                return raise_badarg(ctx);
+            }
+            let bp = (body_list & !TAG_MASK) as *const u64;
+            clauses.push((*cp.add(1), *bp));
+        }
+    }
+    let rows: Vec<u64> = {
+        let guard = ETS_STORE.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(t, _, _)| mana_rt_eq_exact(*t, tab) == 1)
+                    .map(|&(_, _, v)| v)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // results built under a root frame; rows/spec terms are eternal or
+    // caller-live respectively (spec is not used after parsing... heads
+    // and bodies are caller terms — no alloc happens between uses except
+    // inside subst which re-reads from the parsed immediates)
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 2, NIL, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let mut results: Vec<u64> = Vec::new();
+    for row in rows {
+        for &(head, body) in &clauses {
+            let mut caps = Vec::new();
+            if ets_match_term(head, row, &mut caps) {
+                caps.sort_by_key(|&(n, _)| n);
+                results.push(ets_subst_body(ctx, body, &caps, row));
+                break;
+            }
+        }
+        // keep already-built results rooted as a growing list
+        while let Some(r) = results.pop() {
+            fr[3] = r;
+            let cell = alloc_nursery(ctx, 2);
+            unsafe {
+                *cell = fr[3];
+                *cell.add(1) = fr[2];
+            }
+            fr[2] = cell as u64 | TAG_CONS;
+        }
+    }
+    // reverse into final order
+    let mut out = NIL;
+    fr[3] = NIL;
+    let mut cur = fr[2];
+    while cur & TAG_MASK == TAG_CONS {
+        let p = (cur & !TAG_MASK) as *const u64;
+        let v = unsafe { *p };
+        cur = unsafe { *p.add(1) };
+        fr[2] = cur; // remaining source stays rooted
+        let mut fr3 = [0u64, 2, v, out];
+        fr3[0] = ctx.roots_head;
+        ctx.roots_head = fr3.as_ptr() as u64;
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = fr3[2];
+            *cell.add(1) = fr3[3];
+        }
+        ctx.roots_head = fr3[0];
+        out = cell as u64 | TAG_CONS;
+        fr[3] = out;
+    }
+    ctx.roots_head = saved;
+    out
+}
+
 /// ets:lookup_element/3 — badarg on missing table/key (Bandit.Clock's
 /// date_header rescues the resulting ArgumentError to compute a fallback).
 #[no_mangle]
@@ -9070,7 +10109,60 @@ pub extern "C" fn mana_rt_app_get_env(
 // code (native cut: static binary — "loaded" means compiled in)
 
 fn module_is_compiled(m: u64) -> bool {
+    if m & TAG_MASK == TAG_ATOM && is_cut_module(atom_bytes(m)) {
+        return true;
+    }
     export_table().keys().any(|&(em, _, _)| em == m)
+}
+
+/// Modules the compiler implements natively (BIF cuts) or compiles as
+/// runtime raises — they have no export-table entries but "exist" for
+/// code:ensure_loaded / is_loaded (Phoenix.PubSub probes :persistent_term
+/// this way). MUST stay in sync with codegen's is_bif_module + the
+/// unimplemented-raise list.
+fn is_cut_module(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"erlang"
+            | b"maps"
+            | b"io"
+            | b"unicode"
+            | b"persistent_term"
+            | b"code"
+            | b"io_lib"
+            | b"logger"
+            | b"ets"
+            | b"application"
+            | b"file"
+            | b"math"
+            | b"re"
+            | b"timer"
+            | b"gen_tcp"
+            | b"inet"
+            | b"crypto"
+            | b"erts_internal"
+            | b"elixir_erl"
+            | b"erl_eval"
+            | b"beam_lib"
+            | b"global"
+            | b"global_group"
+            | b"net_kernel"
+            | b"zlib"
+    )
+}
+
+/// erlang:module_loaded/1 — closed world: compiled or cut = loaded.
+#[no_mangle]
+pub extern "C" fn mana_rt_module_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if m & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    if module_is_compiled(m) {
+        known().true_a
+    } else {
+        known().false_a
+    }
 }
 
 /// code:is_loaded/1 → {file, "native"} | false (Ecto.Queryable.Atom probes

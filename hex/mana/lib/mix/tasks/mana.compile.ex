@@ -53,6 +53,27 @@ defmodule Mix.Tasks.Mana.Compile do
         core
       end
 
+    # application-own modules keep every export (release semantics):
+    # the project's modules plus any PATH dependency (local apps wired by
+    # config atoms / template-name dispatch). Hex deps stay pruned.
+    path_dep_mods =
+      for {dep_app, dep_path} <- Mix.Project.deps_paths(),
+          not String.starts_with?(Path.expand(dep_path), Path.expand(Mix.Project.deps_path())),
+          beam <-
+            Path.wildcard(
+              Path.join(Mix.Project.build_path(), "lib/#{dep_app}/ebin/*.beam")
+            ),
+          uniq: true,
+          do: Path.basename(beam, ".beam")
+
+    own_mods = Enum.map(beams, &Path.basename(&1, ".beam"))
+
+    seed_args =
+      (own_mods ++ path_dep_mods)
+      |> Enum.uniq()
+      |> Enum.reject(&String.contains?(&1, "Elixir.Mix."))
+      |> Enum.flat_map(&["--seed-exports", &1])
+
     manac = Mana.compiler_path(bin: opts[:bin])
     app = Path.join(out, "app")
     # warm start: previously chased cores. Toolchain modules (Elixir/OTP
@@ -63,15 +84,15 @@ defmodule Mix.Tasks.Mana.Compile do
     cached =
       Path.wildcard(Path.join(shared_cache_dir(), "*.core")) ++
         Path.wildcard(Path.join([out, "core-cache", "*.core"]))
-    compile_loop(manac, mod, fun, arity, app, cached ++ cores, out, MapSet.new(), 400)
+    compile_loop(manac, mod, fun, arity, app, cached ++ cores, out, MapSet.new(), 400, seed_args)
   end
 
   # Reachability-driven stdlib compilation: run manac; when it reports a
   # missing module that we can locate on the code path (Elixir stdlib, OTP
   # stdlib/kernel, deps — anything loadable), dump its Core Erlang into the
   # cache and retry. Only modules the entry actually reaches get pulled in.
-  defp compile_loop(manac, mod, fun, arity, app, cores, out, tried, fuel) do
-    args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ cores
+  defp compile_loop(manac, mod, fun, arity, app, cores, out, tried, fuel, seed_args) do
+    args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ seed_args ++ cores
     {output, status} = System.cmd(manac, args, stderr_to_stdout: true)
 
     if System.get_env("MANA_DEBUG_LOOP") do
@@ -86,7 +107,7 @@ defmodule Mix.Tasks.Mana.Compile do
         # beam exists for and rebuild
         candidates =
           (Regex.scan(~r/dynamic module candidate '([^']+)'/, output) ++
-             Regex.scan(~r/module '([^']+)' \(required by [^)]+\) is not among/, output))
+             Regex.scan(~r/module '([^']+)' \(required by .*\) is not among/, output))
           |> Enum.map(fn [_, m] -> m end)
           |> Enum.uniq()
           |> Enum.reject(&MapSet.member?(tried, &1))
@@ -111,7 +132,8 @@ defmodule Mix.Tasks.Mana.Compile do
             pulled ++ cores,
             out,
             Enum.reduce(candidates, tried, &MapSet.put(&2, &1)),
-            fuel - 1
+            fuel - 1,
+            seed_args
           )
         end
 
@@ -141,7 +163,8 @@ defmodule Mix.Tasks.Mana.Compile do
           pulled ++ cores,
           out,
           Enum.reduce(missing, tried, &MapSet.put(&2, &1)),
-          fuel - 1
+          fuel - 1,
+          seed_args
         )
 
       true ->
@@ -151,7 +174,7 @@ defmodule Mix.Tasks.Mana.Compile do
   end
 
   defp missing_modules(output) do
-    Regex.scan(~r/module '([^']+)' \(required by [^)]+\) is not among the compiled/, output)
+    Regex.scan(~r/module '([^']+)' \(required by .*\) is not among the compiled/, output)
     |> Enum.map(fn [_, m] -> m end)
     |> Enum.uniq()
   end

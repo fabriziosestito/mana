@@ -225,6 +225,7 @@ pub fn compile_program(
     dump_ir: bool,
     poisoned: &HashMap<String, String>,
     cache: Option<&ObjCache>,
+    seed_exports: &[String],
 ) -> CgResult<Vec<PathBuf>> {
     if entry.arity != 0 {
         return Err(format!(
@@ -240,7 +241,8 @@ pub fn compile_program(
             }
         }
     }
-    let (reachable, missing_mods) = reachable_funs(mods, entry_mod, entry, poisoned)?;
+    let (reachable, missing_mods) =
+        reachable_funs(mods, entry_mod, entry, poisoned, seed_exports)?;
     let gc_set = compute_may_gc(mods, &reachable);
     let raise_set = compute_may_raise(mods, &reachable);
 
@@ -1337,6 +1339,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     ("mana_rt_system_time", 0, &[(1_000_000_000u64 << 3) | 0b001])
                 }
                 ("os", "system_time", 1) => ("mana_rt_system_time", 0, &[]),
+                ("os", "getenv", 1) => ("mana_rt_os_getenv", 0, &[]),
                 ("Elixir.System", "cmd", 2) => ("mana_rt_system_cmd", 0, &[NIL_C]),
                 ("Elixir.System", "cmd", 3) => ("mana_rt_system_cmd", 0, &[]),
                 ("Elixir.Float", "round", 2) => ("mana_rt_float_prec", 0, &[0]),
@@ -2433,6 +2436,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if let Some(existing) = self.module.get_function(&sym) {
             return Ok(existing);
         }
+        // check fallibility BEFORE declaring: a linkonce_odr declaration
+        // without a body is invalid IR (this leaked when the target module
+        // was missing)
+        if module.is_some()
+            && !is_bif_module(target_mod)
+            && self.missing_modules.borrow().contains(target_mod)
+        {
+            return Err(format!("module '{}' is not compiled", target_mod));
+        }
         let shim = self
             .module
             .add_function(&sym, self.term_fn_type(fname.arity + 1), None);
@@ -2498,9 +2510,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return Ok(shim);
         }
 
-        if module.is_some() && self.missing_modules.borrow().contains(target_mod) {
-            return Err(format!("module '{}' is not compiled", target_mod));
-        }
         let target = if module.is_none() || module == Some(self.module_name.as_str()) {
             self.local_fn(fname)?
         } else {
@@ -3998,6 +4007,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if module == "gen_tcp" || module == "inet" {
             return self.compile_tcp_bif(f, module, name, args, scope);
         }
+        if module == "crypto" {
+            return self.compile_crypto_bif(f, name, args, scope);
+        }
         if module == "io" {
             return self.compile_io_bif(f, name, args, scope);
         }
@@ -4025,6 +4037,21 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             return match (name, argv.len()) {
                 ("start", 0) | ("start_link", 0) => self.atom_term("ok"),
+                // unit helpers: N * 1000^k as small-int arithmetic
+                ("seconds", 1) | ("minutes", 1) | ("hours", 1) => {
+                    let factor: u64 = match name {
+                        "seconds" => 1000,
+                        "minutes" => 60 * 1000,
+                        _ => 60 * 60 * 1000,
+                    };
+                    self.arith_fastslow(
+                        f,
+                        "*",
+                        2, // AR_MUL
+                        argv[0],
+                        Some(self.i64t.const_int((factor << 3) | 0b001, false)),
+                    )
+                }
                 ("tc", 1) => {
                     let call = self
                         .builder
@@ -4057,6 +4084,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
         if module == "application" {
             return self.compile_application_bif(f, name, args, scope);
+        }
+        if module == "net_kernel" && name == "monitor_nodes" {
+            // single node, forever: subscribing to node events is a no-op
+            // (pg's init calls this — the rest of net_kernel keeps raising)
+            self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+            return self.atom_term("ok");
         }
         if matches!(
             module,
@@ -4101,6 +4134,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 ("read_file_info", 1) | ("read_link_info", 1) => Some(13),
                 ("read_file_info", 2) | ("read_link_info", 2) => Some(14),
                 ("copy", 2) => Some(15),
+                ("get_cwd", 0) => Some(16),
                 _ => None,
             };
             let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
@@ -4157,6 +4191,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             return match name {
                 "allow" => self.atom_term("false"),
+                // Logger.metadata cases on undefined | map
+                "get_process_metadata" => self.atom_term("undefined"),
                 _ => self.atom_term("ok"),
             };
         }
@@ -4530,6 +4566,71 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("get_module_info", 1) => Ok(self.nil()),
+            ("term_to_binary", 1) | ("term_to_binary", 2)
+            | ("binary_to_term", 1) | ("binary_to_term", 2) => {
+                let helper = if name == "term_to_binary" {
+                    "mana_rt_term_to_binary"
+                } else {
+                    "mana_rt_binary_to_term"
+                };
+                let opts = argv.get(1).copied().unwrap_or(self.nil());
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_ptt_i64(helper),
+                        &[self.ctx_val().into(), argv[0].into(), opts.into()],
+                        "etf",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("module_loaded", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_module_loaded"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "mld",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("unique_integer", 0) | ("unique_integer", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_p_i64("mana_rt_unique_integer"),
+                        &[self.ctx_val().into()],
+                        "uniq",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("phash2", 1) | ("phash2", 2) => {
+                let callee = self.rt_fn("mana_rt_phash2", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let range = argv.get(1).copied().unwrap_or(self.i64t.const_zero());
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[self.ctx_val().into(), argv[0].into(), range.into()],
+                        "ph2",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("get_keys", 0) => {
                 let call = self
                     .builder
@@ -6456,7 +6557,38 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         };
         let call = match (name, argv.len()) {
             // tables are identified by their name term; options ignored
-            ("new", 2) => return Ok(argv[0]),
+            ("new", 2) => self
+                .builder
+                .build_call(
+                    self.rt_pt_i64("mana_rt_ets_new"),
+                    &[self.ctx_val().into(), argv[0].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("info", 1) => self
+                .builder
+                .build_call(
+                    self.rt_pt_i64("mana_rt_ets_info"),
+                    &[self.ctx_val().into(), argv[0].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("select", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_select"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("match_delete", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_match_delete"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
             ("insert", 2) | ("insert_new", 2) => self
                 .builder
                 .build_call(
@@ -6476,6 +6608,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .builder
                 .build_call(
                     self.rt_ptt_i64("mana_rt_ets_lookup"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("match", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_match"),
                     &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
                     "ets",
                 )
@@ -6569,7 +6709,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 Ok(call_result(call)?.into_int_value())
             }
-            ("set_env", 3) => {
+            // set_env/4's opts (timeout/persistent) are irrelevant here
+            ("set_env", 3) | ("set_env", 4) => {
                 let callee = self.rt_fn("mana_rt_app_set_env", || {
                     self.i64t.fn_type(
                         &[
@@ -6767,6 +6908,59 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.rt_pt_i64(helper),
                 &[self.ctx_val().into(), argv[0].into()],
                 "uconv",
+            )
+            .map_err(be)?;
+        let v = call_result(call)?.into_int_value();
+        self.check_exc(f, v)
+    }
+
+    /// crypto cut: the Plug.Crypto subset over RustCrypto.
+    fn compile_crypto_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let op: u64 = match (name, args.len()) {
+            ("strong_rand_bytes", 1) => 0,
+            ("hash", 2) => 1,
+            ("mac", 4) => 2,
+            ("exor", 2) => 3,
+            ("pbkdf2_hmac", 5) => 4,
+            _ => return Err(format!("unsupported BIF crypto:{}/{}", name, args.len())),
+        };
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let callee = self.rt_fn("mana_rt_crypto", || {
+            self.i64t.fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        });
+        let zero = self.i64t.const_zero();
+        let arg = |i: usize| -> IntValue<'ctx> { argv.get(i).copied().unwrap_or(zero) };
+        let call = self
+            .builder
+            .build_call(
+                callee,
+                &[
+                    self.ctx_val().into(),
+                    self.i64t.const_int(op, false).into(),
+                    arg(0).into(),
+                    arg(1).into(),
+                    arg(2).into(),
+                    arg(3).into(),
+                    arg(4).into(),
+                ],
+                "cryp",
             )
             .map_err(be)?;
         let v = call_result(call)?.into_int_value();
@@ -7173,6 +7367,88 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         self.rt_ptt_i64("mana_rt_map_take"),
                         &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
                         "mtake",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("with", 2) | ("without", 2) => {
+                let callee = self.rt_fn("mana_rt_maps_with", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            self.i64t
+                                .const_int((name == "with") as u64, false)
+                                .into(),
+                        ],
+                        "mw",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("foreach", 2) => {
+                let callee = self.rt_fn("mana_rt_maps_foreach", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "mfe",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("update_with", 4) => {
+                let callee = self.rt_fn("mana_rt_maps_update_with4", || {
+                    self.i64t.fn_type(
+                        &[
+                            BasicMetadataTypeEnum::PointerType(self.ptrt),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                            BasicMetadataTypeEnum::IntType(self.i64t),
+                        ],
+                        false,
+                    )
+                });
+                let call = self
+                    .builder
+                    .build_call(
+                        callee,
+                        &[
+                            self.ctx_val().into(),
+                            argv[0].into(),
+                            argv[1].into(),
+                            argv[2].into(),
+                            argv[3].into(),
+                        ],
+                        "muw4",
                     )
                     .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
@@ -7927,7 +8203,7 @@ fn is_bif_module(m: &str) -> bool {
         m,
         "erlang" | "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
             | "logger" | "ets" | "application" | "file" | "math" | "re" | "timer"
-            | "gen_tcp" | "inet"
+            | "gen_tcp" | "inet" | "crypto"
             | "erts_internal" | "zlib"
             | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
             | "net_kernel"
@@ -8061,7 +8337,7 @@ fn expr_may_raise(
                     | "logger" | "ets" | "application" | "file" | "erts_internal"
                     | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
                     | "net_kernel" | "math" | "re" | "timer" | "gen_tcp" | "inet"
-                    | "zlib"
+                    | "zlib" | "crypto"
             ) {
                 return true;
             }
@@ -8090,6 +8366,10 @@ fn expr_may_raise(
                         | ("process_flag", 2)
                         | ("hibernate", 3)
                         | ("iolist_size", 1)
+                        | ("term_to_binary", 1)
+                        | ("term_to_binary", 2)
+                        | ("binary_to_term", 1)
+                        | ("binary_to_term", 2)
                         | ("+", 1)
                         | ("-", 1)
                         | ("float", 1)
@@ -8279,6 +8559,10 @@ fn expr_may_gc(
                         | ("decode_packet", 3)
                         | ("hibernate", 3)
                         | ("get_keys", 0)
+                        | ("term_to_binary", 1)
+                        | ("term_to_binary", 2)
+                        | ("binary_to_term", 1)
+                        | ("binary_to_term", 2)
                         | ("++", 2)
                         | ("--", 2)
                         | ("binary_part", 3)
@@ -8311,6 +8595,7 @@ fn expr_may_gc(
                     "put" | "remove" | "merge" | "from_list" | "to_list" | "find"
                         | "fold" | "keys" | "values" | "iterator" | "next"
                         | "merge_with" | "take" | "update" | "update_with"
+                        | "foreach" | "with" | "without"
                 )
             {
                 return true;
@@ -8320,6 +8605,7 @@ fn expr_may_gc(
             if matches!(
                 module.as_str(),
                 "io" | "unicode" | "re" | "timer" | "file" | "gen_tcp" | "inet"
+                    | "crypto"
             ) {
                 return true;
             }
@@ -8654,6 +8940,7 @@ fn reachable_funs(
     entry_mod: &str,
     entry: &FunName,
     poisoned: &HashMap<String, String>,
+    seed_exports: &[String],
 ) -> CgResult<(HashSet<(String, FunName)>, HashSet<String>)> {
     let defs: HashMap<(&str, &FunName), &Fun> = mods
         .iter()
@@ -8718,12 +9005,18 @@ fn reachable_funs(
     // anything); everything else seeds only literally-named pairs
     let mut mentioned_dyn: BTreeSet<String> = BTreeSet::new();
     let mut dyn_pairs: HashSet<(String, usize)> = HashSet::new();
+    // atoms in module position of {M, F, Args} / {M, Opts} literal tuples
+    // (child specs) — chased as candidates even without an Elixir. prefix
+    let mut tuple_heads: HashSet<String> = HashSet::new();
     let mut dyn_modules: HashSet<String> = HashSet::new();
     let mut module_atoms: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut seeded: HashSet<(String, FunName)> = HashSet::new();
     while let Some((module, fname)) = work.pop() {
         if !seen.insert((module.clone(), fname.clone())) {
             continue;
+        }
+        if seed_exports.iter().any(|s| s == &module) {
+            mentioned.insert(module.clone());
         }
         let fun = defs[&(module.as_str(), &fname)];
         let mut atoms = BTreeSet::new();
@@ -8754,7 +9047,7 @@ fn reachable_funs(
             }
         }
         let mut fun_dyn = false;
-        collect_dyn_names(&fun.body, &mut dyn_pairs, &mut fun_dyn);
+        collect_dyn_names(&fun.body, &mut dyn_pairs, &mut fun_dyn, &mut tuple_heads);
         if fun_dyn && dyn_modules.insert(module.clone()) {
             if let Some(atoms) = module_atoms.get(&module) {
                 mentioned_dyn.extend(atoms.iter().cloned());
@@ -8769,7 +9062,13 @@ fn reachable_funs(
             // full seeding stays Elixir-only (Erlang infra mentions each
             // other constantly — full-seeding gen/global pulls all of OTP);
             // pair seeding (dynamically-named functions) applies everywhere
-            let full = mentioned_dyn.contains(a) && a.starts_with("Elixir.");
+            // application-own modules (--seed-exports) get FULL export
+            // retention once touched — configs/templates dispatch into
+            // them by runtime-built atoms no static analysis can see.
+            // Untouched ones stay pruned (each conformance program must
+            // not drag in its siblings' closures).
+            let full = (mentioned_dyn.contains(a) && a.starts_with("Elixir."))
+                || seed_exports.iter().any(|s| s == a);
             let m = mods.iter().find(|m| &m.name == a).unwrap();
             for ex in &m.exports {
                 if ex.name == "module_info" {
@@ -8840,6 +9139,13 @@ fn reachable_funs(
             "manac: module '{}' (required by {}:{}/{}) is not among the compiled modules",
             m, rm, rf.name, rf.arity
         );
+    }
+    // module-position tuple heads ({M, Opts} / {M, F, Args} child specs)
+    // are candidates too, Elixir-prefixed or not (telemetry_poller!)
+    for h in &tuple_heads {
+        if !module_names.contains(h.as_str()) {
+            missing_dyn.insert(h.clone());
+        }
     }
     for m in &missing_dyn {
         eprintln!("manac: note: dynamic module candidate '{}' is not compiled", m);
@@ -8938,7 +9244,12 @@ fn collect_atom_arg_pairs(e: &Expr, out: &mut Vec<(String, String)>) {
 
 /// Literal function names in dynamic-call name positions (with arity), and
 /// whether any name position is a computed expression.
-fn collect_dyn_names(e: &Expr, pairs: &mut HashSet<(String, usize)>, dyn_any: &mut bool) {
+fn collect_dyn_names(
+    e: &Expr,
+    pairs: &mut HashSet<(String, usize)>,
+    dyn_any: &mut bool,
+    heads: &mut HashSet<String>,
+) {
     match e {
         Expr::CallDyn { module: _, name, args } => {
             match name.as_ref() {
@@ -8947,7 +9258,7 @@ fn collect_dyn_names(e: &Expr, pairs: &mut HashSet<(String, usize)>, dyn_any: &m
                 }
                 _ => *dyn_any = true,
             }
-            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any));
+            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads));
         }
         Expr::Call { module, name, args } => {
             // a surviving erlang:apply/3 call has fully dynamic M and F
@@ -8965,7 +9276,7 @@ fn collect_dyn_names(e: &Expr, pairs: &mut HashSet<(String, usize)>, dyn_any: &m
                     }
                 }
             }
-            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any));
+            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads));
         }
         Expr::Lit(_) | Expr::Var(_) | Expr::FunRef { .. } => {}
         Expr::Tuple(items) | Expr::Values(items) => {
@@ -8974,59 +9285,70 @@ fn collect_dyn_names(e: &Expr, pairs: &mut HashSet<(String, usize)>, dyn_any: &m
             // (fun, arity) pair — it only takes effect on modules that are
             // already dynamic candidates, so incidental 3-tuples are inert
             if items.len() == 3 {
-                if let (Expr::Lit(Literal::Atom(_)), Expr::Lit(Literal::Atom(fa))) =
+                if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) =
                     (&items[0], &items[1])
                 {
                     if let Some(n) = static_list_len(&items[2]) {
                         pairs.insert((fa.clone(), n));
+                        heads.insert(m.clone());
                     }
                 }
             }
-            items.iter().for_each(|i| collect_dyn_names(i, pairs, dyn_any))
+            // {Module, Opts} child specs: Supervisor calls
+            // Module.child_spec(Opts) dynamically
+            if items.len() == 2 {
+                if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Nil))
+                | (Expr::Lit(Literal::Atom(m)), Expr::Cons(..)) = (&items[0], &items[1])
+                {
+                    heads.insert(m.clone());
+                    pairs.insert(("child_spec".to_string(), 1));
+                }
+            }
+            items.iter().for_each(|i| collect_dyn_names(i, pairs, dyn_any, heads))
         }
         Expr::Cons(h, t) => {
-            collect_dyn_names(h, pairs, dyn_any);
-            collect_dyn_names(t, pairs, dyn_any);
+            collect_dyn_names(h, pairs, dyn_any, heads);
+            collect_dyn_names(t, pairs, dyn_any, heads);
         }
-        Expr::Fun(f) => collect_dyn_names(&f.body, pairs, dyn_any),
+        Expr::Fun(f) => collect_dyn_names(&f.body, pairs, dyn_any, heads),
         Expr::Let { arg, body, .. } => {
-            collect_dyn_names(arg, pairs, dyn_any);
-            collect_dyn_names(body, pairs, dyn_any);
+            collect_dyn_names(arg, pairs, dyn_any, heads);
+            collect_dyn_names(body, pairs, dyn_any, heads);
         }
         Expr::LetRec { defs, body } => {
             defs.iter()
-                .for_each(|(_, f)| collect_dyn_names(&f.body, pairs, dyn_any));
-            collect_dyn_names(body, pairs, dyn_any);
+                .for_each(|(_, f)| collect_dyn_names(&f.body, pairs, dyn_any, heads));
+            collect_dyn_names(body, pairs, dyn_any, heads);
         }
         Expr::Apply { args, .. } | Expr::PrimOp { args, .. } => {
-            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any))
+            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads))
         }
         Expr::Case { arg, clauses } => {
-            collect_dyn_names(arg, pairs, dyn_any);
+            collect_dyn_names(arg, pairs, dyn_any, heads);
             for c in clauses {
-                collect_dyn_names(&c.guard, pairs, dyn_any);
-                collect_dyn_names(&c.body, pairs, dyn_any);
+                collect_dyn_names(&c.guard, pairs, dyn_any, heads);
+                collect_dyn_names(&c.body, pairs, dyn_any, heads);
             }
         }
         Expr::Try { arg, body, handler, .. } => {
-            collect_dyn_names(arg, pairs, dyn_any);
-            collect_dyn_names(body, pairs, dyn_any);
-            collect_dyn_names(handler, pairs, dyn_any);
+            collect_dyn_names(arg, pairs, dyn_any, heads);
+            collect_dyn_names(body, pairs, dyn_any, heads);
+            collect_dyn_names(handler, pairs, dyn_any, heads);
         }
         Expr::Do(a, b) => {
-            collect_dyn_names(a, pairs, dyn_any);
-            collect_dyn_names(b, pairs, dyn_any);
+            collect_dyn_names(a, pairs, dyn_any, heads);
+            collect_dyn_names(b, pairs, dyn_any, heads);
         }
         Expr::Binary(segs) => segs
             .iter()
-            .for_each(|s| collect_dyn_names(&s.value, pairs, dyn_any)),
+            .for_each(|s| collect_dyn_names(&s.value, pairs, dyn_any, heads)),
         Expr::Map { pairs: mp, update } => {
             for (k, _, v) in mp {
-                collect_dyn_names(k, pairs, dyn_any);
-                collect_dyn_names(v, pairs, dyn_any);
+                collect_dyn_names(k, pairs, dyn_any, heads);
+                collect_dyn_names(v, pairs, dyn_any, heads);
             }
             if let Some(u) = update {
-                collect_dyn_names(u, pairs, dyn_any);
+                collect_dyn_names(u, pairs, dyn_any, heads);
             }
         }
     }

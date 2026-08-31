@@ -35,6 +35,7 @@ fn run() -> Result<(), String> {
     let mut output: Option<PathBuf> = None;
     let mut entry_spec: Option<String> = None;
     let mut emit_ir = false;
+    let mut seed_exports: Vec<String> = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -48,6 +49,10 @@ fn run() -> Result<(), String> {
                 entry_spec = Some(args.next().ok_or("--entry requires [MODULE:]FUN/ARITY")?)
             }
             "--emit-ir" => emit_ir = true,
+            // application-own modules: every export stays a root (deps are
+            // pruned; the app is wired by config atoms and template names)
+            "--seed-exports" => seed_exports
+                .push(args.next().ok_or("--seed-exports requires a module name")?),
             "-h" | "--help" => {
                 println!(
                     "usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES..."
@@ -107,6 +112,7 @@ fn run() -> Result<(), String> {
         emit_ir,
         &poisoned,
         cache.as_ref(),
+        &seed_exports,
     )?;
 
     let link_result = link(&objs, &out);
