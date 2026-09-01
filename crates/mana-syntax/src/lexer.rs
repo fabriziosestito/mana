@@ -269,10 +269,24 @@ impl<'a> Lexer<'a> {
             return Ok(Tok::Float(if negative { -v } else { v }));
         }
         let text = String::from_utf8_lossy(&self.src[start..self.pos]);
+        // smalls are 61-bit tagged (-2^60 ..= 2^60-1): anything outside is
+        // a big literal even when it fits i64 — the old i64 cutoff let
+        // literals in [2^60, 2^63) wrap silently at codegen
+        const SMALL_MAX: i64 = (1 << 60) - 1;
+        const SMALL_MIN: i64 = -(1 << 60);
         match text.parse::<i64>() {
-            Ok(v) => Ok(Tok::Int(if negative { -v } else { v })),
-            // wide constants (bitstring segments, compiler tables); the
-            // sign survives in the digit string for downstream rejection
+            Ok(v) => {
+                let v = if negative { -v } else { v };
+                if (SMALL_MIN..=SMALL_MAX).contains(&v) {
+                    Ok(Tok::Int(v))
+                } else {
+                    Ok(Tok::BigInt(if negative {
+                        format!("-{}", text)
+                    } else {
+                        text.into_owned()
+                    }))
+                }
+            }
             Err(_) => Ok(Tok::BigInt(if negative {
                 format!("-{}", text)
             } else {

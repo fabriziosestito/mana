@@ -93,6 +93,12 @@ pub const KIND_BIN: u64 = 5;
 /// An inert big-integer literal (decimal digits): ordered/compared/printed
 /// correctly, badarith under arithmetic — TODO(bignum) for real math.
 pub const KIND_BIGLIT: u64 = 6;
+/// Real bignum: `[header(limbs<<9 | sign<<8 | 3) | limbs (LE u64)...]`,
+/// normalized (never a value that fits the 61-bit small range, no leading
+/// zero limbs; sign bit set = negative). Allocated in the SHARED OLD SPACE
+/// (alloc_shared: pure bump, never a GC point) so arithmetic keeps its
+/// no-frame fast paths. No term fields — GC copies limbs verbatim.
+pub const KIND_BIGNUM: u64 = 3;
 /// Sub-binary view: `[header(len<<8|13) | parent_term | byte_offset]` — a
 /// zero-copy slice of a ROOT KIND_BIN (never of another view; slicing a
 /// view folds offsets). Same header convention as KIND_BIN so the inline
@@ -158,6 +164,7 @@ fn payload_words(header: u64) -> usize {
         KIND_MAP => 2 * (header >> 8) as usize,
         KIND_BIN | KIND_BIGLIT => ((header >> 8) as usize + 7) / 8,
         KIND_SUBBIN => 2, // parent term + byte offset (len lives in the header)
+        KIND_BIGNUM => (header >> 9) as usize,
         _ => 0,
     }
 }
@@ -1806,6 +1813,13 @@ fn phash2_term(t: u64, h: &mut u64) {
                         mix(h, b as u64);
                     }
                 }
+                KIND_BIGNUM => {
+                    let (neg, mag) = bignum_parts(t).unwrap();
+                    mix(h, neg as u64);
+                    for &l in mag {
+                        mix(h, l);
+                    }
+                }
                 _ => mix(h, *p),
             }
         },
@@ -2108,18 +2122,76 @@ pub extern "C" fn mana_rt_spawn_opt_mfa(
 }
 
 // ---------------------------------------------------------------------------
-// big-integer literal tokens
+// bignums (KIND_BIGNUM) — limb math lives in mod bigint
 
-fn biglit_digits(t: u64) -> Option<&'static [u8]> {
+/// (negative, limbs) of a bignum term.
+fn bignum_parts(t: u64) -> Option<(bool, &'static [u64])> {
     if t & TAG_MASK != TAG_BOXED || t == 0 {
         return None;
     }
     let p = t as *const u64;
     let h = unsafe { *p };
-    if h & 0xff != KIND_BIGLIT {
+    if h & 0xff != KIND_BIGNUM {
         return None;
     }
-    Some(unsafe { std::slice::from_raw_parts(p.add(1) as *const u8, (h >> 8) as usize) })
+    Some((
+        h & 0x100 != 0,
+        unsafe { std::slice::from_raw_parts(p.add(1), (h >> 9) as usize) },
+    ))
+}
+
+/// Is this term an integer (small or bignum)?
+fn is_int_term(t: u64) -> bool {
+    t & TAG_MASK == TAG_SMALL || bignum_parts(t).is_some()
+}
+
+/// (negative, magnitude) of any integer term.
+fn int_mag(t: u64) -> Option<(bool, Vec<u64>)> {
+    if t & TAG_MASK == TAG_SMALL {
+        let v = t as i64 >> 3;
+        return Some(if v < 0 {
+            (true, bigint::normalize(vec![v.unsigned_abs()]))
+        } else {
+            (false, bigint::normalize(vec![v as u64]))
+        });
+    }
+    bignum_parts(t).map(|(neg, l)| (neg, l.to_vec()))
+}
+
+/// THE integer constructor: small when it fits (the small range is
+/// -2^60 ..= 2^60-1), shared-old-space bignum otherwise. Never a GC point.
+fn make_int_mag(ctx: &mut ProcCtx, negative: bool, mag: &[u64]) -> u64 {
+    if mag.is_empty() {
+        return TAG_SMALL; // zero
+    }
+    if mag.len() == 1 {
+        let v = mag[0];
+        if (!negative && v <= (1u64 << 60) - 1) || (negative && v <= 1u64 << 60) {
+            let sv = if negative { -(v as i64) } else { v as i64 };
+            return ((sv << 3) as u64) | TAG_SMALL;
+        }
+    }
+    let p = alloc_shared(ctx, 1 + mag.len());
+    unsafe {
+        *p = ((mag.len() as u64) << 9) | ((negative as u64) << 8) | KIND_BIGNUM;
+        for (i, &l) in mag.iter().enumerate() {
+            *p.add(1 + i) = l;
+        }
+    }
+    p as u64
+}
+
+/// Eternal bignum (literals, no ctx available).
+fn make_int_mag_eternal(negative: bool, mag: &[u64]) -> u64 {
+    debug_assert!(!mag.is_empty());
+    let p = alloc_space(1 + mag.len());
+    unsafe {
+        *p = ((mag.len() as u64) << 9) | ((negative as u64) << 8) | KIND_BIGNUM;
+        for (i, &l) in mag.iter().enumerate() {
+            *p.add(1 + i) = l;
+        }
+    }
+    p as u64
 }
 
 /// Interned eternal big-literal terms, keyed by their decimal text.
@@ -2134,61 +2206,35 @@ pub extern "C" fn mana_rt_big_literal(ptr: *const u8, len: u64) -> u64 {
     if let Some(&t) = map.get(bytes) {
         return t;
     }
-    let n = bytes.len();
-    let words = 1 + (n + 7) / 8;
-    let p = alloc_space(words);
-    unsafe {
-        *p = ((n as u64) << 8) | KIND_BIGLIT;
-        if n % 8 != 0 {
-            *p.add(words - 1) = 0;
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(1) as *mut u8, n);
-    }
-    let t = p as u64;
+    let (neg, digits) = match bytes.strip_prefix(b"-") {
+        Some(rest) => (true, rest),
+        None => (false, bytes),
+    };
+    let mag = bigint::mag_from_decimal(digits).expect("invalid big literal");
+    let t = make_int_mag_eternal(neg, &mag);
     let key: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
     map.insert(key, t);
     t
 }
 
-/// Numeric comparison against/between big literals: sign + digit count +
-/// lexicographic (exact for integers); floats compare via f64 parse.
-fn big_num_cmp(a: u64, b: u64) -> i64 {
-    fn parts(t: u64) -> Option<(bool, &'static [u8])> {
-        biglit_digits(t).map(|d| match d.strip_prefix(b"-") {
-            Some(rest) => (true, rest),
-            None => (false, d),
-        })
+/// Exact comparison of two INTEGER terms (small or bignum).
+fn int_cmp_exact(a: u64, b: u64) -> i64 {
+    if a & TAG_MASK == TAG_SMALL && b & TAG_MASK == TAG_SMALL {
+        let (x, y) = (a as i64 >> 3, b as i64 >> 3);
+        return (x > y) as i64 - (x < y) as i64;
     }
-    match (parts(a), parts(b)) {
-        (Some((na, da)), Some((nb, db))) => {
-            if na != nb {
-                return if na { -1 } else { 1 };
-            }
-            let ord = da
-                .len()
-                .cmp(&db.len())
-                .then_with(|| da.cmp(db));
-            let r = match ord {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            };
-            if na { -r } else { r }
-        }
-        (Some((neg, d)), None) => {
-            // big vs small/float: approximate via f64 (exact for ordering
-            // against 61-bit smalls; adequate for floats)
-            let x: f64 = std::str::from_utf8(d)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(f64::INFINITY);
-            let x = if neg { -x } else { x };
-            let y = num_val(b);
-            (x > y) as i64 - (x < y) as i64
-        }
-        (None, Some(_)) => -big_num_cmp(b, a),
-        (None, None) => 0,
+    let (na, ma) = int_mag(a).expect("int_cmp_exact: not an integer");
+    let (nb, mb) = int_mag(b).expect("int_cmp_exact: not an integer");
+    // normalized zero has an empty magnitude and negative=false
+    if na != nb {
+        return if na { -1 } else { 1 };
     }
+    let r = match bigint::mag_cmp(&ma, &mb) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    if na { -r } else { r }
 }
 
 // ---------------------------------------------------------------------------
@@ -6982,7 +7028,7 @@ fn type_rank(t: u64) -> u8 {
                 KIND_FUN => 3,
                 KIND_MAP => 6,
                 KIND_BIN | KIND_SUBBIN => 9,
-                KIND_BIGLIT => 0, // numbers
+                KIND_BIGLIT | KIND_BIGNUM => 0, // numbers
                 _ => 5, // tuple
             }
         }
@@ -6992,10 +7038,13 @@ fn type_rank(t: u64) -> u8 {
 
 fn num_val(t: u64) -> f64 {
     if t & TAG_MASK == TAG_SMALL {
-        ((t as i64) >> 3) as f64
-    } else {
-        f64::from_bits(unsafe { *(t as *const u64).add(1) })
+        return ((t as i64) >> 3) as f64;
     }
+    if let Some((neg, mag)) = bignum_parts(t) {
+        let v = bigint::mag_to_f64(mag);
+        return if neg { -v } else { v };
+    }
+    f64::from_bits(unsafe { *(t as *const u64).add(1) })
 }
 
 /// Erlang term order with numeric coercion (== semantics for numbers).
@@ -7011,8 +7060,13 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
     }
     match ra {
         0 => {
-            if biglit_digits(a).is_some() || biglit_digits(b).is_some() {
-                return big_num_cmp(a, b);
+            if bignum_parts(a).is_some() || bignum_parts(b).is_some() {
+                // int vs int: exact; int vs float: f64 (num_val knows bigs)
+                if is_int_term(a) && is_int_term(b) {
+                    return int_cmp_exact(a, b);
+                }
+                let (x, y) = (num_val(a), num_val(b));
+                return (x > y) as i64 - (x < y) as i64;
             }
             // numbers, possibly mixed int/float
             if a & TAG_MASK == TAG_SMALL && b & TAG_MASK == TAG_SMALL {
@@ -7171,7 +7225,15 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
                     }
                     1
                 }
-                KIND_BIGLIT => (biglit_digits(a) == biglit_digits(b)) as i64,
+                KIND_BIGNUM => {
+                    // headers equal ⇒ same sign and limb count
+                    for i in 0..(ha >> 9) as usize {
+                        if *pa.add(1 + i) != *pb.add(1 + i) {
+                            return 0;
+                        }
+                    }
+                    1
+                }
                 _ => 0, // funs: identity only (raw-equal handled above)
             }
         },
@@ -9273,7 +9335,7 @@ fn eternal_deep_copy(t: u64) -> u64 {
             unsafe {
                 *np = header;
                 match header & 0xff {
-                    KIND_FLOAT | KIND_BIN => {
+                    KIND_FLOAT | KIND_BIN | KIND_BIGNUM => {
                         std::ptr::copy_nonoverlapping(p.add(1), np.add(1), words - 1);
                     }
                     KIND_FUN => {
@@ -10974,10 +11036,12 @@ fn write_term(t: u64, out: &mut String) {
                     }
                     out.push('}');
                 }
-                KIND_BIGLIT => {
-                    let bytes =
-                        std::slice::from_raw_parts(p.add(1) as *const u8, (header >> 8) as usize);
-                    out.push_str(&String::from_utf8_lossy(bytes));
+                KIND_BIGNUM => {
+                    let (neg, mag) = bignum_parts(t).unwrap();
+                    if neg {
+                        out.push('-');
+                    }
+                    out.push_str(&bigint::mag_to_decimal(mag));
                 }
                 KIND_BIN | KIND_SUBBIN => {
                     let bytes = bin_bytes(t);

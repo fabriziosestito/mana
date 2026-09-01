@@ -796,7 +796,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     // ---- constants ----
 
     fn small_int(&self, n: i64) -> IntValue<'ctx> {
-        // TODO(bignum): values outside the small range wrap silently.
+        // literals outside the small range arrive as Literal::Big (lexer
+        // threshold is 2^60); internal callers pass trusted small values
+        debug_assert!((-(1i64 << 60)..(1i64 << 60)).contains(&n));
         self.i64t.const_int(((n as u64) << 3) | TAG_SMALL, false)
     }
 
@@ -5204,9 +5206,36 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?
                     .into_int_value())
             }
-            ("is_integer", 1) | ("is_atom", 1) | ("is_pid", 1) | ("is_reference", 1) => {
+            ("is_integer", 1) => {
+                let tag = self.tag_of(argv[0])?;
+                let small = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        self.i64t.const_int(1, false),
+                        "ii.s",
+                    )
+                    .map_err(be)?;
+                let isbig = self.kind_test(f, argv[0], |s, header| {
+                    let k = s
+                        .builder
+                        .build_and(header, s.i64t.const_int(0xff, false), "k")
+                        .map_err(be)?;
+                    s.builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(3, false), // KIND_BIGNUM
+                            "k.big",
+                        )
+                        .map_err(be)
+                })?;
+                let c = self.builder.build_or(small, isbig, "isint").map_err(be)?;
+                self.bool_term(c)
+            }
+            ("is_atom", 1) | ("is_pid", 1) | ("is_reference", 1) => {
                 let want: u64 = match name {
-                    "is_integer" => 1,
                     "is_atom" => 2,
                     "is_pid" => 0b0110,
                     _ => 0b1110,
@@ -5326,14 +5355,25 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         .builder
                         .build_and(header, s.i64t.const_int(0xff, false), "k")
                         .map_err(be)?;
-                    s.builder
+                    let f1 = s
+                        .builder
                         .build_int_compare(
                             IntPredicate::EQ,
                             k,
                             s.i64t.const_int(KIND_FLOAT, false),
                             "k.f",
                         )
-                        .map_err(be)
+                        .map_err(be)?;
+                    let bg = s
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            k,
+                            s.i64t.const_int(3, false), // KIND_BIGNUM
+                            "k.b",
+                        )
+                        .map_err(be)?;
+                    s.builder.build_or(f1, bg, "k.n").map_err(be)
                 })?;
                 let c = self.builder.build_or(small, isf, "isnum").map_err(be)?;
                 self.bool_term(c)
