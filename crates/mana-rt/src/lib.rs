@@ -93,13 +93,15 @@ pub const KIND_BIN: u64 = 5;
 /// An inert big-integer literal (decimal digits): ordered/compared/printed
 /// correctly, badarith under arithmetic — TODO(bignum) for real math.
 pub const KIND_BIGLIT: u64 = 6;
-/// Sub-binary view: `[header(len<<8|7) | parent_term | byte_offset]` — a
+/// Sub-binary view: `[header(len<<8|13) | parent_term | byte_offset]` — a
 /// zero-copy slice of a ROOT KIND_BIN (never of another view; slicing a
 /// view folds offsets). Same header convention as KIND_BIN so the inline
-/// length preflight works for both; kinds 5/7 differ only in bit 1, so
-/// `(kind | 2) == 7` accepts either. The parent is a TERM (it moves under
-/// GC) — data pointers are recomputed on every access, never cached.
-pub const KIND_SUBBIN: u64 = 7;
+/// length preflight works for both; kinds 5 (0b0101) and 13 (0b1101)
+/// differ only in bit 3, so `(kind | 8) == 13` accepts either. Kind 7 is
+/// FORBIDDEN for heap objects: header low bits 0b111 collide with the
+/// GC's TAG_FORWARD marker. The parent is a TERM (it moves under GC) —
+/// data pointers are recomputed on every access, never cached.
+pub const KIND_SUBBIN: u64 = 13;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 
@@ -227,6 +229,12 @@ struct Process {
     /// process dictionary. Values are promoted at put, so cross-thread
     /// readers (process_info) only ever see old-space/immediate terms.
     pdict: Mutex<Vec<(u64, u64)>>,
+    /// may this process reference its home scheduler's CURRENT nursery?
+    /// Set when it runs (swap-out) or receives any message; cleared by the
+    /// minor that scans it. Clean parked processes are skipped by minors —
+    /// a parked process only gains nursery refs by running or by a local
+    /// send, and its previous refs were forwarded by the prior minor.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -544,6 +552,7 @@ pub extern "C" fn mana_rt_run(
                 pending_closure: 0,
                 lstate: Mutex::new(LinkState::default()),
                 pdict: Mutex::new(Vec::new()),
+            dirty: std::sync::atomic::AtomicBool::new(true),
             },
         );
         debug_assert_eq!(pid, 0);
@@ -615,6 +624,8 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
                 p.saved_roots = ctx.roots_head;
                 p.saved_exc_class = ctx.exc_class;
                 p.saved_exc_reason = ctx.exc_reason;
+                // it ran: its roots/queues may reference the nursery
+                p.dirty.store(true, Ordering::Release);
                 let killed = p.lstate.lock().pending_kill;
                 if killed != 0 {
                     process_death(ctx, pid, killed);
@@ -816,6 +827,7 @@ fn push_and_wake(ctx: &mut ProcCtx, id: usize, msg: u64) {
         return;
     };
     let p = unsafe { &*cell.0.get() };
+    p.dirty.store(true, Ordering::Release);
     p.ingress.push(msg);
     let mut st = p.state.lock();
     if matches!(*st, PState::Waiting(_)) {
@@ -2028,6 +2040,7 @@ fn spawn_mfa_inner(ctx: &mut ProcCtx, m: u64, f: u64, args: u64) -> u64 {
             pending_closure: pending,
             lstate: Mutex::new(LinkState::default()),
             pdict: Mutex::new(Vec::new()),
+            dirty: std::sync::atomic::AtomicBool::new(true),
         },
     );
     if home == ctx.sched_id {
@@ -5496,11 +5509,25 @@ pub extern "C" fn mana_rt_decode_packet(ctx: *mut ProcCtx, ty: u64, bin: u64, _o
         return raise_badarg(ctx);
     };
     let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(bp, blen) }.to_vec();
-    match atom_bytes(ty) {
-        b"http_bin" => dp_http(ctx, &bytes),
-        b"httph_bin" => dp_httph(ctx, &bytes),
-        _ => raise_badarg(ctx),
-    }
+    // root the input binary across the parse: dp_ok slices the REST out of
+    // it (a view for large tails — Bandit re-feeds ever-shrinking buffers,
+    // and copying every rest made header parsing O(lines x buffer))
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, bin];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    let slot = &fr[2] as *const u64;
+    let base = bytes.as_ptr();
+    let r = match atom_bytes(ty) {
+        b"http_bin" => dp_http(ctx, slot, base, &bytes),
+        b"httph_bin" => dp_httph(ctx, slot, base, &bytes),
+        _ => {
+            ctx.roots_head = saved;
+            return raise_badarg(ctx);
+        }
+    };
+    ctx.roots_head = saved;
+    r
 }
 
 fn dp_more(ctx: &mut ProcCtx) -> u64 {
@@ -5508,13 +5535,25 @@ fn dp_more(ctx: &mut ProcCtx) -> u64 {
 }
 
 /// {ok, Packet, Rest} with Packet rooted across the Rest allocation.
-fn dp_ok(ctx: &mut ProcCtx, packet: u64, rest: &[u8]) -> u64 {
+/// `bin_slot` points at the GC-rooted original input term; `base` is the
+/// scratch copy's start — Rest becomes a slice of the ORIGINAL binary
+/// (zero-copy view when large).
+fn dp_ok(
+    ctx: &mut ProcCtx,
+    packet: u64,
+    bin_slot: *const u64,
+    base: *const u8,
+    rest: &[u8],
+) -> u64 {
+    let off = rest.as_ptr() as usize - base as usize;
     let saved = ctx.roots_head;
     let mut fr = [0u64, 2, NIL, NIL];
     fr[0] = saved;
     fr[2] = packet;
     ctx.roots_head = fr.as_ptr() as u64;
-    fr[3] = bytes_to_new_bin(ctx, rest);
+    let r = mana_rt_bin_slice(ctx as *mut ProcCtx, unsafe { *bin_slot }, off as u64, rest.len() as i64);
+    let ctx = unsafe { &mut *(ctx as *mut ProcCtx) };
+    fr[3] = r;
     let p = alloc_nursery(ctx, 4);
     unsafe {
         *p = (3 << 8) | KIND_TUPLE;
@@ -5526,10 +5565,16 @@ fn dp_ok(ctx: &mut ProcCtx, packet: u64, rest: &[u8]) -> u64 {
     p as u64
 }
 
-fn dp_http_error(ctx: &mut ProcCtx, line: &[u8], rest: &[u8]) -> u64 {
+fn dp_http_error(
+    ctx: &mut ProcCtx,
+    bin_slot: *const u64,
+    base: *const u8,
+    line: &[u8],
+    rest: &[u8],
+) -> u64 {
     let lb = bytes_to_new_bin(ctx, line);
     let err = pair_term(ctx, b"http_error", lb); // roots lb internally
-    dp_ok(ctx, err, rest)
+    dp_ok(ctx, err, bin_slot, base, rest)
 }
 
 /// Take one line (up to and including \r\n or \n). Returns (line_without
@@ -5544,7 +5589,7 @@ fn dp_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
     Some((line, nl + 1))
 }
 
-fn dp_http(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+fn dp_http(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8, bytes: &[u8]) -> u64 {
     let Some((line, rest_at)) = dp_line(bytes) else {
         return dp_more(ctx);
     };
@@ -5552,23 +5597,23 @@ fn dp_http(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     let full_line = &bytes[..rest_at];
     // response line?
     if line.starts_with(b"HTTP/") {
-        return dp_response(ctx, line, full_line, rest);
+        return dp_response(ctx, bin_slot, base, line, full_line, rest);
     }
     // request line: METHOD SP URI [SP HTTP/x.y]
     let mut parts = line.splitn(3, |&b| b == b' ');
     let method = parts.next().unwrap_or(b"");
     let Some(uri) = parts.next() else {
-        return dp_http_error(ctx, full_line, rest);
+        return dp_http_error(ctx, bin_slot, base, full_line, rest);
     };
     let version = parts.next();
     if method.is_empty() || uri.is_empty() {
-        return dp_http_error(ctx, full_line, rest);
+        return dp_http_error(ctx, bin_slot, base, full_line, rest);
     }
     let ver = match version {
         None => (0i64, 9i64),
         Some(v) => match dp_version(v) {
             Some(v) => v,
-            None => return dp_http_error(ctx, full_line, rest),
+            None => return dp_http_error(ctx, bin_slot, base, full_line, rest),
         },
     };
     let saved = ctx.roots_head;
@@ -5598,7 +5643,7 @@ fn dp_http(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
         *req.add(4) = fr[4];
     }
     ctx.roots_head = saved;
-    dp_ok(ctx, req as u64, rest)
+    dp_ok(ctx, req as u64, bin_slot, base, rest)
 }
 
 fn dp_version(v: &[u8]) -> Option<(i64, i64)> {
@@ -5609,17 +5654,24 @@ fn dp_version(v: &[u8]) -> Option<(i64, i64)> {
     Some((major, minor))
 }
 
-fn dp_response(ctx: &mut ProcCtx, line: &[u8], full_line: &[u8], rest: &[u8]) -> u64 {
+fn dp_response(
+    ctx: &mut ProcCtx,
+    bin_slot: *const u64,
+    base: *const u8,
+    line: &[u8],
+    full_line: &[u8],
+    rest: &[u8],
+) -> u64 {
     let mut parts = line.splitn(3, |&b| b == b' ');
     let ver = parts.next().unwrap_or(b"");
     let Some(vt) = dp_version(ver) else {
-        return dp_http_error(ctx, full_line, rest);
+        return dp_http_error(ctx, bin_slot, base, full_line, rest);
     };
     let Some(status) = parts.next() else {
-        return dp_http_error(ctx, full_line, rest);
+        return dp_http_error(ctx, bin_slot, base, full_line, rest);
     };
     let Ok(code) = std::str::from_utf8(status).unwrap_or("x").parse::<i64>() else {
-        return dp_http_error(ctx, full_line, rest);
+        return dp_http_error(ctx, bin_slot, base, full_line, rest);
     };
     let phrase = parts.next().unwrap_or(b"");
     let saved = ctx.roots_head;
@@ -5643,7 +5695,7 @@ fn dp_response(ctx: &mut ProcCtx, line: &[u8], full_line: &[u8], rest: &[u8]) ->
         *resp.add(4) = fr[3];
     }
     ctx.roots_head = saved;
-    dp_ok(ctx, resp as u64, rest)
+    dp_ok(ctx, resp as u64, bin_slot, base, rest)
 }
 
 fn dp_uri(ctx: &mut ProcCtx, uri: &[u8]) -> u64 {
@@ -5716,12 +5768,12 @@ fn dp_uri(ctx: &mut ProcCtx, uri: &[u8]) -> u64 {
     bytes_to_new_bin(ctx, uri)
 }
 
-fn dp_httph(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
+fn dp_httph(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8, bytes: &[u8]) -> u64 {
     let Some((line, mut rest_at)) = dp_line(bytes) else {
         return dp_more(ctx);
     };
     if line.is_empty() {
-        return dp_ok(ctx, atom_intern(b"http_eoh"), &bytes[rest_at..]);
+        return dp_ok(ctx, atom_intern(b"http_eoh"), bin_slot, base, &bytes[rest_at..]);
     }
     if rest_at == bytes.len() {
         // a complete header line could still be extended by an obs-fold
@@ -5730,7 +5782,7 @@ fn dp_httph(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     }
     let full_line = &bytes[..rest_at];
     let Some(colon) = line.iter().position(|&b| b == b':') else {
-        return dp_http_error(ctx, full_line, &bytes[rest_at..]);
+        return dp_http_error(ctx, bin_slot, base, full_line, &bytes[rest_at..]);
     };
     let name = &line[..colon];
     let mut value: Vec<u8> = line[colon + 1..]
@@ -5782,7 +5834,7 @@ fn dp_httph(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
         *h.add(5) = fr[3];
     }
     ctx.roots_head = saved;
-    dp_ok(ctx, h as u64, rest)
+    dp_ok(ctx, h as u64, bin_slot, base, rest)
 }
 
 /// send_after/start_timer. `wrap != 0` wraps the message as
@@ -6222,6 +6274,7 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
             pending_closure: closure,
             lstate: Mutex::new(LinkState::default()),
             pdict: Mutex::new(Vec::new()),
+            dirty: std::sync::atomic::AtomicBool::new(true),
         },
     );
     if home == ctx.sched_id {
@@ -6271,6 +6324,7 @@ pub extern "C" fn mana_rt_send(ctx: *mut ProcCtx, pid: u64, msg: u64) {
     } else {
         promote_term(ctx, msg)
     };
+    p.dirty.store(true, Ordering::Release);
     p.ingress.push(msg);
     let mut st = p.state.lock();
     if matches!(*st, PState::Waiting(_)) {
@@ -6410,12 +6464,25 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
     }
 }
 
+/// Eternal objects are write-once: their fields can reference the
+/// ALLOCATING scheduler's current nursery only until that scheduler's next
+/// minor forwards them — afterwards they point old/static forever. Minors
+/// therefore scan only the fresh ones (this list); the permanent registry
+/// is walked at majors (old-space compaction). Scanning the whole registry
+/// per minor made keepalive GC quadratic (eternals accrue per request).
+static FRESH_ETERNALS: std::sync::Mutex<Vec<(usize, bool, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Raise-path allocations: never moved; fields scanned by collections.
 #[no_mangle]
 pub extern "C" fn mana_rt_alloc_eternal(ctx: *mut ProcCtx, words: u64, is_cons: u64) -> *mut u64 {
     let ctx = unsafe { &*ctx };
     let p = alloc_space(words as usize);
     ctx.global.eternal.lock().push((p as usize, is_cons != 0));
+    FRESH_ETERNALS
+        .lock()
+        .unwrap()
+        .push((p as usize, is_cons != 0, ctx.sched_id));
     p
 }
 
@@ -6492,6 +6559,14 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
                     continue;
                 }
                 if id != ctx.current {
+                    // clean parked processes cannot reference this nursery:
+                    // their roots were forwarded by the minor that cleared
+                    // the flag, and gaining new refs (running / receiving a
+                    // message) re-sets it. This keeps minors O(active
+                    // processes), not O(all processes).
+                    if !p.dirty.swap(false, Ordering::AcqRel) {
+                        continue;
+                    }
                     walk_proc_roots(p, |s| {
                         *s = forward_minor(ctx, &mut old, *s, &mut worklist);
                     });
@@ -6510,14 +6585,21 @@ fn minor_collect(ctx: &mut ProcCtx) -> usize {
             }
         }
 
-        // eternal objects (exception reasons) may reference this nursery
+        // eternal objects (exception reasons) may reference this nursery —
+        // but only the ones allocated on THIS scheduler since its last
+        // minor (write-once: after one forwarding pass their fields are
+        // old/static forever). The full registry is majors-only.
         {
-            let eternal = g.eternal.lock();
-            for (pa, is_cons) in eternal.iter() {
-                scan_fields(*pa as *mut u64, *is_cons, &mut |s| {
+            let mut fresh = FRESH_ETERNALS.lock().unwrap();
+            fresh.retain(|&(pa, is_cons, sid)| {
+                if sid != ctx.sched_id {
+                    return true;
+                }
+                scan_fields(pa as *mut u64, is_cons, &mut |s| {
                     *s = forward_minor(ctx, &mut old, *s, &mut worklist);
                 });
-            }
+                false
+            });
         }
 
         while let Some(t) = worklist.pop() {
@@ -7929,7 +8011,10 @@ pub extern "C" fn mana_rt_bin_write_utf8(bin: u64, off: u64, cp: u64) -> u64 {
 }
 
 /// Pattern extraction of a binary segment: `len < 0` means the whole rest.
-/// Sentinel = match failure. Allocates the sub-binary (roots `bin`).
+/// Sentinel = match failure. Small slices copy (BEAM's heap-binary
+/// heuristic — cheap and they don't pin the parent); larger ones become
+/// zero-copy KIND_SUBBIN views over the ROOT binary (slicing a view folds
+/// offsets, so views never chain).
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_slice(ctx: *mut ProcCtx, bin: u64, off: u64, len: i64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -7944,17 +8029,39 @@ pub extern "C" fn mana_rt_bin_slice(ctx: *mut ProcCtx, bin: u64, off: u64, len: 
     if off + len > total {
         return EXC_SENTINEL;
     }
+    if len <= 64 {
+        let saved = ctx.roots_head;
+        let mut fr = [0u64, 1, bin];
+        fr[0] = saved;
+        ctx.roots_head = fr.as_ptr() as u64;
+        let newp = alloc_bin(ctx, len);
+        ctx.roots_head = saved;
+        let (p, _) = bin_parts(fr[2]).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(p.add(off), newp.add(1) as *mut u8, len);
+        }
+        return newp as u64;
+    }
+    let (parent, abs_off) = {
+        let p = bin as *const u64;
+        if unsafe { *p } & 0xff == KIND_SUBBIN {
+            (unsafe { *p.add(1) }, unsafe { *p.add(2) } as usize + off)
+        } else {
+            (bin, off)
+        }
+    };
     let saved = ctx.roots_head;
-    let mut fr = [0u64, 1, bin];
+    let mut fr = [0u64, 1, parent];
     fr[0] = saved;
     ctx.roots_head = fr.as_ptr() as u64;
-    let newp = alloc_bin(ctx, len);
+    let vp = alloc_nursery(ctx, 3);
     ctx.roots_head = saved;
-    let (p, _) = bin_parts(fr[2]).unwrap();
     unsafe {
-        std::ptr::copy_nonoverlapping(p.add(off), newp.add(1) as *mut u8, len);
+        *vp = ((len as u64) << 8) | KIND_SUBBIN;
+        *vp.add(1) = fr[2];
+        *vp.add(2) = abs_off as u64;
     }
-    newp as u64
+    vp as u64
 }
 
 /// Construction writer: constant segment bytes from a static array.

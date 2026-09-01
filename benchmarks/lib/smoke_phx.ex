@@ -24,7 +24,13 @@ defmodule Smoke.Phx do
     {:ok, {_ip, port}} = PhxAppWeb.Endpoint.server_info(:http)
 
     {:ok, c} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}])
-    loop(c, 10_000)
+    n =
+      case System.get_env("SMOKE_N") do
+        nil -> 10_000
+        v -> String.to_integer(v)
+      end
+
+    loop(c, n)
     IO.puts("survived")
   end
 

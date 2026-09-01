@@ -2970,6 +2970,82 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// `boxed(v) && header.kind == kind` as an i1, via control flow.
+    /// Byte-data base address of a bin-kind subject (KIND_BIN or a
+    /// KIND_SUBBIN view). The subject must already be preflighted as a bin
+    /// kind; bit 3 of the header distinguishes 5 from 13. Emits pure loads —
+    /// callers must recompute after any GC point (the parent moves).
+    fn bin_base_addr(
+        &self,
+        f: FunctionValue<'ctx>,
+        subject: IntValue<'ctx>,
+    ) -> CgResult<IntValue<'ctx>> {
+        let sp = self
+            .builder
+            .build_int_to_ptr(subject, self.ptrt, "bba.p")
+            .map_err(be)?;
+        let header = self
+            .builder
+            .build_load(self.i64t, sp, "bba.h")
+            .map_err(be)?
+            .into_int_value();
+        let viewbit = self
+            .builder
+            .build_and(header, self.i64t.const_int(8, false), "bba.vb")
+            .map_err(be)?;
+        let is_view = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                viewbit,
+                self.i64t.const_zero(),
+                "bba.iv",
+            )
+            .map_err(be)?;
+        let cur = self.builder.get_insert_block().unwrap();
+        let view_bb = self.ctx.append_basic_block(f, "bba.view");
+        let merge = self.ctx.append_basic_block(f, "bba.merge");
+        // plain bin: data starts one word past the header
+        let plain = self
+            .builder
+            .build_int_add(subject, self.i64t.const_int(8, false), "bba.plain")
+            .map_err(be)?;
+        self.builder
+            .build_conditional_branch(is_view, view_bb, merge)
+            .map_err(be)?;
+        self.builder.position_at_end(view_bb);
+        let parent_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(self.i64t, sp, &[self.i64t.const_int(1, false)], "bba.pg")
+                .map_err(be)?
+        };
+        let parent = self
+            .builder
+            .build_load(self.i64t, parent_gep, "bba.parent")
+            .map_err(be)?
+            .into_int_value();
+        let off_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(self.i64t, sp, &[self.i64t.const_int(2, false)], "bba.og")
+                .map_err(be)?
+        };
+        let poff = self
+            .builder
+            .build_load(self.i64t, off_gep, "bba.off")
+            .map_err(be)?
+            .into_int_value();
+        let pdata = self
+            .builder
+            .build_int_add(parent, self.i64t.const_int(8, false), "bba.pd")
+            .map_err(be)?;
+        let viewed = self.builder.build_int_add(pdata, poff, "bba.va").map_err(be)?;
+        let view_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge).map_err(be)?;
+        self.builder.position_at_end(merge);
+        let phi = self.builder.build_phi(self.i64t, "bba.base").map_err(be)?;
+        phi.add_incoming(&[(&plain, cur), (&viewed, view_end)]);
+        Ok(phi.as_basic_value().into_int_value())
+    }
+
     fn kind_test(
         &self,
         f: FunctionValue<'ctx>,
@@ -3651,18 +3727,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .builder
                 .build_and(header, s.i64t.const_int(0xff, false), "bl.k")
                 .map_err(be)?;
-            // kinds 5 (bin) and 7 (sub-binary view) differ only in bit 1;
+            // kinds 5 (bin) and 13 (sub-binary view) differ only in bit 3;
             // both carry len<<8 in the header, so the length check is shared
             let k2 = s
                 .builder
-                .build_or(k, s.i64t.const_int(2, false), "bl.k2")
+                .build_or(k, s.i64t.const_int(8, false), "bl.k2")
                 .map_err(be)?;
             let is_bin = s
                 .builder
                 .build_int_compare(
                     IntPredicate::EQ,
                     k2,
-                    s.i64t.const_int(7, false),
+                    s.i64t.const_int(13, false),
                     "bl.bin",
                 )
                 .map_err(be)?;
@@ -3719,9 +3795,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         let s = *s;
                         let first = static_bits / 8;
                         let last = (static_bits + s - 1) / 8;
+                        let base = self.bin_base_addr(f, subject)?;
                         let bp = self
                             .builder
-                            .build_int_to_ptr(subject, self.ptrt, "bb.p")
+                            .build_int_to_ptr(base, self.ptrt, "bb.p")
                             .map_err(be)?;
                         let mut acc = self.i64t.const_zero();
                         for byte_i in first..=last {
@@ -3730,7 +3807,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                     .build_in_bounds_gep(
                                         self.ctx.i8_type(),
                                         bp,
-                                        &[self.i64t.const_int(8 + byte_i, false)],
+                                        &[self.i64t.const_int(byte_i, false)],
                                         "bb.g",
                                     )
                                     .map_err(be)?
@@ -3794,9 +3871,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             // inline byte loads + compares (the whitespace
                             // trim pyramid runs ~20 of these per string)
                             if prefix_static && bytes.len() <= 16 {
+                                let base = self.bin_base_addr(f, subject)?;
                                 let bp = self
                                     .builder
-                                    .build_int_to_ptr(subject, self.ptrt, "bm.p")
+                                    .build_int_to_ptr(base, self.ptrt, "bm.p")
                                     .map_err(be)?;
                                 let mut ok = self.ctx.bool_type().const_all_ones();
                                 for (j, byte) in bytes.iter().enumerate() {
@@ -3804,7 +3882,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                         .builder
                                         .build_int_add(
                                             off,
-                                            self.i64t.const_int(8 + j as u64, false),
+                                            self.i64t.const_int(j as u64, false),
                                             "bm.i",
                                         )
                                         .map_err(be)?;
@@ -3900,17 +3978,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     // inline load (<<h, rest::binary>> — the string-walk
                     // shape)
                     if prefix_static && matches!(size, SegSize::Bytes(1)) && !spec.signed {
+                        let base = self.bin_base_addr(f, subject)?;
                         let bp = self
                             .builder
-                            .build_int_to_ptr(subject, self.ptrt, "br.p")
-                            .map_err(be)?;
-                        let idx = self
-                            .builder
-                            .build_int_add(off, self.i64t.const_int(8, false), "br.i")
+                            .build_int_to_ptr(base, self.ptrt, "br.p")
                             .map_err(be)?;
                         let gep = unsafe {
                             self.builder
-                                .build_in_bounds_gep(self.ctx.i8_type(), bp, &[idx], "br.g")
+                                .build_in_bounds_gep(self.ctx.i8_type(), bp, &[off], "br.g")
                                 .map_err(be)?
                         };
                         let b = self
@@ -5707,16 +5782,16 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         .builder
                         .build_and(header, s.i64t.const_int(0xff, false), "k")
                         .map_err(be)?;
-                    // bin (5) or sub-binary view (7)
+                    // bin (5) or sub-binary view (13)
                     let k2 = s
                         .builder
-                        .build_or(k, s.i64t.const_int(2, false), "k2")
+                        .build_or(k, s.i64t.const_int(8, false), "k2")
                         .map_err(be)?;
                     s.builder
                         .build_int_compare(
                             IntPredicate::EQ,
                             k2,
-                            s.i64t.const_int(7, false),
+                            s.i64t.const_int(13, false),
                             "k.b",
                         )
                         .map_err(be)
