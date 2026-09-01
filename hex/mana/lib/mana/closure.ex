@@ -10,7 +10,8 @@ defmodule Mana.Closure do
   beams are never followed.
   """
 
-  @build_tool_re ~r{/(mix|ex_unit|iex|eex)(-[\d.]+)?/ebin/}
+  # eex stays pullable: compiled EEx templates call EEx.Engine at runtime
+  @build_tool_re ~r{/(mix|ex_unit|iex)(-[\d.]+)?/ebin/}
 
   @doc """
   BFS the import closure of `seed_beams` (paths). Returns a MapSet of

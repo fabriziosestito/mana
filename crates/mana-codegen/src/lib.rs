@@ -4270,10 +4270,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.builder.position_at_end(dead);
             return Ok(self.i64t.get_undef());
         }
-        if module == "file" {
+        if module == "file" || module == "prim_file" {
             // native file cut (OTP's file.erl/prim_file never compiled) —
             // implemented names dispatch to mana_rt_file by opcode; the
-            // rest keep answering {error, enotsup}
+            // rest keep answering {error, enotsup}. prim_file shares the
+            // table (Plug.Static stats files through it directly).
             let op: Option<u64> = match (name, args.len()) {
                 ("read_file", 1) => Some(0),
                 ("write_file", 2) => Some(1),
@@ -8424,7 +8425,7 @@ fn pattern_spill_sites(p: &Pattern) -> usize {
 /// `manac --print-bif-modules` (single source of truth for its closure BFS).
 pub const BIF_MODULES: &[&str] = &[
     "erlang", "maps", "io", "unicode", "persistent_term", "code", "io_lib",
-    "logger", "ets", "application", "file", "math", "re", "timer",
+    "logger", "ets", "application", "file", "prim_file", "math", "re", "timer",
     "gen_tcp", "inet", "crypto",
     "erts_internal", "zlib",
     "elixir_erl", "erl_eval", "beam_lib", "global", "global_group",
@@ -8831,7 +8832,8 @@ fn expr_may_raise(
             if matches!(
                 module.as_str(),
                 "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
-                    | "logger" | "ets" | "application" | "file" | "erts_internal"
+                    | "logger" | "ets" | "application" | "file" | "prim_file"
+                    | "erts_internal"
                     | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
                     | "net_kernel" | "math" | "re" | "timer" | "gen_tcp" | "inet"
                     | "zlib" | "crypto"
@@ -8957,8 +8959,8 @@ fn expr_may_gc(
             // file/gen_tcp/inet allocate result tuples and may suspend
             if matches!(
                 module.as_str(),
-                "io" | "unicode" | "re" | "timer" | "file" | "gen_tcp" | "inet"
-                    | "crypto"
+                "io" | "unicode" | "re" | "timer" | "file" | "prim_file"
+                    | "gen_tcp" | "inet" | "crypto"
             ) {
                 return true;
             }
@@ -9100,7 +9102,8 @@ fn cond_may_raise(
             if matches!(
                 module.as_str(),
                 "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
-                    | "logger" | "ets" | "application" | "file" | "erts_internal"
+                    | "logger" | "ets" | "application" | "file" | "prim_file"
+                    | "erts_internal"
                     | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
                     | "net_kernel" | "math" | "re" | "timer" | "gen_tcp" | "inet"
                     | "zlib" | "crypto"
@@ -9238,8 +9241,8 @@ fn cond_may_gc(
             // file/gen_tcp/inet allocate result tuples and may suspend
             if matches!(
                 module.as_str(),
-                "io" | "unicode" | "re" | "timer" | "file" | "gen_tcp" | "inet"
-                    | "crypto"
+                "io" | "unicode" | "re" | "timer" | "file" | "prim_file"
+                    | "gen_tcp" | "inet" | "crypto"
             ) {
                 *base = true;
                 return;
@@ -9653,6 +9656,9 @@ fn reachable_funs(
     // anything); everything else seeds only literally-named pairs
     let mut mentioned_dyn: BTreeSet<String> = BTreeSet::new();
     let mut dyn_pairs: HashSet<(String, usize)> = HashSet::new();
+    // MFA-tuple function names seeded at EVERY defined arity (apply-time
+    // args-list extension makes the literal arity unreliable)
+    let mut dyn_any_names: HashSet<String> = HashSet::new();
     // atoms in module position of {M, F, Args} / {M, Opts} literal tuples
     // (child specs) — chased as candidates even without an Elixir. prefix
     let mut tuple_heads: HashSet<String> = HashSet::new();
@@ -9663,6 +9669,7 @@ fn reachable_funs(
     let mut new_mentioned: Vec<String> = Vec::new();
     let mut new_dyn: Vec<String> = Vec::new();
     let mut new_pairs: Vec<(String, usize)> = Vec::new();
+    let mut new_any_names: Vec<String> = Vec::new();
     while let Some((module, fname)) = work.pop() {
         if !seen.insert((module.clone(), fname.clone())) {
             continue;
@@ -9707,6 +9714,11 @@ fn reachable_funs(
                 new_pairs.push(p.clone());
             }
         }
+        for n in &fun.dyn_any_names {
+            if dyn_any_names.insert(n.clone()) {
+                new_any_names.push(n.clone());
+            }
+        }
         if fun.fun_dyn {
             dyn_modules.insert(module.clone());
         }
@@ -9731,7 +9743,11 @@ fn reachable_funs(
         // them by runtime-built atoms no static analysis can see.
         // Untouched ones stay pruned (each conformance program must
         // not drag in its siblings' closures).
-        while !(new_mentioned.is_empty() && new_dyn.is_empty() && new_pairs.is_empty()) {
+        while !(new_mentioned.is_empty()
+            && new_dyn.is_empty()
+            && new_pairs.is_empty()
+            && new_any_names.is_empty())
+        {
             // a module newly mentioned: seed per its current full status
             for a in std::mem::take(&mut new_mentioned) {
                 let full = (mentioned_dyn.contains(&a) && a.starts_with("Elixir."))
@@ -9741,7 +9757,10 @@ fn reachable_funs(
                     if ex.name == "module_info" {
                         continue;
                     }
-                    if !(full || dyn_pairs.contains(&(ex.name.clone(), ex.arity))) {
+                    if !(full
+                        || dyn_pairs.contains(&(ex.name.clone(), ex.arity))
+                        || dyn_any_names.contains(&ex.name))
+                    {
                         continue;
                     }
                     if defs.contains_key(&(m.name.as_str(), ex))
@@ -9783,6 +9802,24 @@ fn reachable_funs(
                         && seeded.insert((m.name.clone(), exn.clone()))
                     {
                         work.push((m.name.clone(), exn.clone()));
+                    }
+                }
+            }
+            // a new MFA-tuple function name: seed every defined arity of
+            // it in every mentioned module
+            for pf in std::mem::take(&mut new_any_names) {
+                if pf == "module_info" {
+                    continue;
+                }
+                for a in &mentioned {
+                    let m = mod_by_name[a.as_str()];
+                    for ex in &m.exports {
+                        if ex.name == pf
+                            && defs.contains_key(&(m.name.as_str(), ex))
+                            && seeded.insert((m.name.clone(), ex.clone()))
+                        {
+                            work.push((m.name.clone(), ex.clone()));
+                        }
                     }
                 }
             }
@@ -9949,6 +9986,7 @@ fn collect_dyn_names(
     pairs: &mut HashSet<(String, usize)>,
     dyn_any: &mut bool,
     heads: &mut HashSet<String>,
+    any_names: &mut HashSet<String>,
 ) {
     match e {
         Expr::CallDyn { module: _, name, args } => {
@@ -9958,7 +9996,8 @@ fn collect_dyn_names(
                 }
                 _ => *dyn_any = true,
             }
-            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads));
+            args.iter()
+                .for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads, any_names));
         }
         Expr::Call { module, name, args } => {
             // a surviving erlang:apply/3 call has fully dynamic M and F
@@ -9976,20 +10015,22 @@ fn collect_dyn_names(
                     }
                 }
             }
-            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads));
+            args.iter()
+                .for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads, any_names));
         }
         Expr::Lit(_) | Expr::Var(_) | Expr::FunRef { .. } => {}
         Expr::Tuple(items) | Expr::Values(items) => {
             // {Mod, Fun, Args} literal tuples (supervisor child specs,
-            // callback tuples) are applied dynamically: seed the
-            // (fun, arity) pair — it only takes effect on modules that are
-            // already dynamic candidates, so incidental 3-tuples are inert
+            // callback tuples) are applied dynamically — and the args list
+            // is routinely EXTENDED at apply time (Plug.Debugger's banner
+            // {M, F, []} is called /5), so seed the name at EVERY defined
+            // arity. Still inert unless the module is a dynamic candidate.
             if items.len() == 3 {
                 if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) =
                     (&items[0], &items[1])
                 {
-                    if let Some(n) = static_list_len(&items[2]) {
-                        pairs.insert((fa.clone(), n));
+                    if static_list_len(&items[2]).is_some() {
+                        any_names.insert(fa.clone());
                         heads.insert(m.clone());
                     }
                 }
@@ -10004,51 +10045,51 @@ fn collect_dyn_names(
                     pairs.insert(("child_spec".to_string(), 1));
                 }
             }
-            items.iter().for_each(|i| collect_dyn_names(i, pairs, dyn_any, heads))
+            items.iter().for_each(|i| collect_dyn_names(i, pairs, dyn_any, heads, any_names))
         }
         Expr::Cons(h, t) => {
-            collect_dyn_names(h, pairs, dyn_any, heads);
-            collect_dyn_names(t, pairs, dyn_any, heads);
+            collect_dyn_names(h, pairs, dyn_any, heads, any_names);
+            collect_dyn_names(t, pairs, dyn_any, heads, any_names);
         }
-        Expr::Fun(f) => collect_dyn_names(&f.body, pairs, dyn_any, heads),
+        Expr::Fun(f) => collect_dyn_names(&f.body, pairs, dyn_any, heads, any_names),
         Expr::Let { arg, body, .. } => {
-            collect_dyn_names(arg, pairs, dyn_any, heads);
-            collect_dyn_names(body, pairs, dyn_any, heads);
+            collect_dyn_names(arg, pairs, dyn_any, heads, any_names);
+            collect_dyn_names(body, pairs, dyn_any, heads, any_names);
         }
         Expr::LetRec { defs, body } => {
             defs.iter()
-                .for_each(|(_, f)| collect_dyn_names(&f.body, pairs, dyn_any, heads));
-            collect_dyn_names(body, pairs, dyn_any, heads);
+                .for_each(|(_, f)| collect_dyn_names(&f.body, pairs, dyn_any, heads, any_names));
+            collect_dyn_names(body, pairs, dyn_any, heads, any_names);
         }
         Expr::Apply { args, .. } | Expr::PrimOp { args, .. } => {
-            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads))
+            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads, any_names))
         }
         Expr::Case { arg, clauses } => {
-            collect_dyn_names(arg, pairs, dyn_any, heads);
+            collect_dyn_names(arg, pairs, dyn_any, heads, any_names);
             for c in clauses {
-                collect_dyn_names(&c.guard, pairs, dyn_any, heads);
-                collect_dyn_names(&c.body, pairs, dyn_any, heads);
+                collect_dyn_names(&c.guard, pairs, dyn_any, heads, any_names);
+                collect_dyn_names(&c.body, pairs, dyn_any, heads, any_names);
             }
         }
         Expr::Try { arg, body, handler, .. } => {
-            collect_dyn_names(arg, pairs, dyn_any, heads);
-            collect_dyn_names(body, pairs, dyn_any, heads);
-            collect_dyn_names(handler, pairs, dyn_any, heads);
+            collect_dyn_names(arg, pairs, dyn_any, heads, any_names);
+            collect_dyn_names(body, pairs, dyn_any, heads, any_names);
+            collect_dyn_names(handler, pairs, dyn_any, heads, any_names);
         }
         Expr::Do(a, b) => {
-            collect_dyn_names(a, pairs, dyn_any, heads);
-            collect_dyn_names(b, pairs, dyn_any, heads);
+            collect_dyn_names(a, pairs, dyn_any, heads, any_names);
+            collect_dyn_names(b, pairs, dyn_any, heads, any_names);
         }
         Expr::Binary(segs) => segs
             .iter()
-            .for_each(|s| collect_dyn_names(&s.value, pairs, dyn_any, heads)),
+            .for_each(|s| collect_dyn_names(&s.value, pairs, dyn_any, heads, any_names)),
         Expr::Map { pairs: mp, update } => {
             for (k, _, v) in mp {
-                collect_dyn_names(k, pairs, dyn_any, heads);
-                collect_dyn_names(v, pairs, dyn_any, heads);
+                collect_dyn_names(k, pairs, dyn_any, heads, any_names);
+                collect_dyn_names(v, pairs, dyn_any, heads, any_names);
             }
             if let Some(u) = update {
-                collect_dyn_names(u, pairs, dyn_any, heads);
+                collect_dyn_names(u, pairs, dyn_any, heads, any_names);
             }
         }
     }

@@ -16,7 +16,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
 /// Bump whenever the summary contents or encoding change; part of the key.
-pub const SUMMARY_FORMAT: u32 = 1;
+pub const SUMMARY_FORMAT: u32 = 2;
 
 const MAGIC: u32 = 0x4d41_4e53; // "MANS"
 
@@ -32,6 +32,7 @@ pub struct FunSummary {
     pub atoms: Vec<String>,                  // collect_atoms (sorted)
     pub arg_pairs: Vec<(String, String)>,    // collect_atom_arg_pairs (in order)
     pub dyn_pairs: Vec<(String, usize)>,     // collect_dyn_names pairs (sorted)
+    pub dyn_any_names: Vec<String>,          // MFA-tuple names, any arity (sorted)
     pub fun_dyn: bool,
     pub tuple_heads: Vec<String>,            // collect_dyn_names heads (sorted)
     pub edges: Vec<Edge>,                    // collect_edges (in order)
@@ -56,7 +57,8 @@ pub fn summarize(m: &Module) -> ModuleSummary {
             let mut pairs: HashSet<(String, usize)> = HashSet::new();
             let mut fun_dyn = false;
             let mut heads: HashSet<String> = HashSet::new();
-            collect_dyn_names(&fun.body, &mut pairs, &mut fun_dyn, &mut heads);
+            let mut any_names: HashSet<String> = HashSet::new();
+            collect_dyn_names(&fun.body, &mut pairs, &mut fun_dyn, &mut heads, &mut any_names);
             let mut edges = Vec::new();
             let mut letrec = HashSet::new();
             collect_edges(&fun.body, &mut edges, &mut letrec);
@@ -70,6 +72,8 @@ pub fn summarize(m: &Module) -> ModuleSummary {
             cond_may_raise(&fun.body, &m.name, &mut letrec, &mut raise_base, &mut raise_deps);
             let mut dyn_pairs: Vec<(String, usize)> = pairs.into_iter().collect();
             dyn_pairs.sort();
+            let mut dyn_any_names: Vec<String> = any_names.into_iter().collect();
+            dyn_any_names.sort();
             let mut tuple_heads: Vec<String> = heads.into_iter().collect();
             tuple_heads.sort();
             FunSummary {
@@ -77,6 +81,7 @@ pub fn summarize(m: &Module) -> ModuleSummary {
                 atoms: atoms.into_iter().collect(),
                 arg_pairs,
                 dyn_pairs,
+                dyn_any_names,
                 fun_dyn,
                 tuple_heads,
                 edges,
@@ -174,6 +179,7 @@ fn encode(s: &ModuleSummary) -> Vec<u8> {
             wstr(&mut b, n);
             w32(&mut b, *a as u32);
         }
+        wvec_str(&mut b, &f.dyn_any_names);
         b.push(f.fun_dyn as u8);
         wvec_str(&mut b, &f.tuple_heads);
         w32(&mut b, f.edges.len() as u32);
@@ -229,6 +235,7 @@ fn decode(b: &[u8]) -> Option<ModuleSummary> {
         for _ in 0..n {
             dyn_pairs.push((rstr(b, &mut p)?, r32(b, &mut p)? as usize));
         }
+        let dyn_any_names = rvec_str(b, &mut p)?;
         let fun_dyn = rbool(b, &mut p)?;
         let tuple_heads = rvec_str(b, &mut p)?;
         let n = r32(b, &mut p)? as usize;
@@ -251,6 +258,7 @@ fn decode(b: &[u8]) -> Option<ModuleSummary> {
             atoms,
             arg_pairs,
             dyn_pairs,
+            dyn_any_names,
             fun_dyn,
             tuple_heads,
             edges,

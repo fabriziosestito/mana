@@ -31,7 +31,35 @@ defmodule Mix.Tasks.Mana.Compile do
   def run(argv) do
     {opts, _argv, _errors} = OptionParser.parse(argv, switches: @switches)
 
-    Mix.Task.run("compile")
+    # native builds get release init semantics: plug_init_mode :runtime is a
+    # dev/code-reloading affordance that resolves plug modules through
+    # runtime-built atoms — invisible to closed-world reachability. Forcing
+    # :compile bakes plug opts (module atoms as literals) into the beams;
+    # Mix's compile-env tracking recompiles affected modules automatically.
+    Application.put_env(:phoenix, :plug_init_mode, :compile)
+
+    # Apply project config once, WITHOUT compile-env validation (beams
+    # compiled with the scrub below legitimately disagree with the config
+    # files' dev-only keys), then scrub dev-only build-tool config
+    # (code_reloader etc.) so compile_env consumers bake release
+    # semantics. Mix.Task.run dedups: the compile below won't re-apply
+    # config over the scrub.
+    Mix.Task.run("loadpaths", ["--no-validate-compile-env"])
+    Mana.Boot.scrub_compile_env!()
+
+    # Mix's staleness checks verify compile_env against the CONFIG FILES,
+    # not runtime put_env — so beams compiled before these overrides keep
+    # the old semantics. A versioned marker under the build dir forces one
+    # full recompile per build dir whenever the override set changes.
+    marker = Path.join(Mix.Project.build_path(), "mana_init_mode")
+    stamp = "plug_init_mode=compile scrub=v1"
+
+    if File.read(marker) == {:ok, stamp} do
+      Mix.Task.run("compile")
+    else
+      Mix.Task.run("compile", ["--force"])
+      File.write!(marker, stamp)
+    end
 
     if opts[:app] && opts[:entry] do
       Mix.raise("--app and --entry are mutually exclusive")
@@ -270,8 +298,10 @@ defmodule Mix.Tasks.Mana.Compile do
         beam = List.to_string(beam_path)
 
         # build-tool applications never belong in a runtime binary; their
-        # protocol impls (Collectable.Mix.Shell, ...) stay unimplemented
-        if beam =~ ~r{/(mix|ex_unit|iex|eex)(-[\d.]+)?/ebin/} do
+        # protocol impls (Collectable.Mix.Shell, ...) stay unimplemented.
+        # eex is NOT one of them: compiled EEx templates call EEx.Engine
+        # at runtime (Plug.Debugger error pages).
+        if beam =~ ~r{/(mix|ex_unit|iex)(-[\d.]+)?/ebin/} do
           :error
         else
           {:ok, beam}

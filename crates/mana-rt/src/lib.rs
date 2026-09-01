@@ -10306,6 +10306,7 @@ fn is_cut_module(name: &[u8]) -> bool {
             | b"logger"
             | b"ets"
             | b"application"
+            | b"prim_file"
             | b"file"
             | b"math"
             | b"re"
