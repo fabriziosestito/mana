@@ -1923,9 +1923,11 @@ pub extern "C" fn mana_rt_memory(ctx: *mut ProcCtx) -> u64 {
         (b"code", 0),
         (b"ets", 0),
     ];
-    // build [{k, v} | ...] back-to-front with the list rooted across allocs
+    // build [{k, v} | ...] back-to-front; BOTH the list and the fresh
+    // tuple are frame-rooted across the cons allocation (a Rust local is
+    // not a GC root — the cons alloc can move the tuple)
     let saved = ctx.roots_head;
-    let mut fr = [0u64, 1, NIL];
+    let mut fr = [0u64, 2, NIL, NIL];
     fr[0] = saved;
     ctx.roots_head = fr.as_ptr() as u64;
     for (k, v) in pairs.iter().rev() {
@@ -1935,12 +1937,14 @@ pub extern "C" fn mana_rt_memory(ctx: *mut ProcCtx) -> u64 {
             *t.add(1) = atom_intern(k);
             *t.add(2) = (v << 3) | TAG_SMALL;
         }
+        fr[3] = t as u64;
         let cell = alloc_nursery(ctx, 2);
         unsafe {
-            *cell = t as u64;
+            *cell = fr[3];
             *cell.add(1) = fr[2];
         }
         fr[2] = cell as u64 | TAG_CONS;
+        fr[3] = NIL;
     }
     ctx.roots_head = saved;
     fr[2]
@@ -10585,7 +10589,8 @@ pub extern "C" fn mana_rt_code_app_dir(ctx: *mut ProcCtx, app: u64, is_priv: u64
         return raise_badarg(ctxr);
     }
     let tab = atom_intern(b"mana_app_dirs");
-    let hit = mana_rt_app_get_env(ctx, tab, app, 0, 1);
+    let miss = known().undefined;
+    let hit = mana_rt_app_get_env(ctx, tab, app, miss, 1);
     let ctxr = unsafe { &mut *ctx };
     if hit == known().undefined {
         let t = alloc_nursery(ctxr, 3);
