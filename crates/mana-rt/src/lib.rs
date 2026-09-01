@@ -103,6 +103,8 @@ pub const KIND_BIGLIT: u64 = 6;
 /// data pointers are recomputed on every access, never cached.
 pub const KIND_SUBBIN: u64 = 13;
 
+mod bigint;
+
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 
 /// MANA_NURSERY_WORDS overrides the initial nursery size AND pins it
