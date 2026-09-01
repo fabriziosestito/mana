@@ -184,12 +184,31 @@ defmodule Mix.Tasks.Mana.Compile do
 
         if pulled == [] or fuel == 0 do
           # candidate notes are driver protocol (consumed by the regexes
-          # above), not user information — drop them from the final output
-          output
-          |> String.split("\n")
-          |> Enum.reject(&String.starts_with?(&1, "manac: note: dynamic module candidate"))
-          |> Enum.join("\n")
-          |> IO.write()
+          # above), and unresolvable missing-module reports describe dead
+          # call sites (they abort only if ever executed) — summarize both
+          # instead of dumping them on every successful build
+          {missing_lines, rest} =
+            output
+            |> String.split("\n")
+            |> Enum.reject(&String.starts_with?(&1, "manac: note: dynamic module candidate"))
+            |> Enum.split_with(&String.starts_with?(&1, "manac: module '"))
+
+          rest |> Enum.join("\n") |> IO.write()
+
+          case missing_lines do
+            [] ->
+              :ok
+
+            lines ->
+              if System.get_env("MANA_DEBUG_LOOP") do
+                Enum.each(lines, &IO.puts/1)
+              else
+                IO.puts(
+                  "mana: #{length(lines)} referenced modules are not compiled " <>
+                    "(dead call sites — abort if ever reached; MANA_DEBUG_LOOP=1 lists them)"
+                )
+              end
+          end
 
           write_manifest(out, cores)
           :ok

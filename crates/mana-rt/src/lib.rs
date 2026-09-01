@@ -624,12 +624,11 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
             }
             CoroutineResult::Return(v) => {
                 let reason = if v == EXC_SENTINEL {
-                    // an uncaught exit with reason normal/shutdown is an
-                    // orderly termination (gen_server stop path) — silent,
-                    // like BEAM
+                    // an uncaught exit with reason normal/shutdown/{shutdown,_}
+                    // is an orderly termination (gen_server stop, socket
+                    // close) — silent, like BEAM
                     let quiet = ctx.exc_class == find_atom("exit").unwrap_or(0)
-                        && (ctx.exc_reason == known().normal
-                            || atom_bytes(ctx.exc_reason) == b"shutdown");
+                        && exit_reason_is_quiet(ctx.exc_reason);
                     if pid != 0 && !quiet {
                         let mut class = String::new();
                         let mut reason = String::new();
@@ -8998,6 +8997,25 @@ pub extern "C" fn mana_rt_pt_get(ctx: *mut ProcCtx, key: u64, default: u64, has_
 /// complete, so a miss means the runtime tried to mint a new atom.
 fn find_atom(name: &str) -> Option<u64> {
     atom_lookup(name.as_bytes())
+}
+
+/// normal / shutdown / {shutdown, _}: BEAM treats these exit reasons as
+/// orderly termination and logs nothing.
+fn exit_reason_is_quiet(r: u64) -> bool {
+    if r == known().normal {
+        return true;
+    }
+    if r & TAG_MASK == TAG_ATOM {
+        return atom_bytes(r) == b"shutdown";
+    }
+    if r & TAG_MASK == TAG_BOXED && r != 0 {
+        let header = unsafe { *(r as *const u64) };
+        if header & 0xff == KIND_TUPLE && (header >> 8) == 2 {
+            let first = unsafe { *(r as *const u64).add(1) };
+            return first & TAG_MASK == TAG_ATOM && atom_bytes(first) == b"shutdown";
+        }
+    }
+    false
 }
 
 fn interned_atom_count() -> u64 {
