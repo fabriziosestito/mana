@@ -1789,7 +1789,8 @@ fn phash2_term(t: u64, h: &mut u64) {
         TAG_BOXED if t != 0 => unsafe {
             let p = t as *const u64;
             let kind = *p & 0xff;
-            mix(h, 5 + kind);
+            // views hash as binaries: equal bytes must hash equal
+            mix(h, 5 + if kind == KIND_SUBBIN { KIND_BIN } else { kind });
             match kind {
                 KIND_TUPLE | KIND_MAP => {
                     let words = payload_words(*p);
