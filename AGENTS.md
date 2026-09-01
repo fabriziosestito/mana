@@ -177,6 +177,29 @@ When asked to open a PR:
   renames, safe for concurrent compiles. The mix task keeps a parallel
   cross-project CORE cache (`<user cache>/mana/cores/<elixir>-otp<otp>/`,
   via `:filename.basedir`) — dumped stdlib Core Erlang keyed by beam mtime.
+- **Release-style boot: `mix mana.compile --app`.** No hand-written entry
+  modules — `Mana.Boot.generate!` precomputes what a BEAM release's boot
+  script + application controller do: bakes the merged compile-time config
+  (`.app` env ⊕ config.exs ⊕ `MIX_ENV.exs`) as `put_env` data, compiles
+  `config/runtime.exs` INTO the generated `Mana.AppBoot` (a local
+  mini-Config DSL with Config's deep-merge semantics; `System.get_env`
+  runs at native boot — PORT/PHX_SERVER work like a release), and starts
+  the app closure dependency-first via direct `Mod.start(:normal, args)`
+  calls (there is no application controller; `ensure_all_started` has no
+  cut). Skip-list = runtime cuts/BEAM infra/build tools + dev source
+  watchers (phoenix_live_reload, file_system); skipped apps still get
+  their env baked (except mix/iex/ex_unit/eex). Build-time release
+  semantics: `plug_init_mode` forced to `:compile` and dev-only
+  build-tool config (code_reloader/live_reload/watchers) scrubbed BEFORE
+  compiling (compile_env consumers bake it in), sequenced as
+  `loadpaths --no-validate-compile-env` → scrub → compile, with a
+  versioned marker forcing one full recompile per build dir when the
+  override set changes. Missing-module calls abort at the CALL SITE (BEAM
+  loads such code and fails only on execution — guarded dead branches
+  like Phoenix's mix_available? stay live). {M,F,Args} literal tuples
+  seed the named function at EVERY arity (apply-time args extension —
+  Plug.Debugger's banner {M,F,[]} is called /5). The conformance gate
+  runs the SAME generated Mana.AppBoot on both runtimes.
 - **Compile speed architecture (the compile-speed milestone).** Three
   layers keep warm builds at hash+link:
   1. **Analysis summaries** (`<cache>/summary/`, keyed by tool_hash +
