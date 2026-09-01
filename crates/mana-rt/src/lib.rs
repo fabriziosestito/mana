@@ -1311,6 +1311,19 @@ fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
                     let bits = *p.add(1);
                     out.extend_from_slice(&bits.to_be_bytes());
                 }
+                KIND_BIGNUM => {
+                    let (neg, mag) = bignum_parts(t).unwrap();
+                    let bytes = bigint::mag_to_bytes_le(mag);
+                    if bytes.len() <= 255 {
+                        out.push(110); // SMALL_BIG_EXT
+                        out.push(bytes.len() as u8);
+                    } else {
+                        out.push(111); // LARGE_BIG_EXT
+                        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                    }
+                    out.push(neg as u8);
+                    out.extend_from_slice(&bytes);
+                }
                 KIND_BIN | KIND_SUBBIN => {
                     let bytes = bin_bytes(t);
                     out.push(109);
@@ -1365,22 +1378,16 @@ fn etf_decode(ctx: &mut ProcCtx, d: &mut EtfDec, safe: bool) -> Result<u64, ()> 
             let v = i32::from_be_bytes(d.take(4)?.try_into().unwrap()) as i64;
             Ok(((v << 3) as u64) | TAG_SMALL)
         }
-        110 => {
-            let n = d.u8()? as usize;
+        110 | 111 => {
+            let n = if tag == 110 {
+                d.u8()? as usize
+            } else {
+                u32::from_be_bytes(d.take(4)?.try_into().unwrap()) as usize
+            };
             let sign = d.u8()?;
-            let mag = d.take(n)?;
-            if n > 8 {
-                return Err(()); // TODO(bignum)
-            }
-            let mut v: u64 = 0;
-            for (i, &b) in mag.iter().enumerate() {
-                v |= (b as u64) << (8 * i);
-            }
-            let v = if sign == 1 { -(v as i64) } else { v as i64 };
-            if v >> 60 != 0 && v >> 60 != -1 {
-                return Err(());
-            }
-            Ok(((v << 3) as u64) | TAG_SMALL)
+            let mag_bytes = d.take(n)?.to_vec();
+            let mag = bigint::mag_from_bytes_le(&mag_bytes);
+            Ok(make_int_mag(ctx, sign == 1 && !mag.is_empty(), &mag))
         }
         118 | 119 | 100 | 115 => {
             let n = if tag == 119 || tag == 115 {
@@ -3006,12 +3013,11 @@ pub extern "C" fn mana_rt_f2i(ctx: *mut ProcCtx, mode: u64, t: u64) -> u64 {
         2 => x.floor(),
         _ => x.ceil(),
     };
-    let v = r as i64;
-    if v >> 60 != 0 && v >> 60 != -1 {
-        eprintln!("mana: TODO(bignum): float conversion out of small-int range");
-        std::process::exit(1);
+    if !r.is_finite() {
+        return raise_badarg(ctx);
     }
-    ((v << 3) as u64) | TAG_SMALL
+    let mag = bigint::f64_to_mag(r.abs());
+    make_int_mag(ctx, r < 0.0 && !mag.is_empty(), &mag)
 }
 
 /// Elixir.Float round/ceil/floor with decimal precision (mode 0/1/2).
@@ -9769,22 +9775,17 @@ pub extern "C" fn mana_rt_binary_decode_unsigned(ctx: *mut ProcCtx, bin: u64, li
     if bin_parts(bin).is_none() {
         return raise_badarg(ctx);
     }
-    let bytes = bin_bytes(bin);
-    if bytes.len() > 7 {
-        eprintln!("mana: TODO(bignum): decode_unsigned over 56 bits");
-        std::process::exit(1);
-    }
-    let mut v: u64 = 0;
-    if little != 0 {
-        for &b in bytes.iter().rev() {
-            v = (v << 8) | b as u64;
-        }
+    // `little` is 0 (the /1 default) or the endianness atom from /2
+    let is_little =
+        little & TAG_MASK == TAG_ATOM && atom_bytes(little) == b"little";
+    let bytes = bin_bytes(bin).to_vec();
+    let le: Vec<u8> = if is_little {
+        bytes
     } else {
-        for &b in bytes {
-            v = (v << 8) | b as u64;
-        }
-    }
-    (v << 3) | TAG_SMALL
+        bytes.iter().rev().copied().collect()
+    };
+    let mag = bigint::mag_from_bytes_le(&le);
+    make_int_mag(ctx, false, &mag)
 }
 
 /// binary:longest_common_prefix/1 (suffix != 0 → suffix variant).

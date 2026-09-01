@@ -1469,6 +1469,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 ("binary", "last", 1) => ("mana_rt_binary_at", 0, &[SMALL0, 1]),
                 ("binary", "encode_unsigned", 1) => ("mana_rt_binary_encode_unsigned", 0, &[0]),
                 ("binary", "decode_unsigned", 1) => ("mana_rt_binary_decode_unsigned", 0, &[0]),
+                ("binary", "decode_unsigned", 2) => ("mana_rt_binary_decode_unsigned", 0, &[]),
                 ("binary", "longest_common_prefix", 1) => ("mana_rt_binary_lcp", 0, &[0]),
                 ("binary", "longest_common_suffix", 1) => ("mana_rt_binary_lcp", 0, &[1]),
                 ("binary", "list_to_bin", 1) => ("mana_rt_list_to_binary", 0, &[]),

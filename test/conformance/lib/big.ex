@@ -75,6 +75,20 @@ defmodule Conf.Big do
     :erlang.display(1.0e18 < huge)
     :erlang.display(huge * 1.0 > 1.0e29)
 
+    # ETF round-trips at and past one limb
+    two64 = Bitwise.bsl(1, 64)
+    for v <- [two64, -two64, huge, -huge, Bitwise.bsl(1, 200), @small_max + 1] do
+      :erlang.display(:erlang.binary_to_term(:erlang.term_to_binary(v)) == v)
+    end
+
+    :erlang.display(:binary.decode_unsigned(<<255, 255, 255, 255, 255, 255, 255, 255, 255>>))
+    :erlang.display(:binary.decode_unsigned(:binary.copy(<<170>>, 16), :little))
+
+    # float → integer beyond the small range
+    :erlang.display(trunc(1.0e30))
+    :erlang.display(round(-1.0e25))
+    :erlang.display(:erlang.float(huge) == 1.2345678901234568e29)
+
     :erlang.display(:done)
     :ok
   end
