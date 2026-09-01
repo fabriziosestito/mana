@@ -4092,7 +4092,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         }
                     }
                     if matches!(size, SegSize::Bytes(n) if *n > 8) {
-                        return Err("TODO(bignum): binding integer segments over 64 bits".into());
+                        return Err("TODO(bignum-segments): binding integer segments over 64 bits".into());
                     }
                     // 1-byte unsigned reads under a preflighted length:
                     // inline load (<<h, rest::binary>> — the string-walk
@@ -4356,7 +4356,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    // ---- BIFs (none allocate today; TODO(bignum) changes that) ----
+    // ---- BIFs (arith may allocate BIGNUMS, but via alloc_shared — never
+    // a GC point, so the may-gc analysis stays as-is) ----
 
     fn compile_bif(
         &self,

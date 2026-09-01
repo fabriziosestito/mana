@@ -38,6 +38,10 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | phx landing, keepalive | 576 µs | 211 µs | 2026-08-31, Phoenix tier-1 first recorded run (render+session+CSRF on top of the Bandit gap) |
 | phx landing, new conn | 895 µs | 411 µs | 2026-09-01, after app-boot milestone (full browser path: sessions, gzip, static assets) |
 | phx landing, keepalive | 672 µs | 243 µs | 2026-09-01, after app-boot milestone (2.8x behind — sub-binary views remain the lever) |
+| phx landing, keepalive | 433 µs | 218 µs | 2026-09-01, perf campaign: dirty-tracked minors (the real lever, found by profiling) + sub-binary views + bignums; 2.8x -> 2.0x |
+| phx landing, new conn | 563 µs | 398 µs | 2026-09-01, perf campaign (1.4x behind) |
+| str upcase 1KB | 149 µs | 14 µs | 2026-09-01, first recorded — unicode char loop; BEAM match contexts are the known next lever |
+| fib 25 | 575 µs | — | 2026-09-01, overflow-checked arith sentinel: no regression vs 618 µs pre-campaign |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction

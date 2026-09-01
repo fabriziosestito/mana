@@ -49,7 +49,6 @@
 //! Cross-thread interaction is limited to mailbox pushes, state flips, and
 //! condvar wakes.
 //!
-//! TODO(bignum): small-int arithmetic wraps into the tag space.
 //! TODO(stacks): process stacks are fixed (root 32MB, spawned 1MB).
 //! TODO(split): this file wants to become term.rs / gc.rs / sched.rs.
 
@@ -90,9 +89,6 @@ pub const KIND_FUN: u64 = 2;
 /// sorted (term order with an exactness tiebreak: 1 before 1.0).
 pub const KIND_MAP: u64 = 4;
 pub const KIND_BIN: u64 = 5;
-/// An inert big-integer literal (decimal digits): ordered/compared/printed
-/// correctly, badarith under arithmetic — TODO(bignum) for real math.
-pub const KIND_BIGLIT: u64 = 6;
 /// Real bignum: `[header(limbs<<9 | sign<<8 | 3) | limbs (LE u64)...]`,
 /// normalized (never a value that fits the 61-bit small range, no leading
 /// zero limbs; sign bit set = negative). Allocated in the SHARED OLD SPACE
@@ -162,7 +158,7 @@ fn payload_words(header: u64) -> usize {
         KIND_FLOAT => 1,
         KIND_FUN => 1 + (header >> 16) as usize,
         KIND_MAP => 2 * (header >> 8) as usize,
-        KIND_BIN | KIND_BIGLIT => ((header >> 8) as usize + 7) / 8,
+        KIND_BIN => ((header >> 8) as usize + 7) / 8,
         KIND_SUBBIN => 2, // parent term + byte offset (len lives in the header)
         KIND_BIGNUM => (header >> 9) as usize,
         _ => 0,
@@ -3306,10 +3302,8 @@ pub extern "C" fn mana_rt_monotonic_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     in_time_unit(ctx, nanos, unit)
 }
 
-/// erlang:system_time/1. Unix nanoseconds exceed 61-bit smalls (BEAM uses
-/// bignums) — we offset from 2020-01-01 instead; wall-clock DELTAS and
-/// second/millisecond absolute values are unaffected in practice —
-/// TODO(bignum).
+/// erlang:system_time/1 — true Unix epoch; nanosecond magnitudes come
+/// back as bignums.
 #[no_mangle]
 pub extern "C" fn mana_rt_system_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -7104,7 +7098,7 @@ fn type_rank(t: u64) -> u8 {
                 KIND_FUN => 3,
                 KIND_MAP => 6,
                 KIND_BIN | KIND_SUBBIN => 9,
-                KIND_BIGLIT | KIND_BIGNUM => 0, // numbers
+                KIND_BIGNUM => 0, // numbers
                 _ => 5, // tuple
             }
         }
@@ -8063,7 +8057,7 @@ pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u
     }
     if nbytes > 8 {
         // dynamic sizes beyond 64 bits would need bignums — fail the match
-        // (TODO(bignum): BEAM would succeed)
+        // (TODO(bignum-segments): BEAM would succeed)
         return EXC_SENTINEL;
     }
     let mut v: u64 = 0;
@@ -8087,7 +8081,7 @@ pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u
     // small ints hold 61 bits; 64-bit segments with larger values need
     // bignums we don't have
     if nbytes >= 8 && (sv >> 60 != 0 && sv >> 60 != -1) {
-        eprintln!("mana: TODO(bignum): 64-bit binary segment value out of small-int range");
+        eprintln!("mana: TODO(bignum-segments): 64-bit binary segment value out of small-int range");
         std::process::abort();
     }
     ((sv << 3) as u64) | TAG_SMALL

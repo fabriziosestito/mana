@@ -200,6 +200,25 @@ When asked to open a PR:
   seed the named function at EVERY arity (apply-time args extension —
   Plug.Debugger's banner {M,F,[]} is called /5). The conformance gate
   runs the SAME generated Mana.AppBoot on both runtimes.
+- **Sub-binaries, bignums, dirty-tracked minors (the perf campaign).**
+  KIND_SUBBIN=13 views `[len<<8|13 | parent | offset]` are produced by
+  bin_slice for slices > 64 bytes (smaller ones copy — no parent pinning);
+  bin_parts recomputes the data pointer from the parent TERM on every
+  access (parents move). Kind 7 is FORBIDDEN for heap headers (collides
+  with TAG_FORWARD 0b111 — this shipped and corrupted heaps). Kinds 5/13
+  differ only in bit 3: `(k|8)==13` is the shared bin-kind test; inline
+  match reads go through bin_base_addr. KIND_BIGNUM=3 `[limbs<<9|sign<<8|3]`
+  allocates via alloc_shared — never a GC point, so +,-,* keep no-frame
+  fast paths (overflow via tagged-value intrinsics: sadd/ssub on tagged,
+  smul on untagged×(b^1)); bit ops on negative bignums abort
+  (TODO(bignum-bitops)); >64-bit binary segments abort
+  (TODO(bignum-segments)). Minors are dirty-tracked: a parked process is
+  scanned only if it ran or received a message since the last minor
+  (push_and_wake/send/swap-out set the flag) — this took phx keepalive
+  from 630µs to 425µs; eternal objects get their one minor scan from the
+  FRESH_ETERNALS list (write-once ⇒ afterwards old/static forever).
+  Gates for these paths: Conf.Subbin, Conf.Big, GC-stress
+  (MANA_NURSERY_WORDS=512/4096), SMP matrix, Smoke.Phx soak.
 - **Compile speed architecture (the compile-speed milestone).** Three
   layers keep warm builds at hash+link:
   1. **Analysis summaries** (`<cache>/summary/`, keyed by tool_hash +
