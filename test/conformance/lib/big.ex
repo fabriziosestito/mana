@@ -89,6 +89,14 @@ defmodule Conf.Big do
     :erlang.display(round(-1.0e25))
     :erlang.display(:erlang.float(huge) == 1.2345678901234568e29)
 
+    # time: true Unix epoch (facts only — values are nondeterministic)
+    secs = :os.system_time(:second)
+    ns = :os.system_time(:nanosecond)
+    :erlang.display(secs > 1_700_000_000 and secs < 2_000_000_000)
+    :erlang.display(ns > Bitwise.bsl(1, 60))
+    back = :erlang.convert_time_unit(ns, :nanosecond, :second)
+    :erlang.display(abs(back - secs) <= 2)
+
     :erlang.display(:done)
     :ok
   end

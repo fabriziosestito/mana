@@ -3219,12 +3219,10 @@ fn in_time_unit(ctx: &mut ProcCtx, nanos: i128, unit: u64) -> u64 {
     } else {
         return raise_badarg(ctx);
     };
-    let v = v as i64;
-    if v >> 60 != 0 && v >> 60 != -1 {
-        eprintln!("mana: TODO(bignum): time value out of small-int range");
-        std::process::exit(1);
-    }
-    ((v << 3) as u64) | TAG_SMALL
+    let neg = v < 0;
+    let uv = v.unsigned_abs();
+    let mag = bigint::normalize(vec![uv as u64, (uv >> 64) as u64]);
+    make_int_mag(ctx, neg && !mag.is_empty(), &mag)
 }
 
 /// erlang:fun_info/2 — closures carry no module/name metadata; arity and
@@ -3315,9 +3313,12 @@ pub extern "C" fn mana_rt_monotonic_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn mana_rt_system_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    const EPOCH_2020_SECS: u64 = 1_577_836_800;
+    // true Unix epoch: absolute nanoseconds exceed the small range and
+    // come back as bignums (the old 2020-offset hack put every absolute
+    // wall-clock reading 50 years in the past — the famous 1976 Date
+    // header)
     let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH + std::time::Duration::from_secs(EPOCH_2020_SECS))
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0);
     in_time_unit(ctx, nanos, unit)
@@ -3332,10 +3333,19 @@ pub extern "C" fn mana_rt_convert_time_unit(
     to: u64,
 ) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    if t & TAG_MASK != TAG_SMALL {
+    let v: i128 = if t & TAG_MASK == TAG_SMALL {
+        (t as i64 >> 3) as i128
+    } else if let Some((neg, mag)) = bignum_parts(t) {
+        // wall-clock magnitudes fit two limbs comfortably
+        if mag.len() > 2 {
+            return raise_badarg(ctx);
+        }
+        let uv = mag[0] as i128
+            | ((*mag.get(1).unwrap_or(&0) as i128) << 64);
+        if neg { -uv } else { uv }
+    } else {
         return raise_badarg(ctx);
-    }
-    let v = (t as i64 >> 3) as i128;
+    };
     let nanos: i128 = if from & TAG_MASK == TAG_SMALL {
         let hz = from as i64 >> 3;
         if hz <= 0 {
@@ -8232,10 +8242,16 @@ pub extern "C" fn mana_rt_bin_write_int(
     little: u64,
 ) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    if val & TAG_MASK != TAG_SMALL {
+    // BEAM truncates integer segments to the low bits — bignums included
+    let v: u64 = if val & TAG_MASK == TAG_SMALL {
+        (val as i64 >> 3) as u64
+    } else if let Some((neg, mag)) = bignum_parts(val) {
+        // low 64 bits, two's complement for negatives (nbytes <= 8)
+        let lo = mag[0];
+        if neg { lo.wrapping_neg() } else { lo }
+    } else {
         return raise_badarg(ctx);
-    }
-    let v = (val as i64 >> 3) as u64;
+    };
     let (p, _) = bin_parts(bin).unwrap();
     let (off, nbytes) = (off as usize, nbytes as usize);
     unsafe {
