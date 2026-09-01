@@ -1836,6 +1836,106 @@ pub extern "C" fn mana_rt_process_flag(ctx: *mut ProcCtx, flag: u64, value: u64)
     }
 }
 
+/// erlang:system_flag/2 — accepted no-ops returning plausible old values
+/// (VM tuning knobs that have no meaning here; Phoenix sets
+/// backtrace_depth at application start).
+#[no_mangle]
+pub extern "C" fn mana_rt_system_flag(ctx: *mut ProcCtx, flag: u64, _value: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if flag & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    match atom_bytes(flag) {
+        b"backtrace_depth" | b"fullsweep_after" | b"min_heap_size"
+        | b"min_bin_vheap_size" | b"max_heap_size" => (8 << 3) | TAG_SMALL,
+        _ => raise_badarg(ctx),
+    }
+}
+
+/// persistent_term:info/0 — #{count => N, memory => bytes-ish}.
+#[no_mangle]
+pub extern "C" fn mana_rt_pt_info(ctx: *mut ProcCtx) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let count = PERSISTENT_TERMS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.len() as u64)
+        .unwrap_or(0);
+    let t = alloc_nursery(ctx, 5);
+    unsafe {
+        *t = (2 << 8) | KIND_MAP;
+        // sorted flatmap: atom order is by name — count < memory
+        *t.add(1) = atom_intern(b"count");
+        *t.add(2) = (count << 3) | TAG_SMALL;
+        *t.add(3) = atom_intern(b"memory");
+        *t.add(4) = ((count * 64) << 3) | TAG_SMALL;
+    }
+    t as u64
+}
+
+/// erlang:memory/0 — allocator stats mapped onto BEAM's key set. Values
+/// come from OUR heaps (old space + nurseries), so absolute numbers
+/// diverge from BEAM (documented; consumers chart trends, not identities).
+#[no_mangle]
+pub extern "C" fn mana_rt_memory(ctx: *mut ProcCtx) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let g = ctx.global;
+    let old_bytes = g.old_used.load(Ordering::Relaxed) as u64 * 8;
+    let nursery_bytes = g.n_scheds as u64 * ctx.nursery_words as u64 * 8;
+    let processes = old_bytes + nursery_bytes;
+    let atom = interned_atom_count() * 64;
+    let system = atom + 1_048_576;
+    let total = processes + system;
+    let pairs: [(&[u8], u64); 9] = [
+        (b"total", total),
+        (b"processes", processes),
+        (b"processes_used", processes),
+        (b"system", system),
+        (b"atom", atom),
+        (b"atom_used", atom),
+        (b"binary", 0),
+        (b"code", 0),
+        (b"ets", 0),
+    ];
+    // build [{k, v} | ...] back-to-front with the list rooted across allocs
+    let saved = ctx.roots_head;
+    let mut fr = [0u64, 1, NIL];
+    fr[0] = saved;
+    ctx.roots_head = fr.as_ptr() as u64;
+    for (k, v) in pairs.iter().rev() {
+        let t = alloc_nursery(ctx, 3);
+        unsafe {
+            *t = (2 << 8) | KIND_TUPLE;
+            *t.add(1) = atom_intern(k);
+            *t.add(2) = (v << 3) | TAG_SMALL;
+        }
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = t as u64;
+            *cell.add(1) = fr[2];
+        }
+        fr[2] = cell as u64 | TAG_CONS;
+    }
+    ctx.roots_head = saved;
+    fr[2]
+}
+
+/// erlang:statistics/1 — the telemetry_poller keys only.
+#[no_mangle]
+pub extern "C" fn mana_rt_statistics(ctx: *mut ProcCtx, item: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if item & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctx);
+    }
+    match atom_bytes(item) {
+        // run queues are drained at safepoints; a snapshot of 0 is honest
+        // enough for poller charts
+        b"total_run_queue_lengths" | b"total_run_queue_lengths_all" | b"run_queue" => TAG_SMALL,
+        _ => raise_badarg(ctx),
+    }
+}
+
 /// spawn_link/1 — link is established before the child first runs.
 #[no_mangle]
 pub extern "C" fn mana_rt_spawn_link(ctx: *mut ProcCtx, closure: u64) -> u64 {
@@ -2983,6 +3083,10 @@ pub extern "C" fn mana_rt_fun_info(ctx: *mut ProcCtx, fun: u64, item: u64) -> u6
     let value = match atom_bytes(item) {
         b"arity" => ((((header >> 8) & 0xff) << 3) as u64) | TAG_SMALL,
         b"env" => NIL,
+        // closures carry no MFA metadata — every fun reports as local
+        // (telemetry:attach warns-and-proceeds on local; BEAM would say
+        // external for `fun M:F/A` captures — documented divergence)
+        b"type" => atom_intern(b"local"),
         _ => known().undefined,
     };
     let saved = ctx.roots_head;
@@ -3124,6 +3228,17 @@ pub extern "C" fn mana_rt_system_info(ctx: *mut ProcCtx, item: u64) -> u64 {
             let n = ctx.global.n_scheds as u64;
             ((n << 3) as u64) | TAG_SMALL
         }
+        // telemetry_poller system_counts — real where cheap, plausible
+        // constants for the BEAM-only limits
+        b"process_count" => {
+            let n = ctx.global.procs.read().iter().filter(|s| s.is_some()).count() as u64;
+            ((n << 3) as u64) | TAG_SMALL
+        }
+        b"atom_count" => ((interned_atom_count() << 3) as u64) | TAG_SMALL,
+        b"port_count" => TAG_SMALL, // 0
+        b"process_limit" => ((262_144u64 << 3) as u64) | TAG_SMALL,
+        b"atom_limit" => ((1_048_576u64 << 3) as u64) | TAG_SMALL,
+        b"port_limit" => ((65_536u64 << 3) as u64) | TAG_SMALL,
         b"os_monotonic_time_source" => {
             // property list benchee's repeated_measurement reads
             let cell = alloc_nursery(ctx, 2);
@@ -8883,6 +8998,10 @@ pub extern "C" fn mana_rt_pt_get(ctx: *mut ProcCtx, key: u64, default: u64, has_
 /// complete, so a miss means the runtime tried to mint a new atom.
 fn find_atom(name: &str) -> Option<u64> {
     atom_lookup(name.as_bytes())
+}
+
+fn interned_atom_count() -> u64 {
+    atom_table_lock().read().map(|m| m.len() as u64).unwrap_or(0)
 }
 
 /// Patterns: a binary or a non-empty list of binaries (compile_pattern is

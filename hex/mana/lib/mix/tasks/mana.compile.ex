@@ -5,10 +5,15 @@ defmodule Mix.Tasks.Mana.Compile do
   Compile this Mix project to a native binary with the mana compiler.
 
       mix mana.compile --entry Mod.fun/0 [--out DIR] [--bin PATH]
+      mix mana.compile --app [--out DIR] [--bin PATH]
 
   The entry must be a zero-arity function; the produced binary runs it and
   exits. Accepted entry formats: `Mod.fun/0`, `Nested.Mod.fun/0`,
   `mod:fun/0` (Erlang-style, module taken verbatim).
+
+  `--app` instead boots the project like a release: a generated
+  `Mana.AppBoot` module bakes the compile-time config and starts the
+  application dependency tree in order, then parks (see `Mana.Boot`).
 
   Current limitations (early days): modules of this project may call each
   other and supported `:erlang` BIFs, but the Elixir/Erlang standard library
@@ -20,7 +25,7 @@ defmodule Mix.Tasks.Mana.Compile do
 
   use Mix.Task
 
-  @switches [entry: :string, out: :string, bin: :string]
+  @switches [entry: :string, out: :string, bin: :string, app: :boolean]
 
   @impl true
   def run(argv) do
@@ -28,7 +33,10 @@ defmodule Mix.Tasks.Mana.Compile do
 
     Mix.Task.run("compile")
 
-    {mod, fun, arity} = resolve_entry!(opts[:entry])
+    if opts[:app] && opts[:entry] do
+      Mix.raise("--app and --entry are mutually exclusive")
+    end
+
     out = Path.expand(opts[:out] || "_mana")
     File.mkdir_p!(out)
 
@@ -40,11 +48,22 @@ defmodule Mix.Tasks.Mana.Compile do
       Mix.raise("no compiled modules under #{Mix.Project.compile_path()}")
     end
 
-    entry_beam = Path.join(Mix.Project.compile_path(), "#{mod}.beam")
+    # --app: release-style boot — generate Mana.AppBoot (baked config +
+    # ordered application starts) and make it the entry
+    {mod, fun, arity, beams} =
+      if opts[:app] do
+        boot_beam = Mana.Boot.generate!(out)
+        {Mana.AppBoot, :main, 0, beams ++ [boot_beam]}
+      else
+        {mod, fun, arity} = resolve_entry!(opts[:entry])
+        entry_beam = Path.join(Mix.Project.compile_path(), "#{mod}.beam")
 
-    unless entry_beam in beams do
-      Mix.raise("no compiled module #{inspect(mod)} at #{entry_beam}")
-    end
+        unless entry_beam in beams do
+          Mix.raise("no compiled module #{inspect(mod)} at #{entry_beam}")
+        end
+
+        {mod, fun, arity, beams}
+      end
 
     cores =
       for beam <- beams do
@@ -319,7 +338,7 @@ defmodule Mix.Tasks.Mana.Compile do
   end
 
   defp resolve_entry!(nil) do
-    Mix.raise("--entry Mod.fun/0 is required (OTP application entry points come later)")
+    Mix.raise("--entry Mod.fun/0 or --app is required")
   end
 
   defp resolve_entry!(entry) do

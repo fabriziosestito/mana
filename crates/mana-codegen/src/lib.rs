@@ -1395,6 +1395,49 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
+    /// A call into a module that isn't compiled: BEAM loads such code fine
+    /// and fails only when the call executes, so abort at the CALL SITE
+    /// (print + exit, like unsupported stubs — aborting keeps the
+    /// may-raise analysis consistent) instead of stubbing the whole
+    /// caller. Guarded dead branches (`if mix_available?(), do: Mix...`)
+    /// stay live. Returns a dummy value positioned in a dead block.
+    fn emit_missing_call_abort(
+        &self,
+        f: FunctionValue<'ctx>,
+        module: &str,
+        name: &str,
+        arity: usize,
+    ) -> CgResult<IntValue<'ctx>> {
+        let msg = format!(
+            "{}: call into missing module {}:{}/{}",
+            self.module_name, module, name, arity
+        );
+        let ptr = self.static_bytes(msg.as_bytes())?;
+        let callee = self.rt_fn("mana_rt_unsupported", || {
+            self.ctx.void_type().fn_type(
+                &[
+                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                    BasicMetadataTypeEnum::IntType(self.i64t),
+                ],
+                false,
+            )
+        });
+        self.builder
+            .build_call(
+                callee,
+                &[
+                    ptr.into(),
+                    self.i64t.const_int(msg.len() as u64, false).into(),
+                ],
+                "",
+            )
+            .map_err(be)?;
+        self.builder.build_unreachable().map_err(be)?;
+        let dead = self.ctx.append_basic_block(f, "missing.dead");
+        self.builder.position_at_end(dead);
+        Ok(self.i64t.const_int(NIL, false))
+    }
+
     /// Functions BEAM implements in C (nif_error stubs in lists.erl and
     /// binary.erl) get native bodies; true if this definition was handled.
     /// Plans: (helper, drop_trailing_args, extra_const_args); helper ""
@@ -1742,7 +1785,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             Expr::Call { module, name, args } if !is_bif_module(module) => {
                 if self.missing_modules.borrow().contains(module) {
-                    return Err(format!("module '{}' is not compiled", module));
+                    let v = self.emit_missing_call_abort(f, module, name, args.len())?;
+                    self.builder.build_return(Some(&v)).map_err(be)?;
+                    return Ok(());
                 }
                 let callee = self.remote_fn(module, name, args.len());
                 let argv = self.eval_args(f, args, scope)?;
@@ -1897,7 +1942,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 if is_bif_module(module) {
                     self.compile_bif(f, module, name, args, scope)
                 } else if self.missing_modules.borrow().contains(module) {
-                    Err(format!("module '{}' is not compiled", module))
+                    self.emit_missing_call_abort(f, module, name, args.len())
                 } else {
                     let callee = self.remote_fn(module, name, args.len());
                     let may_raise = self.raise_set.contains(&(
@@ -2535,14 +2580,27 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if let Some(existing) = self.module.get_function(&sym) {
             return Ok(existing);
         }
-        // check fallibility BEFORE declaring: a linkonce_odr declaration
-        // without a body is invalid IR (this leaked when the target module
-        // was missing)
+        // a fun capture of a missing module: BEAM parity — build the shim
+        // as an abort-if-ever-called stub (the old Err path leaked a
+        // bodyless linkonce declaration AND poisoned the whole caller)
         if module.is_some()
             && !is_bif_module(target_mod)
             && self.missing_modules.borrow().contains(target_mod)
         {
-            return Err(format!("module '{}' is not compiled", target_mod));
+            let shim = self
+                .module
+                .add_function(&sym, self.term_fn_type(fname.arity + 1), None);
+            shim.set_linkage(Linkage::LinkOnceODR);
+            let saved_bb = self.builder.get_insert_block();
+            let msg = format!(
+                "fun {}:{}/{}: module '{}' is not compiled",
+                target_mod, fname.name, fname.arity, target_mod
+            );
+            self.emit_unsupported_stub(shim, &msg)?;
+            if let Some(bb) = saved_bb {
+                self.builder.position_at_end(bb);
+            }
+            return Ok(shim);
         }
         let shim = self
             .module
@@ -4614,6 +4672,28 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("system_flag", 2) => {
+                // VM tuning knobs: accepted no-ops (badarg on unknown flags)
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_fn("mana_rt_system_flag", || {
+                            self.i64t.fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                        "prev",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("exit", 2) => {
                 let call = self
                     .builder
@@ -5517,6 +5597,35 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         self.rt_pt_i64("mana_rt_system_info"),
                         &[self.ctx_val().into(), argv[0].into()],
                         "sysinfo",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
+            ("memory", 0) => {
+                // allocator stats over OUR heaps (values diverge from BEAM)
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_fn("mana_rt_memory", || {
+                            self.i64t.fn_type(
+                                &[BasicMetadataTypeEnum::PointerType(self.ptrt)],
+                                false,
+                            )
+                        }),
+                        &[self.ctx_val().into()],
+                        "mem",
+                    )
+                    .map_err(be)?;
+                Ok(call_result(call)?.into_int_value())
+            }
+            ("statistics", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_statistics"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "stats",
                     )
                     .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
@@ -6973,6 +7082,19 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     "ptget",
                 )
                 .map_err(be)?,
+            ("info", 0) => self
+                .builder
+                .build_call(
+                    self.rt_fn("mana_rt_pt_info", || {
+                        self.i64t.fn_type(
+                            &[BasicMetadataTypeEnum::PointerType(self.ptrt)],
+                            false,
+                        )
+                    }),
+                    &[self.ctx_val().into()],
+                    "ptinfo",
+                )
+                .map_err(be)?,
             _ => {
                 return Err(format!(
                     "unsupported BIF persistent_term:{}/{}",
@@ -8345,6 +8467,7 @@ fn erlang_may_raise(name: &str, arity: usize) -> bool {
             | ("get_module_info", 2)
             | ("decode_packet", 3)
             | ("process_flag", 2)
+            | ("system_flag", 2)
             | ("hibernate", 3)
             | ("iolist_size", 1)
             | ("term_to_binary", 1)
@@ -8374,6 +8497,7 @@ fn erlang_may_raise(name: &str, arity: usize) -> bool {
             | ("make_fun", 3)
             | ("monitor", 3)
             | ("system_info", 1)
+            | ("statistics", 1)
             | ("is_process_alive", 1)
             | ("fun_info", 2)
             | ("fun_info_mfa", 1)
@@ -8441,6 +8565,7 @@ fn erlang_may_gc(name: &str, arity: usize) -> bool {
     matches!(
         (name, arity),
         ("setelement", 3)
+            | ("memory", 0)
             | ("decode_packet", 3)
             | ("hibernate", 3)
             | ("get_keys", 0)

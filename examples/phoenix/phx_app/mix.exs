@@ -48,7 +48,9 @@ defmodule PhxApp.MixProject do
       {:telemetry_poller, "~> 1.0"},
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
-      {:bandit, "~> 1.5"}
+      {:bandit, "~> 1.5"},
+      # native compilation (mix mana.compile --app) from inside this app
+      {:mana, path: "../../../hex/mana", only: :dev, runtime: false}
     ]
   end
 
