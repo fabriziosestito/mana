@@ -8063,6 +8063,57 @@ fn bytes_to_new_bin(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     p as u64
 }
 
+/// IEEE CRC-32 (gzip's checksum), table-driven.
+fn crc32(bytes: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, e) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *e = c;
+        }
+        t
+    });
+    let mut c = 0xffff_ffffu32;
+    for &b in bytes {
+        c = table[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8);
+    }
+    !c
+}
+
+/// zlib:gzip/1 — a REAL gzip container over DEFLATE *stored* blocks
+/// (RFC 1951 §3.2.4): spec-valid output any decoder accepts, zero
+/// compression ratio. TODO(zlib-real): actual DEFLATE compression.
+#[no_mangle]
+pub extern "C" fn mana_rt_zlib_gzip(ctx: *mut ProcCtx, data: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut input = Vec::new();
+    if iolist_flatten(data, &mut input).is_err() {
+        return raise_badarg(ctx);
+    }
+    let mut out = Vec::with_capacity(input.len() + 32);
+    // header: magic, CM=8 (deflate), no flags, no mtime, XFL=0, OS=unknown
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
+    let mut chunks = input.chunks(0xffff).peekable();
+    if input.is_empty() {
+        out.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]); // final empty stored block
+    }
+    while let Some(chunk) = chunks.next() {
+        let last = chunks.peek().is_none();
+        out.push(last as u8); // BFINAL | BTYPE=00 (stored)
+        let len = chunk.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&crc32(&input).to_le_bytes());
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    bytes_to_new_bin(ctx, &out)
+}
+
 /// erlang:list_to_binary/1 (accepts iolists, like BEAM).
 #[no_mangle]
 pub extern "C" fn mana_rt_list_to_binary(ctx: *mut ProcCtx, l: u64) -> u64 {

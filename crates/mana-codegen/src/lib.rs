@@ -4248,6 +4248,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             return self.atom_term("ok");
         }
+        if module == "zlib" && name == "gzip" && args.len() == 1 {
+            // real gzip container over DEFLATE stored blocks (valid
+            // everywhere, compresses nothing — TODO(zlib-real)); browsers
+            // send Accept-Encoding: gzip and Bandit compresses through this
+            let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+            let call = self
+                .builder
+                .build_call(
+                    self.rt_pt_i64("mana_rt_zlib_gzip"),
+                    &[self.ctx_val().into(), argv[0].into()],
+                    "gz",
+                )
+                .map_err(be)?;
+            let v = call_result(call)?.into_int_value();
+            return self.check_exc(f, v);
+        }
         if matches!(
             module,
             "erts_internal" | "elixir_erl" | "erl_eval" | "beam_lib" | "global"
@@ -8960,7 +8976,7 @@ fn expr_may_gc(
             if matches!(
                 module.as_str(),
                 "io" | "unicode" | "re" | "timer" | "file" | "prim_file"
-                    | "gen_tcp" | "inet" | "crypto"
+                    | "gen_tcp" | "inet" | "crypto" | "zlib"
             ) {
                 return true;
             }
@@ -9242,7 +9258,7 @@ fn cond_may_gc(
             if matches!(
                 module.as_str(),
                 "io" | "unicode" | "re" | "timer" | "file" | "prim_file"
-                    | "gen_tcp" | "inet" | "crypto"
+                    | "gen_tcp" | "inet" | "crypto" | "zlib"
             ) {
                 *base = true;
                 return;
