@@ -183,7 +183,14 @@ defmodule Mix.Tasks.Mana.Compile do
         {pulled, tried, have} = pull_all(candidates, out, cut, tried, have, " (dynamic)")
 
         if pulled == [] or fuel == 0 do
-          IO.write(output)
+          # candidate notes are driver protocol (consumed by the regexes
+          # above), not user information — drop them from the final output
+          output
+          |> String.split("\n")
+          |> Enum.reject(&String.starts_with?(&1, "manac: note: dynamic module candidate"))
+          |> Enum.join("\n")
+          |> IO.write()
+
           write_manifest(out, cores)
           :ok
         else
