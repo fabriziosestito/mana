@@ -93,6 +93,13 @@ pub const KIND_BIN: u64 = 5;
 /// An inert big-integer literal (decimal digits): ordered/compared/printed
 /// correctly, badarith under arithmetic — TODO(bignum) for real math.
 pub const KIND_BIGLIT: u64 = 6;
+/// Sub-binary view: `[header(len<<8|7) | parent_term | byte_offset]` — a
+/// zero-copy slice of a ROOT KIND_BIN (never of another view; slicing a
+/// view folds offsets). Same header convention as KIND_BIN so the inline
+/// length preflight works for both; kinds 5/7 differ only in bit 1, so
+/// `(kind | 2) == 7` accepts either. The parent is a TERM (it moves under
+/// GC) — data pointers are recomputed on every access, never cached.
+pub const KIND_SUBBIN: u64 = 7;
 
 const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 
@@ -146,6 +153,7 @@ fn payload_words(header: u64) -> usize {
         KIND_FUN => 1 + (header >> 16) as usize,
         KIND_MAP => 2 * (header >> 8) as usize,
         KIND_BIN | KIND_BIGLIT => ((header >> 8) as usize + 7) / 8,
+        KIND_SUBBIN => 2, // parent term + byte offset (len lives in the header)
         _ => 0,
     }
 }
@@ -737,6 +745,7 @@ fn promote_term(ctx: &mut ProcCtx, t: u64) -> u64 {
                         KIND_TUPLE => (p, 1, (header >> 8) as usize),
                         KIND_FUN => (p, 2, (header >> 16) as usize),
                         KIND_MAP => (p, 1, 2 * (header >> 8) as usize),
+                        KIND_SUBBIN => (p, 1, 1),
                         _ => (p, 0, 0),
                     }
                 }
@@ -1281,14 +1290,11 @@ fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
                     let bits = *p.add(1);
                     out.extend_from_slice(&bits.to_be_bytes());
                 }
-                KIND_BIN => {
-                    let len = (*p >> 8) as usize;
+                KIND_BIN | KIND_SUBBIN => {
+                    let bytes = bin_bytes(t);
                     out.push(109);
-                    out.extend_from_slice(&(len as u32).to_be_bytes());
-                    out.extend_from_slice(std::slice::from_raw_parts(
-                        p.add(1) as *const u8,
-                        len,
-                    ));
+                    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                    out.extend_from_slice(bytes);
                 }
                 _ => return Err(()),
             }
@@ -1780,11 +1786,8 @@ fn phash2_term(t: u64, h: &mut u64) {
                     }
                 }
                 KIND_FLOAT => mix(h, *p.add(1)),
-                KIND_BIN => {
-                    for &b in std::slice::from_raw_parts(
-                        p.add(1) as *const u8,
-                        (*p >> 8) as usize,
-                    ) {
+                KIND_BIN | KIND_SUBBIN => {
+                    for &b in bin_bytes(t) {
                         mix(h, b as u64);
                     }
                 }
@@ -6567,6 +6570,8 @@ unsafe fn scan_fields(p: *mut u64, is_cons: bool, f: &mut impl FnMut(*mut u64)) 
                     f(p.add(1 + i));
                 }
             }
+            // sub-binary views: the parent binary is a term field
+            KIND_SUBBIN => f(p.add(1)),
             _ => {}
         }
     }
@@ -6891,7 +6896,7 @@ fn type_rank(t: u64) -> u8 {
                 KIND_FLOAT => 0,
                 KIND_FUN => 3,
                 KIND_MAP => 6,
-                KIND_BIN => 9,
+                KIND_BIN | KIND_SUBBIN => 9,
                 KIND_BIGLIT => 0, // numbers
                 _ => 5, // tuple
             }
@@ -7053,6 +7058,13 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
         TAG_BOXED => unsafe {
             let (pa, pb) = (a as *const u64, b as *const u64);
             let (ha, hb) = (*pa, *pb);
+            // bin kinds first: a view and a plain binary with equal bytes
+            // are =:= even though their headers differ, so the header
+            // fast-reject below must not see them
+            let bin_kind = |h: u64| matches!(h & 0xff, KIND_BIN | KIND_SUBBIN);
+            if bin_kind(ha) || bin_kind(hb) {
+                return (bin_kind(ha) && bin_kind(hb) && bin_bytes(a) == bin_bytes(b)) as i64;
+            }
             if ha != hb {
                 return 0;
             }
@@ -7074,7 +7086,6 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
                     }
                     1
                 }
-                KIND_BIN => (bin_bytes(a) == bin_bytes(b)) as i64,
                 KIND_BIGLIT => (biglit_digits(a) == biglit_digits(b)) as i64,
                 _ => 0, // funs: identity only (raw-equal handled above)
             }
@@ -7320,7 +7331,9 @@ fn map_key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
     // compare == 0 with distinct bits: a binary's byte compare was already
     // exact — only numbers (1 vs 1.0), possibly nested in containers, need
     // the exactness tiebreak
-    if a & TAG_MASK == TAG_BOXED && unsafe { *(a as *const u64) } & 0xff == KIND_BIN {
+    if a & TAG_MASK == TAG_BOXED
+        && matches!(unsafe { *(a as *const u64) } & 0xff, KIND_BIN | KIND_SUBBIN)
+    {
         return std::cmp::Ordering::Equal;
     }
     if mana_rt_eq_exact(a, b) == 1 {
@@ -7731,10 +7744,26 @@ fn bin_parts(t: u64) -> Option<(*const u8, usize)> {
     }
     let p = t as *const u64;
     let header = unsafe { *p };
-    if header & 0xff != KIND_BIN {
-        return None;
+    match header & 0xff {
+        KIND_BIN => Some((unsafe { p.add(1) } as *const u8, (header >> 8) as usize)),
+        // view: recompute from the parent TERM every call — the parent
+        // moves under GC, so the data pointer must never be cached
+        KIND_SUBBIN => {
+            let parent = unsafe { *p.add(1) };
+            let off = unsafe { *p.add(2) } as usize;
+            debug_assert!(
+                parent & TAG_MASK == TAG_BOXED
+                    && unsafe { *(parent as *const u64) } & 0xff == KIND_BIN,
+                "sub-binary parent must be a root KIND_BIN"
+            );
+            let pp = parent as *const u64;
+            Some((
+                unsafe { (pp.add(1) as *const u8).add(off) },
+                (header >> 8) as usize,
+            ))
+        }
+        _ => None,
     }
-    Some((unsafe { p.add(1) } as *const u8, (header >> 8) as usize))
 }
 
 fn bin_bytes(t: u64) -> &'static [u8] {
@@ -9110,6 +9139,25 @@ fn eternal_deep_copy(t: u64) -> u64 {
         TAG_BOXED if t != 0 => {
             let p = t as *const u64;
             let header = unsafe { *p };
+            // flatten views up front: an eternal reason must not pin a heap
+            // parent (and eternal storage never gets GC-forwarded)
+            if header & 0xff == KIND_SUBBIN {
+                let bytes = bin_bytes(t);
+                let bwords = 1 + (bytes.len() + 7) / 8;
+                let bp = alloc_space(bwords);
+                unsafe {
+                    *bp = ((bytes.len() as u64) << 8) | KIND_BIN;
+                    if bytes.len() % 8 != 0 {
+                        *bp.add(bwords - 1) = 0;
+                    }
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        bp.add(1) as *mut u8,
+                        bytes.len(),
+                    );
+                }
+                return bp as u64;
+            }
             let words = 1 + payload_words(header);
             let np = alloc_space(words);
             unsafe {
@@ -10821,8 +10869,8 @@ fn write_term(t: u64, out: &mut String) {
                         std::slice::from_raw_parts(p.add(1) as *const u8, (header >> 8) as usize);
                     out.push_str(&String::from_utf8_lossy(bytes));
                 }
-                KIND_BIN => {
-                    let bytes = std::slice::from_raw_parts(p.add(1) as *const u8, (header >> 8) as usize);
+                KIND_BIN | KIND_SUBBIN => {
+                    let bytes = bin_bytes(t);
                     out.push_str("<<");
                     // all-printable-ascii binaries render as a string; unlike
                     // char lists, control chars do NOT qualify

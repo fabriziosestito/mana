@@ -3651,12 +3651,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .builder
                 .build_and(header, s.i64t.const_int(0xff, false), "bl.k")
                 .map_err(be)?;
+            // kinds 5 (bin) and 7 (sub-binary view) differ only in bit 1;
+            // both carry len<<8 in the header, so the length check is shared
+            let k2 = s
+                .builder
+                .build_or(k, s.i64t.const_int(2, false), "bl.k2")
+                .map_err(be)?;
             let is_bin = s
                 .builder
                 .build_int_compare(
                     IntPredicate::EQ,
-                    k,
-                    s.i64t.const_int(KIND_BIN, false),
+                    k2,
+                    s.i64t.const_int(7, false),
                     "bl.bin",
                 )
                 .map_err(be)?;
@@ -5701,11 +5707,16 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         .builder
                         .build_and(header, s.i64t.const_int(0xff, false), "k")
                         .map_err(be)?;
+                    // bin (5) or sub-binary view (7)
+                    let k2 = s
+                        .builder
+                        .build_or(k, s.i64t.const_int(2, false), "k2")
+                        .map_err(be)?;
                     s.builder
                         .build_int_compare(
                             IntPredicate::EQ,
-                            k,
-                            s.i64t.const_int(KIND_BIN, false),
+                            k2,
+                            s.i64t.const_int(7, false),
                             "k.b",
                         )
                         .map_err(be)
