@@ -81,6 +81,18 @@ defmodule Mana.Boot do
         end
       end
 
+    # real per-app dirs for code:lib_dir/priv_dir (Plug.Static resolves
+    # priv/static through them) — build-machine paths, like a release's
+    # lib dir; TODO(embed-priv): embed static assets into the binary
+    dir_calls =
+      for a <- order ++ env_only, dir = app_dir(a), dir != nil do
+        quote do
+          Application.put_env(:mana_app_dirs, unquote(a), unquote(dir))
+        end
+      end
+
+    env_calls = env_calls ++ dir_calls
+
     runtime_body = runtime_config_body()
 
     ast =
@@ -222,6 +234,12 @@ defmodule Mana.Boot do
         {order, seen} = Enum.reduce(deps, {order, seen}, fn d, {o, s} -> visit(d, o, s) end)
         {order ++ [app], seen}
     end
+  end
+
+  defp app_dir(app) do
+    to_string(Application.app_dir(app))
+  rescue
+    _ -> nil
   end
 
   defp loadable?(app) do

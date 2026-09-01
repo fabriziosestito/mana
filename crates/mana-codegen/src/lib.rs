@@ -2057,6 +2057,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.builder.position_at_end(dead);
                 Ok(self.i64t.get_undef())
             }
+            // the writable-binary accumulator seed for <<acc/binary, ...>>
+            // append loops (Base.decode64 etc.); the arg is only a capacity
+            // hint and our binary construction copies on append, so an
+            // empty static binary is semantically exact
+            Expr::PrimOp { name, .. } if name == "bs_init_writable" => {
+                self.static_binary(&[])
+            }
             Expr::PrimOp { name, .. } => Err(format!("unsupported primop {}", name)),
             Expr::Case { arg, clauses } => {
                 let vals = self.compile_case_arg(f, arg, clauses, scope)?;
@@ -6220,6 +6227,19 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .iter()
             .map(|s| parse_seg_spec(&s.spec))
             .collect::<Result<Vec<_>, _>>()?;
+        // sub-byte integer segments (Base's <<acc/binary, a::4, b::4, ...>>
+        // decode loops): coalesce each maximal run into ONE byte-aligned
+        // synthetic segment whose value is bsl/bor/band arithmetic over the
+        // original exprs (left-folded — original evaluation order; band =
+        // BEAM's truncation-to-size). Runs must end byte-aligned: a true
+        // sub-byte bitstring RESULT has no representation here.
+        if specs
+            .iter()
+            .any(|s| matches!(s.kind, SegKind::Int { size: SegSize::Bits(_) }))
+        {
+            let rewritten = coalesce_bit_runs(segs, &specs)?;
+            return self.compile_binary_construct(f, &rewritten, scope);
+        }
         // compile-time-known segment bytes
         let mut const_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(specs.len());
         for (spec, seg) in specs.iter().zip(segs) {
@@ -7000,15 +7020,26 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
-            ("lib_dir", 1) => {
-                let s = b"/mana/lib";
-                let bin = self.compile_binary_const_term(f, s, scope)?;
+            ("lib_dir", 1) | ("priv_dir", 1) => {
+                // real per-app dirs baked by the --app boot generator
+                // (env key {:mana_app_dirs, App}); {error, bad_name} for
+                // anything not baked — same failure BEAM gives unknown apps
+                let is_priv = self.i64t.const_int((name == "priv_dir") as u64, false);
                 let call = self
                     .builder
                     .build_call(
-                        self.rt_pt_i64("mana_rt_binary_to_list"),
-                        &[self.ctx_val().into(), bin.into()],
-                        "cl",
+                        self.rt_fn("mana_rt_code_app_dir", || {
+                            self.i64t.fn_type(
+                                &[
+                                    BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                    BasicMetadataTypeEnum::IntType(self.i64t),
+                                ],
+                                false,
+                            )
+                        }),
+                        &[self.ctx_val().into(), argv[0].into(), is_priv.into()],
+                        "appdir",
                     )
                     .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
@@ -7166,6 +7197,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ("mac", 4) => 2,
             ("exor", 2) => 3,
             ("pbkdf2_hmac", 5) => 4,
+            ("hash_equals", 2) => 5,
             _ => return Err(format!("unsupported BIF crypto:{}/{}", name, args.len())),
         };
         let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
@@ -8275,6 +8307,79 @@ fn atom_list(e: &Expr, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Coalesce runs of constant sub-byte integer segments into single
+/// byte-aligned synthetic segments (see compile_binary_construct).
+fn coalesce_bit_runs(
+    segs: &[mana_syntax::BinSegment<Box<Expr>>],
+    specs: &[SegSpec],
+) -> CgResult<Vec<mana_syntax::BinSegment<Box<Expr>>>> {
+    let mask = |v: &Expr, bits: u64| -> Expr {
+        Expr::Call {
+            module: "erlang".to_string(),
+            name: "band".to_string(),
+            args: vec![v.clone(), Expr::Lit(Literal::Int(((1i64 << bits) - 1) as i64))],
+        }
+    };
+    let mut out: Vec<mana_syntax::BinSegment<Box<Expr>>> = Vec::with_capacity(segs.len());
+    let mut run: Vec<(&Expr, u64)> = Vec::new();
+    let flush = |run: &mut Vec<(&Expr, u64)>,
+                 out: &mut Vec<mana_syntax::BinSegment<Box<Expr>>>|
+     -> CgResult<()> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        let total: u64 = run.iter().map(|(_, b)| b).sum();
+        if total % 8 != 0 {
+            return Err(format!(
+                "TODO(bitstring): sub-byte segments do not group to a whole byte ({} bits)",
+                total
+            ));
+        }
+        if total > 57 {
+            return Err(format!(
+                "TODO(bitstring): coalesced bit run exceeds small-int width ({} bits)",
+                total
+            ));
+        }
+        let mut it = run.drain(..);
+        let (v0, b0) = it.next().unwrap();
+        let mut acc = mask(v0, b0);
+        for (v, b) in it {
+            let shifted = Expr::Call {
+                module: "erlang".to_string(),
+                name: "bsl".to_string(),
+                args: vec![acc, Expr::Lit(Literal::Int(b as i64))],
+            };
+            acc = Expr::Call {
+                module: "erlang".to_string(),
+                name: "bor".to_string(),
+                args: vec![shifted, mask(v, b)],
+            };
+        }
+        out.push(mana_syntax::BinSegment {
+            value: Box::new(acc),
+            spec: vec![
+                Expr::Lit(Literal::Int((total / 8) as i64)),
+                Expr::Lit(Literal::Int(8)),
+                Expr::Lit(Literal::Atom("integer".to_string())),
+                Expr::Lit(Literal::Nil),
+            ],
+        });
+        Ok(())
+    };
+    for (seg, spec) in segs.iter().zip(specs) {
+        match &spec.kind {
+            SegKind::Int { size: SegSize::Bits(b) } => run.push((seg.value.as_ref(), *b)),
+            _ => {
+                flush(&mut run, &mut out)?;
+                out.push(seg.clone());
+            }
+        }
+    }
+    flush(&mut run, &mut out)?;
+    Ok(out)
 }
 
 fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {

@@ -1557,6 +1557,7 @@ pub const C_HASH: u64 = 1;
 pub const C_MAC: u64 = 2;
 pub const C_EXOR: u64 = 3;
 pub const C_PBKDF2: u64 = 4;
+const C_HASH_EQUALS: u64 = 5;
 
 fn crypto_bin_arg(t: u64) -> Result<Vec<u8>, ()> {
     let mut out = Vec::new();
@@ -1634,6 +1635,31 @@ pub extern "C" fn mana_rt_crypto(
 ) -> u64 {
     let ctx = unsafe { &mut *ctx };
     match op {
+        C_HASH_EQUALS => {
+            // constant-time equality on equal-size binaries; badarg on
+            // size mismatch or non-binaries, like OTP
+            let (Some((ap, an)), Some((bp, bn))) = (bin_parts(a), bin_parts(b)) else {
+                return raise_badarg(ctx);
+            };
+            if an != bn {
+                return raise_badarg(ctx);
+            }
+            let (asl, bsl) = unsafe {
+                (
+                    std::slice::from_raw_parts(ap, an),
+                    std::slice::from_raw_parts(bp, bn),
+                )
+            };
+            let mut acc = 0u8;
+            for i in 0..an {
+                acc |= asl[i] ^ bsl[i];
+            }
+            if acc == 0 {
+                known().true_a
+            } else {
+                known().false_a
+            }
+        }
         C_RAND => {
             if a & TAG_MASK != TAG_SMALL || (a as i64 >> 3) < 0 {
                 return raise_badarg(ctx);
@@ -10441,6 +10467,36 @@ pub extern "C" fn mana_rt_code_is_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
     }
     ctx.roots_head = saved;
     t as u64
+}
+
+/// code:lib_dir/1 and code:priv_dir/1 — the --app boot generator bakes
+/// each application's build-time dir under env {:mana_app_dirs, App}
+/// (a binary). Unknown apps get {error, bad_name}, like BEAM.
+#[no_mangle]
+pub extern "C" fn mana_rt_code_app_dir(ctx: *mut ProcCtx, app: u64, is_priv: u64) -> u64 {
+    let ctxr = unsafe { &mut *ctx };
+    if app & TAG_MASK != TAG_ATOM {
+        return raise_badarg(ctxr);
+    }
+    let tab = atom_intern(b"mana_app_dirs");
+    let hit = mana_rt_app_get_env(ctx, tab, app, 0, 1);
+    let ctxr = unsafe { &mut *ctx };
+    if hit == known().undefined {
+        let t = alloc_nursery(ctxr, 3);
+        unsafe {
+            *t = (2 << 8) | KIND_TUPLE;
+            *t.add(1) = atom_error();
+            *t.add(2) = atom_intern(b"bad_name");
+        }
+        return t as u64;
+    }
+    // {ok, DirBin} → charlist (++ "/priv" for priv_dir)
+    let dir = unsafe { *((hit & !TAG_MASK) as *const u64).add(2) };
+    let mut bytes = bin_bytes(dir).to_vec();
+    if is_priv != 0 {
+        bytes.extend_from_slice(b"/priv");
+    }
+    bytes_to_charlist(ctxr, &bytes)
 }
 
 /// code:ensure_loaded/1 → {module, M} | {error, nofile}. Eternal tuples —
