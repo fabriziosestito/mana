@@ -4471,6 +4471,112 @@ pub const T_CONNECT: u64 = 0;
 pub const T_LISTEN: u64 = 1;
 pub const T_ACCEPT: u64 = 2;
 pub const T_RECV: u64 = 3;
+/// file:sendfile/5 (RawFile, Socket, Offset, Bytes, _Opts) — read-at +
+/// parking send loop; Bytes == 0 streams to EOF. Returns {ok, Sent}.
+#[no_mangle]
+pub extern "C" fn mana_rt_sendfile(
+    ctx: *mut ProcCtx,
+    fd_t: u64,
+    sock: u64,
+    off_t: u64,
+    len_t: u64,
+    _opts: u64,
+) -> u64 {
+    use std::os::unix::fs::FileExt;
+    let ctx = unsafe { &mut *ctx };
+    let Some(fidx) = file_resolve(fd_t) else { return raise_badarg(ctx) };
+    let Some(sidx) = sock_resolve(sock) else { return raise_badarg(ctx) };
+    if off_t & TAG_MASK != TAG_SMALL
+        || len_t & TAG_MASK != TAG_SMALL
+        || (off_t as i64 >> 3) < 0
+        || (len_t as i64 >> 3) < 0
+    {
+        return raise_badarg(ctx);
+    }
+    let base = (off_t as i64 >> 3) as u64;
+    let want = (len_t as i64 >> 3) as u64; // 0 = to EOF
+    let mut sent = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if want > 0 && sent == want {
+            break;
+        }
+        let cap = if want > 0 {
+            std::cmp::min(buf.len() as u64, want - sent) as usize
+        } else {
+            buf.len()
+        };
+        let n = {
+            let tab = FILES.lock().unwrap();
+            let Some(entry) = tab.slots.get(fidx).and_then(|s| s.as_ref()) else {
+                return pair_term(ctx, b"error", atom_intern(b"ebadf"));
+            };
+            match entry.file.read_at(&mut buf[..cap], base + sent) {
+                Ok(n) => n,
+                Err(e) => {
+                    drop(tab);
+                    return err_tuple(ctx, &e);
+                }
+            }
+        };
+        if n == 0 {
+            break; // EOF: {ok, actually_sent}, like BEAM
+        }
+        // socket send with partial-write parking (the T_SEND discipline)
+        let mut off = 0usize;
+        while off < n {
+            let step: Result<Option<usize>, std::io::Error> = {
+                let mut tab = SOCKETS.lock().unwrap();
+                let Some(entry) = tab.slots.get_mut(sidx).and_then(|s| s.as_mut()) else {
+                    drop(tab);
+                    return closed_err(ctx);
+                };
+                let SockSource::Stream(st) = &mut entry.source else {
+                    drop(tab);
+                    return raise_badarg(ctx);
+                };
+                match st.write(&buf[off..n]) {
+                    Ok(k) => {
+                        entry.send_oct += k as u64;
+                        Ok(Some(k))
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        Ok(None)
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            match step {
+                Ok(Some(k)) => off += k,
+                Ok(None) => {
+                    park_on_socket(ctx, sidx, false, None);
+                }
+                Err(e) => {
+                    clear_waiter(sidx, ctx.current, false);
+                    if e.kind() == std::io::ErrorKind::BrokenPipe
+                        || e.kind() == std::io::ErrorKind::ConnectionReset
+                    {
+                        return closed_err(ctx);
+                    }
+                    return err_tuple(ctx, &e);
+                }
+            }
+        }
+        clear_waiter(sidx, ctx.current, false);
+        sent += n as u64;
+    }
+    let t = alloc_nursery(ctx, 3);
+    unsafe {
+        *t = (2 << 8) | KIND_TUPLE;
+        *t.add(1) = atom_intern(b"ok");
+        *t.add(2) = ((sent << 3) as u64) | TAG_SMALL;
+    }
+    t as u64
+}
+
 pub const T_SEND: u64 = 4;
 pub const T_CLOSE: u64 = 5;
 pub const T_SHUTDOWN: u64 = 6;

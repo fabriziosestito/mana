@@ -4293,6 +4293,39 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.builder.position_at_end(dead);
             return Ok(self.i64t.get_undef());
         }
+        if (module == "file") && name == "sendfile" && args.len() == 5 {
+            // read-at + parking send loop in the runtime (Plug.Static)
+            let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+            let call = self
+                .builder
+                .build_call(
+                    self.rt_fn("mana_rt_sendfile", || {
+                        self.i64t.fn_type(
+                            &[
+                                BasicMetadataTypeEnum::PointerType(self.ptrt),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                                BasicMetadataTypeEnum::IntType(self.i64t),
+                            ],
+                            false,
+                        )
+                    }),
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(),
+                        argv[1].into(),
+                        argv[2].into(),
+                        argv[3].into(),
+                        argv[4].into(),
+                    ],
+                    "sf",
+                )
+                .map_err(be)?;
+            let v = call_result(call)?.into_int_value();
+            return self.check_exc(f, v);
+        }
         if module == "file" || module == "prim_file" {
             // native file cut (OTP's file.erl/prim_file never compiled) —
             // implemented names dispatch to mana_rt_file by opcode; the
