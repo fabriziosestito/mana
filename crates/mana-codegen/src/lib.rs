@@ -2825,53 +2825,167 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
 
         self.builder.position_at_end(fast);
-        let ua = self.untag_int(a)?;
-        let fv = match (name, b) {
+        // small results that can leave the 61-bit range go to the slow path
+        // (bignum promotion). +/-/* use overflow intrinsics ON TAGGED values:
+        // tagged(x) = 8x+1, so a + (b-1) and a - (b-1) are already-tagged
+        // sums whose i64 overflow flag fires EXACTLY when the true result
+        // leaves the small range (untagged 61-bit values can never overflow
+        // an i64 intrinsic).
+        let to_slow = |cond: IntValue<'ctx>, tag: &str| -> CgResult<()> {
+            let cont = self.ctx.append_basic_block(f, tag);
+            self.builder
+                .build_conditional_branch(cond, slow, cont)
+                .map_err(be)?;
+            self.builder.position_at_end(cont);
+            Ok(())
+        };
+        let ovf = |l: IntValue<'ctx>, r: IntValue<'ctx>, which: &str| -> CgResult<(
+            IntValue<'ctx>,
+            IntValue<'ctx>,
+        )> {
+            let intr = inkwell::intrinsics::Intrinsic::find(which)
+                .ok_or_else(|| format!("missing intrinsic {}", which))?;
+            let decl = intr
+                .get_declaration(&self.module, &[self.i64t.into()])
+                .ok_or("intrinsic declaration")?;
+            let call = self
+                .builder
+                .build_call(decl, &[l.into(), r.into()], "ovf")
+                .map_err(be)?;
+            let sv = call_result(call)?.into_struct_value();
+            let v = self
+                .builder
+                .build_extract_value(sv, 0, "ovf.v")
+                .map_err(be)?
+                .into_int_value();
+            let o = self
+                .builder
+                .build_extract_value(sv, 1, "ovf.o")
+                .map_err(be)?
+                .into_int_value();
+            Ok((v, o))
+        };
+        let small_range_ok = |v: IntValue<'ctx>| -> CgResult<IntValue<'ctx>> {
+            // (v << 3) >> 3 == v  ⇔  v fits the 61-bit small range
+            let sh = self
+                .builder
+                .build_left_shift(v, self.i64t.const_int(3, false), "rng.l")
+                .map_err(be)?;
+            let back = self
+                .builder
+                .build_right_shift(sh, self.i64t.const_int(3, false), true, "rng.r")
+                .map_err(be)?;
+            self.builder
+                .build_int_compare(IntPredicate::NE, back, v, "rng.bad")
+                .map_err(be)
+        };
+        let fastv = match (name, b) {
             ("+", Some(b)) => {
-                let ub = self.untag_int(b)?;
-                self.builder.build_int_add(ua, ub, "add").map_err(be)?
+                let b1 = self
+                    .builder
+                    .build_int_sub(b, self.i64t.const_int(1, false), "add.b")
+                    .map_err(be)?;
+                let (v, o) = ovf(a, b1, "llvm.sadd.with.overflow")?;
+                to_slow(o, "add.k")?;
+                v // already tagged
             }
             ("-", Some(b)) => {
-                let ub = self.untag_int(b)?;
-                self.builder.build_int_sub(ua, ub, "sub").map_err(be)?
+                let b1 = self
+                    .builder
+                    .build_int_sub(b, self.i64t.const_int(1, false), "sub.b")
+                    .map_err(be)?;
+                let (v, o) = ovf(a, b1, "llvm.ssub.with.overflow")?;
+                to_slow(o, "sub.k")?;
+                v // already tagged
             }
             ("*", Some(b)) => {
-                let ub = self.untag_int(b)?;
-                self.builder.build_int_mul(ua, ub, "mul").map_err(be)?
+                let ua = self.untag_int(a)?;
+                let b8 = self
+                    .builder
+                    .build_xor(b, self.i64t.const_int(1, false), "mul.b")
+                    .map_err(be)?;
+                let (v, o) = ovf(ua, b8, "llvm.smul.with.overflow")?;
+                to_slow(o, "mul.k")?;
+                self.builder
+                    .build_or(v, self.i64t.const_int(1, false), "mul.t")
+                    .map_err(be)?
             }
             ("div", Some(b)) => {
+                let ua = self.untag_int(a)?;
                 let ub = self.untag_int(b)?;
-                self.builder
+                let zero = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        ub,
+                        self.i64t.const_zero(),
+                        "div.z",
+                    )
+                    .map_err(be)?;
+                to_slow(zero, "div.k")?;
+                let q = self
+                    .builder
                     .build_int_signed_div(ua, ub, "div")
-                    .map_err(be)?
+                    .map_err(be)?;
+                // -2^60 div -1 leaves the small range
+                let bad = small_range_ok(q)?;
+                to_slow(bad, "div.k2")?;
+                self.retag_int(q)?
             }
             ("rem", Some(b)) => {
+                let ua = self.untag_int(a)?;
                 let ub = self.untag_int(b)?;
-                self.builder
+                let zero = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        ub,
+                        self.i64t.const_zero(),
+                        "rem.z",
+                    )
+                    .map_err(be)?;
+                to_slow(zero, "rem.k")?;
+                let r = self
+                    .builder
                     .build_int_signed_rem(ua, ub, "rem")
-                    .map_err(be)?
+                    .map_err(be)?;
+                self.retag_int(r)?
             }
             ("band", Some(b)) => {
-                let ub = self.untag_int(b)?;
-                self.builder.build_and(ua, ub, "band").map_err(be)?
+                let (ua, ub) = (self.untag_int(a)?, self.untag_int(b)?);
+                let v = self.builder.build_and(ua, ub, "band").map_err(be)?;
+                self.retag_int(v)?
             }
             ("bor", Some(b)) => {
-                let ub = self.untag_int(b)?;
-                self.builder.build_or(ua, ub, "bor").map_err(be)?
+                let (ua, ub) = (self.untag_int(a)?, self.untag_int(b)?);
+                let v = self.builder.build_or(ua, ub, "bor").map_err(be)?;
+                self.retag_int(v)?
             }
             ("bxor", Some(b)) => {
-                let ub = self.untag_int(b)?;
-                self.builder.build_xor(ua, ub, "bxor").map_err(be)?
+                let (ua, ub) = (self.untag_int(a)?, self.untag_int(b)?);
+                let v = self.builder.build_xor(ua, ub, "bxor").map_err(be)?;
+                self.retag_int(v)?
             }
-            ("bnot", None) => self
-                .builder
-                .build_xor(ua, self.i64t.const_all_ones(), "bnot")
-                .map_err(be)?,
-            ("neg", None) => self
-                .builder
-                .build_int_sub(self.i64t.const_zero(), ua, "neg")
-                .map_err(be)?,
+            ("bnot", None) => {
+                let ua = self.untag_int(a)?;
+                let v = self
+                    .builder
+                    .build_xor(ua, self.i64t.const_all_ones(), "bnot")
+                    .map_err(be)?;
+                self.retag_int(v)?
+            }
+            ("neg", None) => {
+                let ua = self.untag_int(a)?;
+                let v = self
+                    .builder
+                    .build_int_sub(self.i64t.const_zero(), ua, "neg")
+                    .map_err(be)?;
+                let bad = small_range_ok(v)?; // -(-2^60) leaves the range
+                to_slow(bad, "neg.k")?;
+                self.retag_int(v)?
+            }
             ("abs", None) => {
+                let ua = self.untag_int(a)?;
                 let neg = self
                     .builder
                     .build_int_compare(
@@ -2885,14 +2999,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .builder
                     .build_int_sub(self.i64t.const_zero(), ua, "abs.neg")
                     .map_err(be)?;
-                self.builder
+                let v = self
+                    .builder
                     .build_select(neg, nv, ua, "abs")
                     .map_err(be)?
-                    .into_int_value()
+                    .into_int_value();
+                let bad = small_range_ok(v)?; // abs(-2^60) leaves the range
+                to_slow(bad, "abs.k")?;
+                self.retag_int(v)?
             }
             _ => return Err(format!("arith_fastslow: bad op {}", name)),
         };
-        let fastv = self.retag_int(fv)?;
         let fast_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge).map_err(be)?;
 

@@ -1,0 +1,84 @@
+defmodule Conf.Big do
+  @moduledoc """
+  Bignums vs the BEAM oracle: overflow promotion/demotion at every ±2^60
+  boundary, decimal printing, exact comparisons (including against floats
+  and as map keys), bit ops and shifts across the boundary, and a
+  factorial loop (shared-old-space allocation stress).
+  """
+
+  @small_max 1_152_921_504_606_846_975
+  @small_min -1_152_921_504_606_846_976
+
+  def go do
+    # promotion at the boundaries (every arm must round-trip through BEAM)
+    :erlang.display(@small_max + 1)
+    :erlang.display(@small_min - 1)
+    :erlang.display(-@small_min)
+    :erlang.display(abs(@small_min))
+    :erlang.display(div(@small_min, -1))
+    :erlang.display(@small_max * 2)
+    :erlang.display(@small_min * 2)
+    :erlang.display(1_073_741_824 * 1_073_741_824)
+
+    # demotion: big - big = small again
+    big = @small_max + 10
+    :erlang.display(big - 20)
+    :erlang.display(big - big)
+    :erlang.display(is_integer(big) and is_number(big))
+
+    # big literals + arithmetic on them
+    huge = 123_456_789_012_345_678_901_234_567_890
+    :erlang.display(huge)
+    :erlang.display(huge + 1)
+    :erlang.display(huge * huge)
+    :erlang.display(div(huge, 1_000_000_000))
+    :erlang.display(rem(huge, 97))
+    :erlang.display(-huge)
+    :erlang.display(huge - huge)
+
+    # div/rem sign matrix (truncating; rem takes the dividend sign)
+    :erlang.display({div(-huge, 7), rem(-huge, 7)})
+    :erlang.display({div(huge, -7), rem(huge, -7)})
+
+    # comparison matrix: exact int/int, int/float, ordering + map keys
+    :erlang.display(huge > @small_max)
+    :erlang.display(-huge < @small_min)
+    :erlang.display(huge == huge + 0)
+    :erlang.display(huge === huge)
+    :erlang.display(9_007_199_254_740_993 == 9_007_199_254_740_992)
+    :erlang.display(min(huge, 5))
+    m = %{huge => :big, (huge + 1) => :bigger, 5 => :small}
+    :erlang.display(map_size(m))
+    :erlang.display(Map.get(m, huge))
+    :erlang.display(Enum.sort(Map.keys(m)))
+
+    # shifts and bit ops across the boundary
+    :erlang.display(Bitwise.bsl(1, 100))
+    :erlang.display(Bitwise.bsr(Bitwise.bsl(1, 100), 100))
+    :erlang.display(Bitwise.bsl(-1, 65))
+    :erlang.display(Bitwise.bsr(-1024, 3))
+    :erlang.display(Bitwise.bsr(Bitwise.bsl(-3, 80), 79))
+    :erlang.display(Bitwise.band(Bitwise.bsl(1, 100) + 255, 255))
+    :erlang.display(Bitwise.bor(Bitwise.bsl(1, 70), 1))
+    :erlang.display(Bitwise.bxor(Bitwise.bsl(1, 70), Bitwise.bsl(1, 70)))
+    :erlang.display(Bitwise.bnot(Bitwise.bsl(1, 90)))
+
+    # to_string/inspect path
+    :erlang.display(Integer.to_string(huge) == "123456789012345678901234567890")
+
+    # factorial: promotion, big×small mul, and old-space churn
+    :erlang.display(fact(50))
+    :erlang.display(rem(fact(200), 1_000_000_007))
+    :erlang.display(byte_size(Integer.to_string(fact(200))))
+
+    # float boundary
+    :erlang.display(1.0e18 < huge)
+    :erlang.display(huge * 1.0 > 1.0e29)
+
+    :erlang.display(:done)
+    :ok
+  end
+
+  defp fact(0), do: 1
+  defp fact(n), do: n * fact(n - 1)
+end

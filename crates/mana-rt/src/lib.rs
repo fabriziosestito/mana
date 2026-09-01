@@ -2743,6 +2743,7 @@ pub extern "C" fn mana_rt_float_pat(t: u64, bits: u64) -> u64 {
 }
 
 /// Numeric coercion for arithmetic; None = not a number → badarith.
+/// Bignums coerce to their (possibly rounded) f64 for float-mixed ops.
 fn num_of(t: u64) -> Option<(f64, bool)> {
     if t & TAG_MASK == TAG_SMALL {
         return Some(((t as i64 >> 3) as f64, true));
@@ -2751,6 +2752,10 @@ fn num_of(t: u64) -> Option<(f64, bool)> {
         let p = t as *const u64;
         if unsafe { *p } & 0xff == KIND_FLOAT {
             return Some((f64::from_bits(unsafe { *p.add(1) }), false));
+        }
+        if let Some((neg, mag)) = bignum_parts(t) {
+            let v = bigint::mag_to_f64(mag);
+            return Some((if neg { -v } else { v }, true));
         }
     }
     None
@@ -2777,106 +2782,161 @@ pub const AR_BSL: u64 = 11;
 pub const AR_BSR: u64 = 12;
 pub const AR_BNOT: u64 = 13;
 
-/// Arithmetic slow path: anything that isn't the inline both-small-int
-/// case. Mixed/float ops produce boxed floats (box_float — never GCs);
-/// non-numbers and integer ops on floats raise badarith like BEAM.
-#[no_mangle]
-pub extern "C" fn mana_rt_arith(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
-    let ctx = unsafe { &mut *ctx };
-    // bit ops are integer-only: no float coercion, badarith otherwise
-    if let AR_BAND | AR_BOR | AR_BXOR | AR_BSL | AR_BSR | AR_BNOT = op {
-        if a & TAG_MASK != TAG_SMALL {
-            return raise_badarith(ctx);
-        }
-        let x = a as i64 >> 3;
-        if op == AR_BNOT {
-            return (((!x) << 3) as u64) | TAG_SMALL;
-        }
-        if b & TAG_MASK != TAG_SMALL {
-            return raise_badarith(ctx);
-        }
-        let y = b as i64 >> 3;
-        let r = match op {
-            AR_BAND => x & y,
-            AR_BOR => x | y,
-            AR_BXOR => x ^ y,
-            // Erlang: a negative shift amount reverses direction
-            AR_BSL | AR_BSR => {
-                let n = if op == AR_BSR { -y } else { y };
-                if n <= -64 {
-                    if x < 0 { -1 } else { 0 }
-                } else if n < 0 {
-                    x >> (-n)
-                } else if n >= 64 {
-                    if x != 0 {
-                        abort_bignum("bsl overflow");
-                    }
-                    0
-                } else {
-                    let s = x << n;
-                    if (s >> n) != x {
-                        abort_bignum("bsl overflow");
-                    }
-                    s
-                }
-            }
-            _ => unreachable!(),
-        };
-        // small ints are 61-bit; anything wider needs real bignums
-        if r > (i64::MAX >> 3) || r < (i64::MIN >> 3) {
-            abort_bignum("bit op result exceeds 61 bits");
-        }
-        return ((r << 3) as u64) | TAG_SMALL;
+/// Signed magnitude addition helper: (na, ma) + (nb, mb).
+fn int_signed_add(na: bool, ma: &[u64], nb: bool, mb: &[u64]) -> (bool, Vec<u64>) {
+    if na == nb {
+        return (na, bigint::mag_add(ma, mb));
     }
-    let Some((x, xi)) = num_of(a) else {
-        return raise_badarith(ctx);
-    };
+    match bigint::mag_cmp(ma, mb) {
+        std::cmp::Ordering::Equal => (false, Vec::new()),
+        std::cmp::Ordering::Greater => (na, bigint::mag_sub(ma, mb)),
+        std::cmp::Ordering::Less => (nb, bigint::mag_sub(mb, ma)),
+    }
+}
+
+/// Integer arithmetic (small or bignum operands) with promotion/demotion.
+/// Results allocate in shared old space — never a GC point.
+fn int_arith(ctx: &mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
+    let (na, ma) = int_mag(a).unwrap();
     match op {
-        AR_NEG => {
-            if xi {
-                return (((-(a as i64 >> 3)) << 3) as u64) | TAG_SMALL;
-            }
-            return box_float(ctx, -x);
-        }
-        AR_ABS => {
-            if xi {
-                let v = a as i64 >> 3;
-                return (((v.abs()) << 3) as u64) | TAG_SMALL;
-            }
-            return box_float(ctx, x.abs());
+        AR_NEG => return make_int_mag(ctx, !na && !ma.is_empty(), &ma),
+        AR_ABS => return make_int_mag(ctx, false, &ma),
+        AR_BNOT => {
+            // bnot(x) = -x - 1
+            return if na {
+                make_int_mag(ctx, false, &bigint::mag_sub(&ma, &[1]))
+            } else {
+                make_int_mag(ctx, true, &bigint::mag_add(&ma, &[1]))
+            };
         }
         _ => {}
     }
-    let Some((y, yi)) = num_of(b) else {
-        return raise_badarith(ctx);
-    };
+    let (nb, mb) = int_mag(b).unwrap();
     match op {
-        AR_ADD | AR_SUB | AR_MUL => {
-            if xi && yi {
-                // both small (inline fast path normally catches this)
-                let (p, q) = (a as i64 >> 3, b as i64 >> 3);
+        AR_ADD => {
+            let (n, m) = int_signed_add(na, &ma, nb, &mb);
+            make_int_mag(ctx, n, &m)
+        }
+        AR_SUB => {
+            let (n, m) = int_signed_add(na, &ma, !nb && !mb.is_empty(), &mb);
+            make_int_mag(ctx, n, &m)
+        }
+        AR_MUL => {
+            let m = bigint::mag_mul(&ma, &mb);
+            make_int_mag(ctx, na != nb && !m.is_empty(), &m)
+        }
+        AR_IDIV | AR_REM => {
+            if mb.is_empty() {
+                return raise_badarith(ctx);
+            }
+            // truncating division; rem takes the dividend's sign (Erlang)
+            let (q, r) = bigint::mag_divrem(&ma, &mb);
+            if op == AR_IDIV {
+                make_int_mag(ctx, (na != nb) && !q.is_empty(), &q)
+            } else {
+                make_int_mag(ctx, na && !r.is_empty(), &r)
+            }
+        }
+        AR_FDIV => {
+            let (x, y) = (num_val(a), num_val(b));
+            if y == 0.0 {
+                return raise_badarith(ctx);
+            }
+            box_float(ctx, x / y)
+        }
+        AR_BAND | AR_BOR | AR_BXOR => {
+            if a & TAG_MASK == TAG_SMALL && b & TAG_MASK == TAG_SMALL {
+                // exact for all smalls (results never leave the small range)
+                let (x, y) = (a as i64 >> 3, b as i64 >> 3);
                 let r = match op {
-                    AR_ADD => p.wrapping_add(q),
-                    AR_SUB => p.wrapping_sub(q),
-                    _ => p.wrapping_mul(q),
+                    AR_BAND => x & y,
+                    AR_BOR => x | y,
+                    _ => x ^ y,
                 };
                 return ((r << 3) as u64) | TAG_SMALL;
             }
-            let r = match op {
-                AR_ADD => x + y,
-                AR_SUB => x - y,
-                _ => x * y,
-            };
-            box_float(ctx, r)
+            if na || nb {
+                // infinite-two's-complement on negative bignums: the fiddly
+                // corner nothing on our paths needs yet
+                abort_bignum("bit op on a negative bignum (TODO(bignum-bitops))");
+            }
+            let n = std::cmp::max(ma.len(), mb.len());
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let (x, y) = (*ma.get(i).unwrap_or(&0), *mb.get(i).unwrap_or(&0));
+                out.push(match op {
+                    AR_BAND => x & y,
+                    AR_BOR => x | y,
+                    _ => x ^ y,
+                });
+            }
+            make_int_mag(ctx, false, &bigint::normalize(out))
         }
+        AR_BSL | AR_BSR => {
+            // shift counts must be smalls (a bignum-sized shift would be an
+            // absurd allocation; BEAM raises system_limit far earlier)
+            if b & TAG_MASK != TAG_SMALL {
+                return raise_badarith(ctx);
+            }
+            let y = b as i64 >> 3;
+            // Erlang: a negative count reverses direction
+            let n = if op == AR_BSR { -y } else { y };
+            if n >= 0 {
+                let m = bigint::mag_shl(&ma, n as u64);
+                make_int_mag(ctx, na && !m.is_empty(), &m)
+            } else {
+                let k = (-n) as u64;
+                if na {
+                    // floor semantics: x >> k = -((|x| - 1) >> k) - 1
+                    let m = bigint::mag_shr(&bigint::mag_sub(&ma, &[1]), k);
+                    make_int_mag(ctx, true, &bigint::mag_add(&m, &[1]))
+                } else {
+                    let m = bigint::mag_shr(&ma, k);
+                    make_int_mag(ctx, false, &m)
+                }
+            }
+        }
+        _ => raise_badarith(ctx),
+    }
+}
+
+/// Arithmetic slow path: anything that isn't the inline both-small-int
+/// fast case (including small overflow, which promotes to bignums here).
+/// Mixed/float ops produce boxed floats; non-numbers and integer-only ops
+/// on floats raise badarith like BEAM.
+#[no_mangle]
+pub extern "C" fn mana_rt_arith(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let unary = matches!(op, AR_NEG | AR_ABS | AR_BNOT);
+    if is_int_term(a) && (unary || is_int_term(b)) {
+        return int_arith(ctx, op, a, b);
+    }
+    // bit ops are integer-only: no float coercion
+    if let AR_BAND | AR_BOR | AR_BXOR | AR_BSL | AR_BSR | AR_BNOT = op {
+        return raise_badarith(ctx);
+    }
+    let Some((x, _)) = num_of(a) else {
+        return raise_badarith(ctx);
+    };
+    match op {
+        AR_NEG => return box_float(ctx, -x),
+        AR_ABS => return box_float(ctx, x.abs()),
+        _ => {}
+    }
+    let Some((y, _)) = num_of(b) else {
+        return raise_badarith(ctx);
+    };
+    match op {
+        AR_ADD => box_float(ctx, x + y),
+        AR_SUB => box_float(ctx, x - y),
+        AR_MUL => box_float(ctx, x * y),
         AR_FDIV => {
             if y == 0.0 {
                 return raise_badarith(ctx);
             }
             box_float(ctx, x / y)
         }
-        // div/rem are integer-only; the inline fast path handles both-small,
-        // so reaching here means at least one float → badarith (BEAM)
+        // div/rem are integer-only → at least one float here → badarith
         AR_IDIV | AR_REM => raise_badarith(ctx),
         _ => raise_badarith(ctx),
     }
@@ -8477,6 +8537,33 @@ pub extern "C" fn mana_rt_iolist_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
 }
 
 /// Integer digits in a base (2..=36, uppercase — BEAM's format).
+/// Digits of ANY integer term in `base` (bignum-aware).
+fn int_term_digits(t: u64, base: u32) -> Option<String> {
+    if t & TAG_MASK == TAG_SMALL {
+        return Some(int_digits(t as i64 >> 3, base));
+    }
+    let (neg, mag) = bignum_parts(t)?;
+    let body = if base == 10 {
+        bigint::mag_to_decimal(mag)
+    } else {
+        // repeated divrem by the base — rare path (Integer.to_string/2)
+        let mut cur = mag.to_vec();
+        let mut out = Vec::new();
+        while !cur.is_empty() {
+            let (q, r) = bigint::mag_divrem_limb(&cur, base as u64);
+            out.push(
+                char::from_digit(r as u32, base)
+                    .unwrap()
+                    .to_ascii_uppercase() as u8,
+            );
+            cur = q;
+        }
+        out.reverse();
+        String::from_utf8(out).unwrap()
+    };
+    Some(if neg { format!("-{}", body) } else { body })
+}
+
 fn int_digits(v: i64, base: u32) -> String {
     if v == 0 {
         return "0".into();
@@ -8500,14 +8587,14 @@ fn int_digits(v: i64, base: u32) -> String {
 #[no_mangle]
 pub extern "C" fn mana_rt_integer_to_binary(ctx: *mut ProcCtx, t: u64, base: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    if t & TAG_MASK != TAG_SMALL || base & TAG_MASK != TAG_SMALL {
+    if !is_int_term(t) || base & TAG_MASK != TAG_SMALL {
         return raise_badarg(ctx);
     }
     let b = base as i64 >> 3;
     if !(2..=36).contains(&b) {
         return raise_badarg(ctx);
     }
-    let s = int_digits(t as i64 >> 3, b as u32);
+    let s = int_term_digits(t, b as u32).unwrap();
     bytes_to_new_bin(ctx, s.as_bytes())
 }
 
@@ -8515,26 +8602,44 @@ pub extern "C" fn mana_rt_integer_to_binary(ctx: *mut ProcCtx, t: u64, base: u64
 #[no_mangle]
 pub extern "C" fn mana_rt_integer_to_list(ctx: *mut ProcCtx, t: u64, base: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    if t & TAG_MASK != TAG_SMALL || base & TAG_MASK != TAG_SMALL {
+    if !is_int_term(t) || base & TAG_MASK != TAG_SMALL {
         return raise_badarg(ctx);
     }
     let b = base as i64 >> 3;
     if !(2..=36).contains(&b) {
         return raise_badarg(ctx);
     }
-    let s = int_digits(t as i64 >> 3, b as u32);
+    let s = int_term_digits(t, b as u32).unwrap();
     bytes_to_charlist(ctx, s.as_bytes())
 }
 
 /// Parse decimal/base digits (with optional sign) — badarg on any junk.
-fn parse_int_bytes(bytes: &[u8], base: u32) -> Option<i64> {
+fn parse_int_term(ctx: &mut ProcCtx, bytes: &[u8], base: u32) -> Option<u64> {
     let s = std::str::from_utf8(bytes).ok()?;
-    let v = i64::from_str_radix(s, base).ok()?;
-    // small ints are 61 bits
-    if v >> 60 != 0 && v >> 60 != -1 {
-        return None; // TODO(bignum)
+    if let Ok(v) = i64::from_str_radix(s, base) {
+        if v >> 60 == 0 || v >> 60 == -1 {
+            return Some(((v << 3) as u64) | TAG_SMALL);
+        }
     }
-    Some(v)
+    // outside i64 / outside the small range: parse into limbs
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mag = if base == 10 {
+        bigint::mag_from_decimal(digits.as_bytes())?
+    } else {
+        let mut acc: Vec<u64> = Vec::new();
+        for c in digits.chars() {
+            let d = c.to_digit(base)?;
+            acc = bigint::mag_add(&bigint::mag_mul(&acc, &[base as u64]), &[d as u64]);
+        }
+        bigint::normalize(acc)
+    };
+    Some(make_int_mag(ctx, neg && !mag.is_empty(), &mag))
 }
 
 /// erlang:binary_to_integer/1,2.
@@ -8548,8 +8653,9 @@ pub extern "C" fn mana_rt_binary_to_integer(ctx: *mut ProcCtx, bin: u64, base: u
     if !(2..=36).contains(&b) {
         return raise_badarg(ctx);
     }
-    match parse_int_bytes(bin_bytes(bin), b as u32) {
-        Some(v) => ((v << 3) as u64) | TAG_SMALL,
+    let bytes = bin_bytes(bin).to_vec();
+    match parse_int_term(ctx, &bytes, b as u32) {
+        Some(t) => t,
         None => raise_badarg(ctx),
     }
 }
@@ -8579,8 +8685,8 @@ pub extern "C" fn mana_rt_list_to_integer(ctx: *mut ProcCtx, l: u64, base: u64) 
         bytes.push((h as i64 >> 3) as u8);
         cur = unsafe { *p.add(1) };
     }
-    match parse_int_bytes(&bytes, b as u32) {
-        Some(v) => ((v << 3) as u64) | TAG_SMALL,
+    match parse_int_term(ctx, &bytes, b as u32) {
+        Some(t) => t,
         None => raise_badarg(ctx),
     }
 }
