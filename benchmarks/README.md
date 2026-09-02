@@ -42,6 +42,9 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | phx landing, new conn | 563 µs | 398 µs | 2026-09-01, perf campaign (1.4x behind) |
 | str upcase 1KB | 149 µs | 14 µs | 2026-09-01, first recorded — unicode char loop; BEAM match contexts are the known next lever |
 | fib 25 | 575 µs | — | 2026-09-01, overflow-checked arith sentinel: no regression vs 618 µs pre-campaign |
+| zlib gzip 4KB html | 36.7 µs | 34.4 µs | 2026-09-02, LiveView milestone (real DEFLATE via miniz_oxide — at BEAM parity) |
+| zlib gunzip 4KB html | 62.3 µs | 45.9 µs | 2026-09-02, miniz_oxide inflate (1.36x behind zlib — cold path) |
+| zlib raw deflate+inflate roundtrip | 41.4 µs | 51.7 µs | 2026-09-02, permessage-deflate shape (mana 1.25x faster) |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction
