@@ -126,11 +126,12 @@ defmodule Conf.WsClient do
   end
 
   @doc """
-  Receive one complete data frame: {opcode, payload}. Pings are answered
-  and skipped. Fragmented messages are reassembled.
+  Receive one complete data frame: {opcode, rsv1, payload, rest}. Pings
+  are answered and skipped. Fragmented messages are reassembled; rsv1 is
+  taken from the first frame (permessage-deflate marks the message there).
   """
   def recv_frame(c, buf \\ <<>>) do
-    {fin, opcode, payload, rest} = read_one(c, buf)
+    {fin, rsv1, opcode, payload, rest} = read_one(c, buf)
 
     cond do
       opcode == 9 ->
@@ -138,27 +139,26 @@ defmodule Conf.WsClient do
         recv_frame(c, rest)
 
       fin == 0 ->
-        {opcode2, full, rest2} = recv_continuations(c, rest, payload)
-        _ = opcode2
-        {opcode, full, rest2}
+        {full, rest2} = recv_continuations(c, rest, payload)
+        {opcode, rsv1, full, rest2}
 
       true ->
-        {opcode, payload, rest}
+        {opcode, rsv1, payload, rest}
     end
   end
 
   defp recv_continuations(c, buf, acc) do
-    {fin, opcode, payload, rest} = read_one(c, buf)
+    {fin, _rsv1, _opcode, payload, rest} = read_one(c, buf)
 
     if fin == 1 do
-      {opcode, acc <> payload, rest}
+      {acc <> payload, rest}
     else
       recv_continuations(c, rest, acc <> payload)
     end
   end
 
   defp read_one(c, buf) do
-    <<fin::1, _rsv::3, opcode::4, masked::1, len7::7, rest::binary>> = need(c, buf, 2)
+    <<fin::1, rsv1::1, _rsv::2, opcode::4, masked::1, len7::7, rest::binary>> = need(c, buf, 2)
 
     {len, rest} =
       case len7 do
@@ -176,7 +176,7 @@ defmodule Conf.WsClient do
 
     0 = masked
     <<payload::binary-size(len), rest::binary>> = need(c, rest, len)
-    {fin, opcode, payload, rest}
+    {fin, rsv1, opcode, payload, rest}
   end
 
   defp need(_c, buf, n) when byte_size(buf) >= n, do: buf
@@ -195,9 +195,70 @@ defmodule Conf.WsClient do
 
   @doc "Receive and decode one V2 text message."
   def recv_msg(c, buf \\ <<>>) do
-    {opcode, payload, rest} = recv_frame(c, buf)
+    {opcode, _rsv1, payload, rest} = recv_frame(c, buf)
     1 = opcode
     {Jason.decode!(payload), rest}
+  end
+
+  # -- permessage-deflate (RFC 7692) --
+
+  @doc """
+  A pair of raw (headerless, window 15) zlib streams with context
+  takeover, matching Bandit's default negotiation: one to inflate
+  server frames, one to deflate client frames.
+  """
+  def deflate_ctx do
+    zi = :zlib.open()
+    :zlib.inflateInit(zi, -15)
+    zd = :zlib.open()
+    :zlib.deflateInit(zd, :default, :deflated, -15, 8, :default)
+    %{inflate: zi, deflate: zd}
+  end
+
+  @doc "Send a compressed V2 message: deflate + strip tail + RSV1 set."
+  def push_deflate(c, ctx, join_ref, ref, topic, event, payload) do
+    json = Jason.encode!([join_ref, ref, topic, event, payload])
+    comp = IO.iodata_to_binary(:zlib.deflate(ctx.deflate, json, :sync))
+    # drop the trailing 00 00 FF FF sync marker (RFC 7692 §7.2.1)
+    body = binary_part(comp, 0, byte_size(comp) - 4)
+    send_frame_rsv1(c, 1, body)
+  end
+
+  @doc "Receive and decode one V2 message, inflating if RSV1 is set."
+  def recv_msg_deflate(c, ctx, buf \\ <<>>) do
+    {opcode, rsv1, payload, rest} = recv_frame(c, buf)
+    1 = opcode
+
+    data =
+      if rsv1 == 1 do
+        drain(ctx.inflate, <<payload::binary, 0, 0, 255, 255>>)
+      else
+        payload
+      end
+
+    {Jason.decode!(data), rsv1, rest}
+  end
+
+  defp drain(z, data) do
+    case :zlib.safeInflate(z, data) do
+      {:continue, out} -> IO.iodata_to_binary([out, drain(z, [])])
+      {:finished, out} -> IO.iodata_to_binary(out)
+    end
+  end
+
+  defp send_frame_rsv1(c, opcode, payload) do
+    len = byte_size(payload)
+
+    len_part =
+      cond do
+        len < 126 -> <<1::1, len::7>>
+        len < 65_536 -> <<1::1, 126::7, len::16>>
+        true -> <<1::1, 127::7, len::64>>
+      end
+
+    # fin=1, rsv1=1 (compressed), rsv2=rsv3=0
+    frame = [<<1::1, 1::1, 0::2, opcode::4>>, len_part, <<0, 0, 0, 0>>, payload]
+    :ok = :gen_tcp.send(c, frame)
   end
 
   @doc "Join the LiveView channel; returns {topic, reply_payload, rest}."

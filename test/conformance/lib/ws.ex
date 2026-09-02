@@ -48,11 +48,11 @@ defmodule Conf.Ws do
 
     # clean close: server echoes the close frame
     C.send_close(a_sock)
-    {8, _payload, _} = C.recv_frame(a_sock)
+    {8, _rsv, _payload, _} = C.recv_frame(a_sock)
     IO.puts(inspect(:closed))
 
     C.send_close(b_sock)
-    {8, _payload2, _} = C.recv_frame(b_sock)
+    {8, _rsv2, _payload2, _} = C.recv_frame(b_sock)
     IO.puts(inspect(:closed))
 
     IO.puts(inspect(:done))
