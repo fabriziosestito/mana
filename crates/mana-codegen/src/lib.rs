@@ -1738,8 +1738,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.compile_tail(f, body, scope)
             }
             Expr::LetRec { defs, body } => {
-                let mut inner = self.bind_letrec(f, defs, scope)?;
-                self.compile_tail(f, body, &mut inner)
+                let (group, inner_body) = flatten_letrec(defs, body);
+                let mut inner = self.bind_letrec(f, &group, scope)?;
+                self.compile_tail(f, inner_body, &mut inner)
             }
             Expr::Do(first, then) => {
                 let wm = self.next_slot.get();
@@ -1886,8 +1887,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.compile_value(f, body, scope)
             }
             Expr::LetRec { defs, body } => {
-                let mut inner = self.bind_letrec(f, defs, scope)?;
-                self.compile_value(f, body, &mut inner)
+                let (group, inner_body) = flatten_letrec(defs, body);
+                let mut inner = self.bind_letrec(f, &group, scope)?;
+                self.compile_value(f, inner_body, &mut inner)
             }
             Expr::Do(first, then) => {
                 let wm = self.next_slot.get();
@@ -5929,6 +5931,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("garbage_collect", 0) => self.atom_term("true"),
+            // garbage_collect(Pid) — collection is implicit; report success
+            ("garbage_collect", 1) => self.atom_term("true"),
             ("is_port", 1) => self.atom_term("false"),
             // no distribution: everything lives on nonode@nohost
             ("node", 0) | ("node", 1) => self.atom_term("nonode@nohost"),
@@ -7078,13 +7082,28 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 )
             })
         };
+        let quint = |helper: &str| {
+            self.rt_fn(helper, || {
+                self.i64t.fn_type(
+                    &[
+                        BasicMetadataTypeEnum::PointerType(self.ptrt),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                        BasicMetadataTypeEnum::IntType(self.i64t),
+                    ],
+                    false,
+                )
+            })
+        };
         let call = match (name, argv.len()) {
-            // tables are identified by their name term; options ignored
+            // tables are identified by their name term; the option list
+            // is parsed for the table kind (set / bag / duplicate_bag)
             ("new", 2) => self
                 .builder
                 .build_call(
-                    self.rt_pt_i64("mana_rt_ets_new"),
-                    &[self.ctx_val().into(), argv[0].into()],
+                    self.rt_ptt_i64("mana_rt_ets_new"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
                     "ets",
                 )
                 .map_err(be)?,
@@ -7156,10 +7175,64 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     "ets",
                 )
                 .map_err(be)?,
+            ("lookup_element", 4) => self
+                .builder
+                .build_call(
+                    quint("mana_rt_ets_lookup_element4"),
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(),
+                        argv[1].into(),
+                        argv[2].into(),
+                        argv[3].into(),
+                    ],
+                    "ets",
+                )
+                .map_err(be)?,
             ("delete", 2) => self
                 .builder
                 .build_call(
                     self.rt_ptt_i64("mana_rt_ets_delete"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("take", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_take"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("member", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_member"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("delete_object", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_delete_object"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("select_count", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_select_count"),
+                    &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
+                    "ets",
+                )
+                .map_err(be)?,
+            ("select_delete", 2) => self
+                .builder
+                .build_call(
+                    self.rt_ptt_i64("mana_rt_ets_select_delete"),
                     &[self.ctx_val().into(), argv[0].into(), argv[1].into()],
                     "ets",
                 )
@@ -7261,9 +7334,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
-            ("get_key", 2) | ("get_application", 0) | ("get_application", 1) => {
-                self.atom_term("undefined")
-            }
+            ("get_key", 2) | ("get_all_key", 1) | ("get_application", 0)
+            | ("get_application", 1) => self.atom_term("undefined"),
             _ => Err(format!(
                 "unsupported BIF application:{}/{}",
                 name,
@@ -9817,6 +9889,39 @@ fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut usize) {
 }
 
 // ---- free variable analysis ----
+
+/// Collapse a directly-nested letrec chain (`letrec A in letrec B in ...`)
+/// into one mutually-visible group. The Erlang compiler emits nested
+/// single-member letrecs annotated `letrec_goto` for shared match
+/// continuations; an inner label's body calls an outer label. After
+/// lambda-lifting, a lifted inner body gets a fresh scope that no longer
+/// sees the outer label, so the call fails to resolve. Merging the chain
+/// into one group makes every label a sibling of every other, which is a
+/// superset of the original (outer-defined-first) visibility and thus
+/// safe. Only flattens while the bound names stay disjoint and nothing is
+/// bound between the letrecs (body is immediately another letrec).
+fn flatten_letrec<'a>(
+    defs: &[(FunName, Fun)],
+    body: &'a Expr,
+) -> (Vec<(FunName, Fun)>, &'a Expr) {
+    let mut group: Vec<(FunName, Fun)> = defs.to_vec();
+    let mut cur = body;
+    while let Expr::LetRec {
+        defs: inner_defs,
+        body: inner_body,
+    } = cur
+    {
+        let collides = inner_defs
+            .iter()
+            .any(|(n, _)| group.iter().any(|(m, _)| m == n));
+        if collides {
+            break;
+        }
+        group.extend(inner_defs.iter().cloned());
+        cur = inner_body;
+    }
+    (group, cur)
+}
 
 fn free_vars(e: &Expr, bound: &mut HashSet<String>, out: &mut BTreeSet<String>) {
     match e {
