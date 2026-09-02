@@ -5,14 +5,16 @@ defmodule ManaJSON do
   `encode!/1`, `encode_to_iodata!/1`, `decode!/1` (plus non-raising
   `encode/1` / `decode/1`) — by forwarding to `:mana_json_native`.
 
-  Wire it up as Phoenix's `:json_library`:
+  Wire it up as Phoenix's `:json_library`, only under the mana build:
 
-      config :phoenix, :json_library, ManaJSON
+      config :phoenix, :json_library,
+        if(config_env() == :mana, do: ManaJSON, else: Jason)
 
-  On BEAM the `:mana_json_native` module delegates to Jason (so a normal
-  Elixir run — and the conformance oracle — works). When the app is
-  compiled with mana, the build binds those functions to the Go/Rust-free
-  native BIFs shipped in this package's `native/mana_json/` crate.
+  When the app is compiled with mana, the build binds `:mana_json_native`'s
+  functions to the native BIFs shipped in this package's `native/mana_json/`
+  crate. On BEAM this module is not used (the package is `only: [:mana]` and
+  Phoenix uses Jason directly); the `:mana_json_native` stub only returns
+  `{:error, :not_supported_on_beam}` as a loud safety net.
   """
 
   def encode(term), do: :mana_json_native.encode(term)

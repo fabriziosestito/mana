@@ -227,8 +227,8 @@ fn run() -> Result<(), String> {
 /// The content-addressed object cache under the OS user-cache dir
 /// (~/.cache/mana, ~/Library/Caches/mana, %LOCALAPPDATA%\mana), overridden
 /// by MANA_CACHE_DIR, disabled by MANA_NO_CACHE or --emit-ir. The tool
-/// identity is the manac binary's own content hash (dev-branch rule, like
-/// Go): rebuilding the compiler invalidates everything, correctly.
+/// identity is the manac binary's own content hash (dev-branch rule):
+/// rebuilding the compiler invalidates everything, correctly.
 fn obj_cache(emit_ir: bool) -> Result<Option<mana_codegen::ObjCache>, String> {
     if emit_ir || std::env::var_os("MANA_NO_CACHE").is_some() {
         return Ok(None);

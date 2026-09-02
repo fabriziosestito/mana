@@ -103,6 +103,14 @@ compiler (`cc`).
 
 ## Conventions
 
+- **Never reference the prior Go implementation in code.** `~/wrk/mana` (the
+  author's earlier Elixir→Go transpiler) is prior art to mine for pitfalls,
+  but it must NOT appear in this repo's code, comments, docstrings, or shipped
+  docs — no "mirrors the Go reference", "like the Go version", "the Go BIF",
+  etc. Production readers do not know about past experiments. Describe behavior
+  on its own terms; this AGENTS.md is the only place `~/wrk/mana` may be named.
+  (Avoid naming Go the language in code comments too — reword prior-art design
+  citations to state the idea directly.)
 - Errors are `Result<T, String>` with human-readable messages naming the
   construct and (in the parser) the line number. Keep that shape for now; a
   proper diagnostics type is future work, don't introduce one crate-locally.
