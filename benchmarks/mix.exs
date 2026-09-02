@@ -12,7 +12,8 @@ defmodule Benchmarks.MixProject do
         {:benchee, "~> 1.1"},
         {:ecto, "~> 3.13"},
       {:bandit, "~> 1.11"},
-      {:phx_app, path: "../examples/phoenix/phx_app"}
+      {:phx_app, path: "../examples/phoenix/phx_app"},
+      {:mana_json, path: "../hex/mana_json"}
       ]
     ]
   end
