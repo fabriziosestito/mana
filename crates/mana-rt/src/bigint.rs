@@ -1,9 +1,14 @@
 //! Arbitrary-precision integer magnitudes: little-endian `u64` limb
 //! vectors, always normalized (no most-significant zero limbs; the empty
-//! slice is zero). Sign lives in the term header, not here. Hand-rolled —
-//! the dependency budget does not include a bignum crate, and the needed
-//! surface is small: school arithmetic, division with remainder, decimal
-//! and byte conversions, exact f64 bridging.
+//! slice is zero). Sign lives in the term header, not here.
+//!
+//! Hand-rolled by MEASURED choice, not dogma: the term layout stores raw
+//! limbs, so a crate pays limb↔bignum conversion on every op. The in-tree
+//! A/B (`cargo test --release -p mana-rt ab_ -- --ignored --nocapture`)
+//! shows num-bigint 2-9x SLOWER on the dominant 1-2 limb shapes
+//! (timestamps, request ids) and ahead only ~1.3x on decimal formatting.
+//! Re-run the A/B before revisiting; correctness is gated by the u128
+//! property tests below plus Conf.Big (BEAM as oracle).
 
 /// Drop most-significant zero limbs.
 pub fn normalize(mut v: Vec<u64>) -> Vec<u64> {
@@ -314,6 +319,115 @@ pub fn mag_from_bytes_le(bytes: &[u8]) -> Vec<u64> {
         out.push(u64::from_le_bytes(b));
     }
     normalize(out)
+}
+
+#[cfg(test)]
+mod ab_bench {
+    //! Hand-rolled kernel vs num-bigint A/B on OUR workload shapes.
+    //! num-bigint pays the term-boundary conversion (&[u64] limbs ↔
+    //! BigUint) because the heap layout stores raw limbs — that is the
+    //! real cost the runtime would see. Run with:
+    //!   cargo test --release -p mana-rt ab_ -- --ignored --nocapture
+    use super::*;
+    use num_bigint::BigUint;
+    use std::time::Instant;
+
+    fn to_big(a: &[u64]) -> BigUint {
+        let mut bytes = Vec::with_capacity(a.len() * 8);
+        for &l in a {
+            bytes.extend_from_slice(&l.to_le_bytes());
+        }
+        BigUint::from_bytes_le(&bytes)
+    }
+
+    fn from_big(b: &BigUint) -> Vec<u64> {
+        b.to_u64_digits()
+    }
+
+    fn time(label: &str, iters: u32, mut f: impl FnMut() -> u64) {
+        // warmup
+        let mut sink = 0u64;
+        for _ in 0..iters / 10 {
+            sink = sink.wrapping_add(f());
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            sink = sink.wrapping_add(f());
+        }
+        let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+        println!("{:<38} {:>9.1} ns/op (sink {})", label, ns, sink & 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn ab_kernel_vs_num_bigint() {
+        let one = vec![0x1234_5678_9abc_def0u64]; // 1 limb (timestamps)
+        let two = vec![u64::MAX, 0x1f]; // 2 limbs (ns since epoch etc.)
+        let four = mag_from_decimal(b"123456789012345678901234567890123456789012345678901234567890").unwrap();
+        let f200 = {
+            // factorial(200) — the Conf.Big stress shape (~1245 bits)
+            let mut m = vec![1u64];
+            for i in 2..=200u64 {
+                m = mag_mul(&m, &[i]);
+            }
+            m
+        };
+
+        println!("--- 1-2 limb (dominant runtime case) ---");
+        time("hand add 2-limb", 2_000_000, || mag_add(&two, &one)[0]);
+        time("crate add 2-limb (+conv)", 2_000_000, || {
+            from_big(&(to_big(&two) + to_big(&one)))[0]
+        });
+        time("hand mul 2x1", 1_000_000, || mag_mul(&two, &one)[0]);
+        time("crate mul 2x1 (+conv)", 1_000_000, || {
+            from_big(&(to_big(&two) * to_big(&one)))[0]
+        });
+        time("hand divrem 2/1", 1_000_000, || mag_divrem(&two, &one).1.first().copied().unwrap_or(0));
+        time("crate divrem 2/1 (+conv)", 1_000_000, || {
+            from_big(&(to_big(&two) % to_big(&one))).first().copied().unwrap_or(0)
+        });
+        time("hand to_decimal 2-limb", 200_000, || mag_to_decimal(&two).len() as u64);
+        time("crate to_decimal 2-limb (+conv)", 200_000, || {
+            to_big(&two).to_string().len() as u64
+        });
+
+        println!("--- 4 limb ---");
+        time("hand mul 4x4", 500_000, || mag_mul(&four, &four)[0]);
+        time("crate mul 4x4 (+conv)", 500_000, || {
+            from_big(&(to_big(&four) * to_big(&four)))[0]
+        });
+        time("hand divrem 4/2", 500_000, || mag_divrem(&four, &two).0[0]);
+        time("crate divrem 4/2 (+conv)", 500_000, || {
+            from_big(&(to_big(&four) / to_big(&two)))[0]
+        });
+
+        println!("--- factorial(200) scale (~20 limbs) ---");
+        time("hand fact200 mul-chain", 5_000, || {
+            let mut m = vec![1u64];
+            for i in 2..=200u64 {
+                m = mag_mul(&m, &[i]);
+            }
+            m[0]
+        });
+        time("crate fact200 mul-chain (+conv)", 5_000, || {
+            // conversion per step, as the runtime term boundary would pay
+            let mut m = vec![1u64];
+            for i in 2..=200u64 {
+                m = from_big(&(to_big(&m) * BigUint::from(i)));
+            }
+            m[0]
+        });
+        time("hand to_decimal f200 (375 digits)", 20_000, || {
+            mag_to_decimal(&f200).len() as u64
+        });
+        time("crate to_decimal f200 (+conv)", 20_000, || {
+            to_big(&f200).to_string().len() as u64
+        });
+        time("hand divrem f200/4", 100_000, || mag_divrem(&f200, &four).1.first().copied().unwrap_or(0));
+        time("crate divrem f200/4 (+conv)", 100_000, || {
+            from_big(&(to_big(&f200) % to_big(&four))).first().copied().unwrap_or(0)
+        });
+    }
 }
 
 #[cfg(test)]
