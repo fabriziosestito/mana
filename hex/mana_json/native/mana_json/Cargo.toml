@@ -1,0 +1,19 @@
+[package]
+name = "mana_json_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mana_json_native"
+# staticlib → libmana_json_native.a, whose extern mana_rt_* references
+# resolve at manac's final link against libmana_rt.a
+crate-type = ["staticlib"]
+
+[dependencies]
+mana-native = { path = "../../../../crates/mana-native" }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+
+[profile.release]
+opt-level = 3
+
+[workspace]

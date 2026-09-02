@@ -1,0 +1,1 @@
+/home/lain/wrk/manallvm/hex/mana_json/native/mana_json/target/release/libmana_json_native.a: /home/lain/wrk/manallvm/crates/mana-native/src/lib.rs /home/lain/wrk/manallvm/hex/mana_json/native/mana_json/src/lib.rs
