@@ -116,8 +116,14 @@ compiler (`cc`).
 - The parser must accept **real `erlc +to_core` output**. When extending it,
   generate a real `.core` file first (`erlc +to_core foo.erl`) and develop
   against that, not against the Core Erlang spec's idealized syntax.
-- Dependencies are deliberately minimal (inkwell is the only external one).
-  Do not add crates for things the stdlib does adequately.
+- Dependency policy: prefer the Rust stdlib for anything it covers
+  adequately — but do NOT hand-roll complex, correctness-critical
+  algorithms that a well-established crate provides (bignum arithmetic,
+  crypto primitives, regexes). Adding such a crate requires two gates:
+  (a) behavior byte-identical to BEAM through the conformance suite, and
+  (b) a measured benchmark showing it is at least as fast as the code it
+  replaces on OUR workload shapes. Current externals: inkwell, mio,
+  corosensei, rayon, blake3, regex, sha1/sha2/hmac, getrandom, dirs.
 - No `unsafe` outside `mana-rt` term decoding and the GEP helpers in codegen
   that already use it.
 
