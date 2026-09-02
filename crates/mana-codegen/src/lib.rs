@@ -1696,6 +1696,16 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_call(self.rt_register_atoms(), &atom_args, "")
             .map_err(be)?;
 
+        // seed elixir_config's URI scheme → default-port table (BEAM does
+        // this in elixir:start/2; the closed world skips that boot)
+        self.builder
+            .build_call(
+                self.rt_p_void("mana_rt_seed_uri_defaults"),
+                &[ctx.into()],
+                "",
+            )
+            .map_err(be)?;
+
         let target = self.fns.borrow()[entry];
         let entry_ptr = target.as_global_value().as_pointer_value();
         let call = self

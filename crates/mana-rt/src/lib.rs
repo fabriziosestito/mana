@@ -10987,8 +10987,51 @@ pub extern "C" fn mana_rt_ets_new(_ctx: *mut ProcCtx, name: u64, opts: u64) -> u
     name
 }
 
-/// ets:info/1 → undefined for unknown tables, [] otherwise (existence
-/// checks only — Phoenix.Config's cache probe).
+/// Seed the `elixir_config` ets table with the URI scheme → default-port
+/// entries that `elixir:start/2` inserts on BEAM (`{{uri, <<"http">>}, 80}`
+/// …). The closed world never runs the :elixir application boot, so
+/// URI.default_port/1 (→ elixir_config:get({uri, Scheme})) would return nil
+/// and any HTTP request whose Host header omits a port would then crash in
+/// the response path. Called once from the generated main.
+#[no_mangle]
+pub extern "C" fn mana_rt_seed_uri_defaults(ctx: *mut ProcCtx) {
+    let ctx = unsafe { &mut *ctx };
+    let tab = atom_intern(b"elixir_config");
+    let uri = atom_intern(b"uri");
+    let defaults: &[(&[u8], i64)] = &[
+        (b"ftp", 21),
+        (b"sftp", 22),
+        (b"tftp", 69),
+        (b"http", 80),
+        (b"https", 443),
+        (b"ldap", 389),
+        (b"ws", 80),
+        (b"wss", 443),
+    ];
+    for &(scheme, port) in defaults {
+        let sbin = bytes_to_new_bin(ctx, scheme);
+        // root sbin across the two tuple allocs
+        let mut fr = [ctx.roots_head, 1, sbin];
+        ctx.roots_head = fr.as_ptr() as u64;
+        let key = alloc_nursery(ctx, 3);
+        unsafe {
+            *key = (2 << 8) | KIND_TUPLE;
+            *key.add(1) = uri;
+            *key.add(2) = fr[2];
+        }
+        fr[2] = key as u64;
+        let row = alloc_nursery(ctx, 3);
+        unsafe {
+            *row = (2 << 8) | KIND_TUPLE;
+            *row.add(1) = fr[2];
+            *row.add(2) = ((port << 3) as u64) | TAG_SMALL;
+        }
+        ctx.roots_head = fr[0];
+        let _ = &mut fr;
+        mana_rt_ets_insert(ctx, tab, row as u64, 0);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_info(_ctx: *mut ProcCtx, tab: u64) -> u64 {
     let tabs = ETS_TABLES.lock().unwrap();
