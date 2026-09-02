@@ -4,6 +4,7 @@ members = [
     "crates/mana-syntax",
     "crates/mana-codegen",
     "crates/mana-rt",
+    "crates/mana-native",
     "crates/manac",
 ]
 

@@ -1,0 +1,13 @@
+[package]
+name = "mana-native"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# rlib only: a package's native/ crate depends on this for the term ABI
+# (extern declarations + safe wrappers). The mana_rt_* symbols it declares
+# are defined in libmana_rt.a and resolved at manac's final link.
+crate-type = ["rlib"]
+
+[dependencies]
