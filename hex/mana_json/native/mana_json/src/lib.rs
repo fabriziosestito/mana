@@ -19,16 +19,15 @@ use serde_json::Value;
 
 #[no_mangle]
 pub extern "C" fn mana_json_native_encode_1(ctx: *mut ProcCtx, term: u64) -> u64 {
-    let value = match term_to_value(Term(term)) {
-        Ok(v) => v,
-        Err(reason) => return build_error(ctx, reason),
-    };
-    let bytes = match serde_json::to_vec(&value) {
-        Ok(b) => b,
-        Err(_) => return build_error(ctx, b"encode_error"),
-    };
+    // walk the term straight into a byte buffer — no serde_json::Value tree,
+    // no second serialization pass. Read-only over the process heap: no mana
+    // allocation until the result is built below.
+    let mut out = Vec::new();
+    if let Err(reason) = encode_term(Term(term), &mut out) {
+        return build_error(ctx, reason);
+    }
     let mut env = unsafe { Env::new(ctx) };
-    let bin = env.binary(&bytes);
+    let bin = env.binary(&out);
     let ok = env.atom(b"ok");
     let t = env.tuple(&[ok, bin]);
     env.get(t)
@@ -61,84 +60,154 @@ fn build_error(ctx: *mut ProcCtx, reason: &[u8]) -> u64 {
     env.get(t)
 }
 
-// -- term -> serde_json::Value (read-only walk; no mana allocation) --
+// -- term -> JSON bytes (read-only walk; no mana allocation, no Value tree) --
 
-fn term_to_value(t: Term) -> Result<Value, &'static [u8]> {
+fn encode_term(t: Term, out: &mut Vec<u8>) -> Result<(), &'static [u8]> {
     if t.is_nil() {
-        return Ok(Value::Array(Vec::new()));
+        out.extend_from_slice(b"[]");
+        return Ok(());
     }
     if t.is_small() || t.is_bignum() {
-        return Ok(int_to_value(t));
+        write_int(t, out);
+        return Ok(());
     }
     if t.is_float() {
-        return match serde_json::Number::from_f64(t.as_float()) {
-            Some(n) => Ok(Value::Number(n)),
-            None => Err(b"non_finite_float"),
-        };
+        let f = t.as_float();
+        if !f.is_finite() {
+            return Err(b"non_finite_float");
+        }
+        // ryu = serde_json's own float formatter: shortest round-trip, always
+        // with a '.' or exponent so decode reads it back as a float.
+        let mut buf = ryu::Buffer::new();
+        out.extend_from_slice(buf.format(f).as_bytes());
+        return Ok(());
     }
     if t.is_atom() {
-        return Ok(match t.atom_name() {
-            b"null" | b"nil" => Value::Null,
-            b"true" => Value::Bool(true),
-            b"false" => Value::Bool(false),
-            name => Value::String(String::from_utf8_lossy(name).into_owned()),
-        });
+        match t.atom_name() {
+            b"null" | b"nil" => out.extend_from_slice(b"null"),
+            b"true" => out.extend_from_slice(b"true"),
+            b"false" => out.extend_from_slice(b"false"),
+            name => write_json_string(name, out),
+        }
+        return Ok(());
     }
     if let Some(bytes) = t.binary_bytes() {
-        return Ok(Value::String(String::from_utf8_lossy(bytes).into_owned()));
+        write_json_string(bytes, out);
+        return Ok(());
     }
     if t.is_cons() {
-        let mut arr = Vec::new();
+        out.push(b'[');
         let mut cur = t;
+        let mut first = true;
         loop {
             if cur.is_nil() {
-                return Ok(Value::Array(arr));
+                break;
             }
             if !cur.is_cons() {
                 return Err(b"improper_list");
             }
-            arr.push(term_to_value(cur.cons_head())?);
+            if !first {
+                out.push(b',');
+            }
+            first = false;
+            encode_term(cur.cons_head(), out)?;
             cur = cur.cons_tail();
         }
+        out.push(b']');
+        return Ok(());
     }
     if t.is_map() {
+        out.push(b'{');
         let n = t.map_size();
-        let mut obj = serde_json::Map::new();
         for i in 0..n {
-            let k = t.map_key(i);
-            let key = if k.is_atom() {
-                String::from_utf8_lossy(k.atom_name()).into_owned()
-            } else if let Some(kb) = k.binary_bytes() {
-                String::from_utf8_lossy(kb).into_owned()
-            } else if k.is_small() || k.is_bignum() {
-                let mut buf = [0u8; 64];
-                let len = k.int_decimal(&mut buf).unwrap_or(0).min(buf.len());
-                String::from_utf8_lossy(&buf[..len]).into_owned()
-            } else {
-                return Err(b"bad_key");
-            };
-            obj.insert(key, term_to_value(t.map_val(i))?);
+            if i > 0 {
+                out.push(b',');
+            }
+            write_key(t.map_key(i), out)?;
+            out.push(b':');
+            encode_term(t.map_val(i), out)?;
         }
-        return Ok(Value::Object(obj));
+        out.push(b'}');
+        return Ok(());
     }
     Err(b"unsupported")
 }
 
-/// Any integer term -> a JSON number, preserving bignums exactly via their
-/// decimal digits (serde_json's arbitrary_precision keeps the literal).
-fn int_to_value(t: Term) -> Value {
+/// Any integer term -> its decimal digits, preserving bignums exactly.
+fn write_int(t: Term, out: &mut Vec<u8>) {
     let mut buf = [0u8; 64];
     let n = t.int_decimal(&mut buf).unwrap();
     if n <= buf.len() {
-        serde_json::from_slice(&buf[..n]).unwrap()
+        out.extend_from_slice(&buf[..n]);
     } else {
         let mut v = vec![0u8; n];
         t.int_decimal(&mut v);
-        serde_json::from_slice(&v).unwrap()
+        out.extend_from_slice(&v);
     }
 }
 
-// -- serde_json::Value -> term (rooted build through the Env) --
+/// A map key -> a JSON string. Keys must be atom / binary / integer (integer
+/// keys become their decimal as a string); anything else is a bad key.
+fn write_key(k: Term, out: &mut Vec<u8>) -> Result<(), &'static [u8]> {
+    if k.is_atom() {
+        write_json_string(k.atom_name(), out);
+    } else if let Some(kb) = k.binary_bytes() {
+        write_json_string(kb, out);
+    } else if k.is_small() || k.is_bignum() {
+        out.push(b'"');
+        write_int(k, out);
+        out.push(b'"');
+    } else {
+        return Err(b"bad_key");
+    }
+    Ok(())
+}
+
+/// Emit a JSON string for arbitrary bytes. Valid UTF-8 is escaped in place;
+/// invalid UTF-8 is lossily replaced (U+FFFD), matching the old Value path.
+fn write_json_string(bytes: &[u8], out: &mut Vec<u8>) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => escape_str(s.as_bytes(), out),
+        Err(_) => {
+            let s = String::from_utf8_lossy(bytes);
+            escape_str(s.as_bytes(), out)
+        }
+    }
+}
+
+/// serde_json's default string escaping: escape `"`, `\`, and the C0 control
+/// characters (short escapes for \b \t \n \f \r, else \u00XX). Non-ASCII and
+/// `/` are passed through unescaped.
+fn escape_str(bytes: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(b'"');
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let short: &[u8] = match b {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            0x08 => b"\\b",
+            0x0c => b"\\f",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x00..=0x1f => {
+                out.extend_from_slice(&bytes[start..i]);
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[(b >> 4) as usize]);
+                out.push(HEX[(b & 0xf) as usize]);
+                start = i + 1;
+                continue;
+            }
+            _ => continue,
+        };
+        out.extend_from_slice(&bytes[start..i]);
+        out.extend_from_slice(short);
+        start = i + 1;
+    }
+    out.extend_from_slice(&bytes[start..]);
+    out.push(b'"');
+}
 
 fn value_to_term(env: &mut Env, v: &Value) -> H {
     match v {
