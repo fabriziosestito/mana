@@ -51,10 +51,18 @@ defmodule Mix.Tasks.Mana.Compile do
     # not runtime put_env — so beams compiled before these overrides keep
     # the old semantics. A versioned marker under the build dir forces one
     # full recompile per build dir whenever the override set changes.
+    #
+    # The scrub above is applied before every compile, so any module Mix
+    # DOES recompile here bakes release semantics. The hazard is a module
+    # compiled earlier WITHOUT the scrub (a plain `mix compile` / `mix
+    # phx.server` in dev — exactly the browser-demo workflow) that Mix now
+    # considers up to date. Detect that by comparing the marker's mtime
+    # against the newest project beam: a beam newer than the marker was
+    # compiled outside this task (unscrubbed), so force a full recompile.
     marker = Path.join(Mix.Project.build_path(), "mana_init_mode")
     stamp = "plug_init_mode=compile scrub=v1"
 
-    if File.read(marker) == {:ok, stamp} do
+    if File.read(marker) == {:ok, stamp} and marker_fresh?(marker) do
       Mix.Task.run("compile")
     else
       Mix.Task.run("compile", ["--force"])
@@ -391,6 +399,26 @@ defmodule Mix.Tasks.Mana.Compile do
       end
 
     Path.join([base, "cores", "#{System.version()}-otp#{System.otp_release()}"])
+  end
+
+  # True when the marker is at least as new as every compiled beam — i.e.
+  # no plain (unscrubbed) compile has happened since the last --app build
+  # wrote the marker. A newer beam means a dev compile poisoned the build
+  # dir, so we must force a scrubbed recompile.
+  defp marker_fresh?(marker) do
+    case File.stat(marker, time: :posix) do
+      {:ok, %{mtime: m}} ->
+        Path.wildcard(Path.join(Mix.Project.compile_path(), "*.beam"))
+        |> Enum.all?(fn beam ->
+          case File.stat(beam, time: :posix) do
+            {:ok, %{mtime: b}} -> b <= m
+            _ -> false
+          end
+        end)
+
+      _ ->
+        false
+    end
   end
 
   defp resolve_entry!(nil) do
