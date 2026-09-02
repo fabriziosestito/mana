@@ -1,17 +1,19 @@
 defmodule :mana_json_native do
   @moduledoc """
-  The native-bound JSON BIFs. Declared with `use Mana.Native` so the mana
-  build recognizes it (from this package's `mana_native:` mix metadata) and
-  binds `encode/1` and `decode/1` to the symbols in `native/mana_json/`.
+  The native-bound JSON BIFs. This package's `mana_native:` mix metadata
+  (see mix.exs) tells the mana build to bind `encode/1` and `decode/1` to
+  the symbols in `native/mana_json/` (`mana_json_native_encode_1` /
+  `_decode_1`).
 
   On BEAM the bodies below run as ordinary Elixir — they delegate to Jason
   so a normal Elixir run and the conformance oracle behave the same as the
   native path. When compiled with mana, these bodies are cut and never
-  reached; the native crate's `mana_json_native_encode_1` / `_decode_1`
-  handle the call instead.
-  """
+  reached.
 
-  use Mana.Native, otp_app: :mana_json, package: :mana_json
+  (A `use Mana.Native` marker exists for documentation, but is intentionally
+  not used here to avoid a compile-time dependency on the mana package — the
+  build discovers this module solely through the `mana_native:` mix key.)
+  """
 
   def encode(term) do
     {:ok, IO.iodata_to_binary(Jason.encode_to_iodata!(term))}

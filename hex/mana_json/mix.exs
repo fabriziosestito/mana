@@ -30,9 +30,10 @@ defmodule ManaJSON.MixProject do
 
   defp deps do
     [
-      # Mana.Native macro (a marker) + the build pipeline.
-      {:mana, path: "../mana"},
       # BEAM-side fallback for the stub bodies + the conformance oracle.
+      # (No dep on :mana itself — discovery is via the mana_native: key
+      # above, so the package stays free of dep-diamond conflicts with the
+      # consumer's own mana path dep.)
       {:jason, "~> 1.2"}
     ]
   end
