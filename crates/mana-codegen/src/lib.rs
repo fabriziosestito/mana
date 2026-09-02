@@ -4459,21 +4459,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             return self.atom_term("ok");
         }
-        if module == "zlib" && name == "gzip" && args.len() == 1 {
-            // real gzip container over DEFLATE stored blocks (valid
-            // everywhere, compresses nothing — TODO(zlib-real)); browsers
-            // send Accept-Encoding: gzip and Bandit compresses through this
-            let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
-            let call = self
-                .builder
-                .build_call(
-                    self.rt_pt_i64("mana_rt_zlib_gzip"),
-                    &[self.ctx_val().into(), argv[0].into()],
-                    "gz",
-                )
-                .map_err(be)?;
-            let v = call_result(call)?.into_int_value();
-            return self.check_exc(f, v);
+        if module == "zlib" {
+            if let Some(v) = self.compile_zlib_bif(f, name, args, scope)? {
+                return Ok(v);
+            }
+            // unhandled zlib names fall through to the raise arm below
         }
         if matches!(
             module,
@@ -7058,6 +7048,101 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
         let v = call_result(call)?.into_int_value();
         self.check_exc(f, v)
+    }
+
+    /// zlib cut: streaming compression over miniz_oxide. Handled names
+    /// return Some(result); unknown zlib functions return None so the
+    /// caller falls through to the runtime-raise arm. Handle terms are
+    /// {mana_zlib, N} opaque tuples.
+    fn compile_zlib_bif(
+        &self,
+        f: FunctionValue<'ctx>,
+        name: &str,
+        args: &[Expr],
+        scope: &mut Scope<'ctx>,
+    ) -> CgResult<Option<IntValue<'ctx>>> {
+        let arity = args.len();
+        // arg count → runtime fn type (ctx pointer + N i64 terms)
+        let ty = |n: usize| {
+            let mut params: Vec<BasicMetadataTypeEnum> =
+                vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
+            params.extend((0..n).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
+            self.i64t.fn_type(&params, false)
+        };
+        let small = |v: i64| self.i64t.const_int(((v << 3) as u64) | 0b001, false);
+
+        // (symbol, extra term args appended after the evaluated call args)
+        let plan: Option<(&str, usize, Vec<IntValue<'ctx>>)> = match (name, arity) {
+            ("open", 0) => Some(("mana_rt_zlib_open", 0, vec![])),
+            ("close", 1) => Some(("mana_rt_zlib_close", 1, vec![])),
+            ("inflateInit", 1) => Some(("mana_rt_zlib_inflate_init", 1, vec![small(15)])),
+            ("inflateInit", 2) => Some(("mana_rt_zlib_inflate_init", 2, vec![])),
+            ("deflateInit", 2) => Some((
+                "mana_rt_zlib_deflate_init",
+                2,
+                vec![small(15), self.atom_term("default")?],
+            )),
+            // deflateInit/6: Z, Level, Method, WindowBits, MemLevel, Strategy
+            // — honor Level(1), WindowBits(3), Strategy(5); drop the rest
+            ("deflateInit", 6) => None, // handled specially below
+            ("deflate", 2) => Some((
+                "mana_rt_zlib_deflate",
+                2,
+                vec![self.atom_term("none")?],
+            )),
+            ("deflate", 3) => Some(("mana_rt_zlib_deflate", 3, vec![])),
+            ("safeInflate", 2) => Some(("mana_rt_zlib_safe_inflate", 2, vec![])),
+            ("inflateReset", 1) | ("deflateReset", 1) => Some(("mana_rt_zlib_reset", 1, vec![])),
+            ("inflateEnd", 1) | ("deflateEnd", 1) => Some(("mana_rt_zlib_end", 1, vec![])),
+            ("gzip", 1) => Some(("mana_rt_zlib_gzip", 1, vec![])),
+            ("gunzip", 1) => Some(("mana_rt_zlib_gunzip", 1, vec![])),
+            ("compress", 1) => Some(("mana_rt_zlib_compress", 1, vec![small(0)])),
+            ("zip", 1) => Some(("mana_rt_zlib_compress", 1, vec![small(1)])),
+            ("uncompress", 1) => Some(("mana_rt_zlib_uncompress", 1, vec![small(0)])),
+            ("unzip", 1) => Some(("mana_rt_zlib_uncompress", 1, vec![small(1)])),
+            _ => return Ok(None),
+        };
+
+        // deflateInit/6 selects a subset of the evaluated args
+        if name == "deflateInit" && arity == 6 {
+            let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+            let callee = self.rt_fn("mana_rt_zlib_deflate_init", || ty(4));
+            let call = self
+                .builder
+                .build_call(
+                    callee,
+                    &[
+                        self.ctx_val().into(),
+                        argv[0].into(), // Z
+                        argv[1].into(), // Level
+                        argv[3].into(), // WindowBits
+                        argv[5].into(), // Strategy
+                    ],
+                    "zlib",
+                )
+                .map_err(be)?;
+            let v = call_result(call)?.into_int_value();
+            return Ok(Some(self.check_exc(f, v)?));
+        }
+
+        let Some((sym, nargs, extra)) = plan else {
+            return Ok(None);
+        };
+        let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
+        let mut call_args: Vec<BasicMetadataValueEnum> = vec![self.ctx_val().into()];
+        for a in argv.iter().take(nargs) {
+            call_args.push((*a).into());
+        }
+        for e in &extra {
+            call_args.push((*e).into());
+        }
+        let callee = self.rt_fn(sym, || ty(nargs + extra.len()));
+        let call = self
+            .builder
+            .build_call(callee, &call_args, "zlib")
+            .map_err(be)?;
+        let v = call_result(call)?.into_int_value();
+        Ok(Some(self.check_exc(f, v)?))
     }
 
     /// ets cut: the global KV store (keypos 1 only, no match specs).

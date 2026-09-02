@@ -13,6 +13,9 @@ crossbeam-queue = "0.3.13"
 getrandom = "0.2"
 hmac = "0.12"
 mio = { version = "1.2.2", features = ["net", "os-poll", "os-ext"] }
+# real DEFLATE (permessage-deflate + gzip); flate2's default backend,
+# pure Rust. Gated per AGENTS.md: BEAM-identical via Conf.Zlib + benched.
+miniz_oxide = "0.8"
 
 parking_lot = "0.12.5"
 regex = "1.13.1"
