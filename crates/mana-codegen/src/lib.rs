@@ -135,13 +135,13 @@ struct Lift {
 /// (closed world). A C `main` (init ctx, call entry) lands in the entry
 /// module's object. `poisoned` maps unparseable module names to their
 /// errors, surfaced if reachability needs them.
-/// The content-addressed object cache (Go's build-cache model). An entry
-/// is keyed by the "action": everything that feeds a module's object —
+/// The content-addressed object cache (content-hash build-cache model). An
+/// entry is keyed by the "action": everything that feeds a module's object —
 /// the compiler binary itself, the target/config, the module's core text,
 /// its include set, the effect verdicts of its remote callees, the missing
 /// modules it references, and whether it emits main. Anything new that
-/// influences codegen MUST be added to the key (Go's cgo caching bug is
-/// the canonical omission).
+/// influences codegen MUST be added to the key (a key that omits a codegen
+/// input is the canonical cache-poisoning bug).
 pub struct ObjCache {
     pub root: PathBuf,
     /// blake3 of the running compiler binary (dev-branch tool identity)
@@ -189,7 +189,7 @@ impl ObjCache {
         Ok(dst)
     }
 
-    /// Age-based trim, Go-style: at most once per 24h, drop entries not
+    /// Age-based trim: at most once per 24h, drop entries not
     /// used (mtime) for 30 days. Best-effort — errors are ignored.
     pub fn trim(&self) {
         let stamp = self.root.join("obj").join("trim.stamp");

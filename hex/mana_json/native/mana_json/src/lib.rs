@@ -2,12 +2,12 @@
 //! `mana_json` hex package. Two BIFs back `ManaJSON`:
 //! `mana_json_native:encode/1` and `decode/1`, term <-> JSON via serde_json.
 //!
-//! Term <-> JSON correspondence (mirrors the reference Go mana_json):
+//! Term <-> JSON correspondence:
 //!   - atom :nil / :null  -> JSON null ; JSON null -> :nil on decode
 //!   - :true / :false     -> JSON booleans
 //!   - other atoms        -> their name as a JSON string
-//!   - integer / float    -> JSON number (decode: i64, else float, like the
-//!                           Go reference; encode preserves bignums exactly)
+//!   - integer / float    -> JSON number (decode: i64, else float; encode
+//!                           preserves bignums exactly)
 //!   - binary             -> JSON string (UTF-8)
 //!   - proper list / nil  -> JSON array (improper list -> {:error, ...})
 //!   - map                -> JSON object; keys must be atom/binary/integer;
@@ -222,8 +222,8 @@ fn value_to_term(env: &mut Env, v: &Value) -> H {
             } else if let Ok(i) = s.parse::<i64>() {
                 env.int(i)
             } else {
-                // out of i64 range: match the Go reference (fall back to
-                // float) rather than a lossy path we can't round-trip
+                // out of i64 range: fall back to float rather than a lossy
+                // path we can't round-trip
                 env.float(s.parse::<f64>().unwrap_or(0.0))
             }
         }
