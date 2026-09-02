@@ -3664,6 +3664,19 @@ static SOCKETS: std::sync::Mutex<SocketTable> = std::sync::Mutex::new(SocketTabl
     free: Vec::new(),
 });
 
+thread_local! {
+    /// Per-scheduler-thread read scratch for socket recv/pump. Allocating
+    /// and zeroing a fresh 64 KiB chunk per read cost ~11% of a Phoenix
+    /// request's instructions (callgrind). Safe to share across the
+    /// coroutines of one thread: every use reads then copies out under the
+    /// SOCKETS lock with no yield in between.
+    static RECV_SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; 65536]);
+}
+
+fn with_recv_scratch<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    RECV_SCRATCH.with(|c| f(&mut c.borrow_mut()[..]))
+}
+
 /// (pid, socket idx, wanted-read) wake tokens from the reactor thread.
 static IO_WAKES: SegQueue<(usize, usize, bool)> = SegQueue::new();
 /// socket indices whose sources the reactor should register with its poll.
@@ -4962,7 +4975,6 @@ pub extern "C" fn mana_rt_tcp(
             }
             let want = (b as i64 >> 3) as usize;
             let Ok(deadline) = timeout_deadline(c) else { return raise_badarg(ctx) };
-            let mut chunk = vec![0u8; 65536];
             loop {
                 enum Step {
                     Done(Vec<u8>, bool),
@@ -4991,11 +5003,15 @@ pub extern "C" fn mana_rt_tcp(
                             drop(tab);
                             return raise_badarg(ctx);
                         };
-                        match s.read(&mut chunk) {
-                            Ok(0) => Step::Closed(binary),
-                            Ok(k) => {
+                        match with_recv_scratch(|chunk| {
+                            s.read(chunk).map(|k| {
                                 entry.recv_oct += k as u64;
                                 entry.rbuf.extend_from_slice(&chunk[..k]);
+                                k
+                            })
+                        }) {
+                            Ok(0) => Step::Closed(binary),
+                            Ok(_) => {
                                 if want == 0 || entry.rbuf.len() >= want {
                                     let take = if want == 0 {
                                         entry.rbuf.len()
@@ -5451,7 +5467,6 @@ fn drain_io_active(ctx: &mut ProcCtx) {
 
 fn active_pump(ctx: &mut ProcCtx, idx: usize) {
     use std::io::Read;
-    let mut chunk = vec![0u8; 65536];
     loop {
         enum Ev {
             Data(Vec<u8>, usize, bool, bool), // bytes, owner, binary, once
@@ -5481,17 +5496,17 @@ fn active_pump(ctx: &mut ProcCtx, idx: usize) {
                 let SockSource::Stream(s) = &mut entry.source else {
                     return; // listeners have no active data
                 };
-                match s.read(&mut chunk) {
-                    Ok(0) => {
+                match with_recv_scratch(|chunk| s.read(chunk).map(|k| chunk[..k].to_vec())) {
+                    Ok(data) if data.is_empty() => {
                         entry.active = ActiveMode::Passive; // tcp_closed once
                         Ev::Closed(owner)
                     }
-                    Ok(k) => {
-                        entry.recv_oct += k as u64;
+                    Ok(data) => {
+                        entry.recv_oct += data.len() as u64;
                         if once {
                             entry.active = ActiveMode::Passive;
                         }
-                        Ev::Data(chunk[..k].to_vec(), owner, binary, once)
+                        Ev::Data(data, owner, binary, once)
                     }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
