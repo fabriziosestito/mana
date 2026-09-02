@@ -6062,6 +6062,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
+            ("pid_to_list", 1) => {
+                let call = self
+                    .builder
+                    .build_call(
+                        self.rt_pt_i64("mana_rt_pid_to_list"),
+                        &[self.ctx_val().into(), argv[0].into()],
+                        "p2l",
+                    )
+                    .map_err(be)?;
+                let v = call_result(call)?.into_int_value();
+                self.check_exc(f, v)
+            }
             ("list_to_tuple", 1) | ("tuple_to_list", 1) => {
                 let helper = if name == "list_to_tuple" {
                     "mana_rt_list_to_tuple"
@@ -9096,6 +9108,7 @@ fn erlang_may_raise(name: &str, arity: usize) -> bool {
             | ("integer_to_binary", 2)
             | ("integer_to_list", 1)
             | ("integer_to_list", 2)
+            | ("pid_to_list", 1)
             | ("binary_to_integer", 1)
             | ("binary_to_integer", 2)
             | ("list_to_integer", 1)

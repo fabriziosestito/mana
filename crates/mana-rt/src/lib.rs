@@ -9024,6 +9024,20 @@ pub extern "C" fn mana_rt_integer_to_list(ctx: *mut ProcCtx, t: u64, base: u64) 
     bytes_to_charlist(ctx, s.as_bytes())
 }
 
+/// erlang:pid_to_list/1 — BEAM-style "<0.ID.0>" charlist (no distribution,
+/// so node creation and serial are 0). Inspect.PID wraps this as
+/// "#PID<0.ID.0>".
+#[no_mangle]
+pub extern "C" fn mana_rt_pid_to_list(ctx: *mut ProcCtx, pid: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    if pid & 0xF != PID_TAG4 {
+        return raise_badarg(ctx);
+    }
+    let id = pid >> 4;
+    let s = format!("<0.{}.0>", id);
+    bytes_to_charlist(ctx, s.as_bytes())
+}
+
 /// Parse decimal/base digits (with optional sign) — badarg on any junk.
 fn parse_int_term(ctx: &mut ProcCtx, bytes: &[u8], base: u32) -> Option<u64> {
     let s = std::str::from_utf8(bytes).ok()?;
