@@ -132,10 +132,15 @@ defmodule Mix.Tasks.Mana.Compile do
     manac = Mana.compiler_path(bin: opts[:bin])
     app = Path.join(out, "app")
 
+    # discover deps that ship native/ crates (mana_native: metadata),
+    # cargo-build them, and produce the manac native-manifest + --native-obj
+    # link inputs. Native modules are cut — the closure BFS must skip them.
+    {native_args, native_mods} = build_native_deps!(out)
+
     # runtime-implemented modules the closure BFS must never follow —
     # single source of truth lives in manac
     {cut_out, 0} = System.cmd(manac, ["--print-bif-modules"])
-    cut = MapSet.new(String.split(cut_out, "\n", trim: true))
+    cut = MapSet.union(MapSet.new(String.split(cut_out, "\n", trim: true)), native_mods)
 
     # warm start: the manifest memoizes the last successful build's full
     # core list, so a rebuild starts complete and compiles in one round.
@@ -153,7 +158,104 @@ defmodule Mix.Tasks.Mana.Compile do
         end
       end)
 
-    compile_loop(manac, mod, fun, arity, app, cores, out, MapSet.new(), 400, seed_args, cut, have)
+    compile_loop(manac, mod, fun, arity, app, cores, out, MapSet.new(), 400, seed_args, cut, have, native_args)
+  end
+
+  # Walk deps for `mana_native:` metadata; cargo-build each native crate;
+  # write the manac native-manifest and collect --native-obj static libs.
+  # Returns {manac_native_args, native_module_set}.
+  defp build_native_deps!(out) do
+    entries =
+      for {dep_app, dep_path} <- Mix.Project.deps_paths(),
+          pkg <- native_packages(dep_app, dep_path) do
+        pkg
+      end
+
+    if entries == [] do
+      {[], MapSet.new()}
+    else
+      {libs, lines, mods} =
+        Enum.reduce(entries, {[], [], []}, fn %{module: mod, src: src, dep_path: dp},
+                                              {libs, lines, mods} ->
+          lib = build_native_crate!(Path.join(dp, src), mod)
+
+          fn_lines =
+            for {fun, ar} <- native_exports(mod) do
+              # conservative default effects: may_gc + may_raise are always
+              # safe (a valid term never equals the exception sentinel)
+              "#{mod} #{fun} #{ar} #{mod}_#{fun}_#{ar} 1 1"
+            end
+
+          {[lib | libs], fn_lines ++ lines, [mod | mods]}
+        end)
+
+      manifest = Path.join(out, "_manac_native.manifest")
+      File.write!(manifest, Enum.join(lines, "\n") <> "\n")
+
+      args = ["--native-manifest", manifest] ++ Enum.flat_map(libs, &["--native-obj", &1])
+      {args, MapSet.new(mods)}
+    end
+  end
+
+  defp native_packages(dep_app, dep_path) do
+    mix_exs = Path.join(dep_path, "mix.exs")
+
+    if File.exists?(mix_exs) do
+      try do
+        Mix.Project.in_project(dep_app, dep_path, fn _ ->
+          case Keyword.get(Mix.Project.config(), :mana_native) do
+            nil ->
+              []
+
+            opts ->
+              for {name, attrs} <- Keyword.get(opts, :packages, []) do
+                %{
+                  module: Keyword.fetch!(attrs, :module),
+                  src: Keyword.get(attrs, :src, Path.join("native", Atom.to_string(name))),
+                  dep_path: dep_path
+                }
+              end
+          end
+        end)
+      rescue
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
+  defp build_native_crate!(crate_dir, mod) do
+    unless File.dir?(crate_dir) do
+      Mix.raise("native crate dir missing: #{crate_dir}")
+    end
+
+    Mix.shell().info("==> cargo build --release (native #{mod}) in #{crate_dir}")
+
+    {out, status} =
+      System.cmd("cargo", ["build", "--release"],
+        cd: crate_dir,
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: Mix.raise("cargo build failed for #{crate_dir}:\n#{out}")
+
+    lib = Path.join([crate_dir, "target", "release", "lib#{mod}.a"])
+    unless File.exists?(lib), do: Mix.raise("native static lib not found: #{lib}")
+    lib
+  end
+
+  # The native functions to bind = the stub module's exports minus the
+  # BEAM/Elixir-generated ones. Symbol convention: <module>_<fun>_<arity>.
+  defp native_exports(mod) do
+    m = String.to_atom(mod)
+    Code.ensure_loaded(m)
+
+    m.module_info(:exports)
+    |> Enum.reject(fn {fun, _ar} ->
+      s = Atom.to_string(fun)
+      fun in [:module_info, :__info__, :__mana_native__] or String.starts_with?(s, "__")
+    end)
   end
 
   # Reachability-driven stdlib compilation: run manac; when it reports a
@@ -161,8 +263,8 @@ defmodule Mix.Tasks.Mana.Compile do
   # stdlib/kernel, deps — anything loadable), dump its Core Erlang — AND its
   # whole static import closure, so one round absorbs the whole subgraph —
   # into the cache and retry. Only modules the entry reaches get pulled in.
-  defp compile_loop(manac, mod, fun, arity, app, cores, out, tried, fuel, seed_args, cut, have) do
-    args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ seed_args ++ cores
+  defp compile_loop(manac, mod, fun, arity, app, cores, out, tried, fuel, seed_args, cut, have, native_args) do
+    args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ native_args ++ seed_args ++ cores
     t0 = System.monotonic_time(:millisecond)
     {output, status} = System.cmd(manac, args, stderr_to_stdout: true)
 
@@ -233,7 +335,8 @@ defmodule Mix.Tasks.Mana.Compile do
             fuel - 1,
             seed_args,
             cut,
-            have
+            have,
+            native_args
           )
         end
 
@@ -263,7 +366,8 @@ defmodule Mix.Tasks.Mana.Compile do
           fuel - 1,
           seed_args,
           cut,
-          have
+          have,
+          native_args
         )
 
       true ->

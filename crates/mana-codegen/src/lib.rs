@@ -9268,6 +9268,10 @@ fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)>) 
         .collect();
     let conds = inject_native_conds(conds, true);
     let set = effect_fixpoint(conds);
+    // native fns were injected only to resolve their callers; they are not
+    // compiled functions, so drop them from the result (the reference
+    // walker never has them as keys either).
+    let set: GcSet = set.into_iter().filter(|(m, _)| !is_native_module(m)).collect();
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
         if let Some(mods) = all_asts(units) {
             let slow = compute_may_gc_slow(&mods, reachable);
@@ -9297,6 +9301,7 @@ fn compute_may_raise(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)
         .collect();
     let conds = inject_native_conds(conds, false);
     let set = effect_fixpoint(conds);
+    let set: GcSet = set.into_iter().filter(|(m, _)| !is_native_module(m)).collect();
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
         if let Some(mods) = all_asts(units) {
             let slow = compute_may_raise_slow(&mods, reachable);
