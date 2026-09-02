@@ -19,9 +19,10 @@ defmodule Conf.WsClient do
     if System.get_env("PHX_KEEP_LOGGER") == nil, do: :logger.remove_handler(:default)
 
     Application.put_env(:plug, :validate_header_keys_during_test, false)
-    # native JSON on the Phoenix socket serializer path (native on mana,
-    # Jason-backed on the BEAM oracle) — proves ManaJSON is a drop-in
-    Application.put_env(:phoenix, :json_library, ManaJSON)
+    # native JSON on the Phoenix socket serializer path: ManaJSON (serde) on
+    # the native binary, Jason on the BEAM oracle (ManaJSON can't run there).
+    # Proves ManaJSON is a drop-in for the LiveView serializer.
+    Application.put_env(:phoenix, :json_library, Conf.JSON.lib())
 
     Application.put_env(:phx_app, PhxAppWeb.Endpoint,
       adapter: Bandit.PhoenixAdapter,

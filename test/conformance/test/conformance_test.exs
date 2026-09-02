@@ -81,7 +81,7 @@ defmodule ConformanceTest do
       {out, status} =
         System.cmd("mix", ["mana.compile", "--app"],
           cd: phx_dir,
-          env: [{"MANA_BIN", manac}],
+          env: [{"MANA_BIN", manac}, {"MIX_ENV", "mana"}],
           stderr_to_stdout: true
         )
 
@@ -125,7 +125,7 @@ defmodule ConformanceTest do
 
         :beam ->
           pa =
-            [Path.join(phx_dir, "_mana") | Path.wildcard(Path.join(phx_dir, "_build/dev/lib/*/ebin"))]
+            [Path.join(phx_dir, "_mana") | Path.wildcard(Path.join(phx_dir, "_build/mana/lib/*/ebin"))]
             |> Enum.flat_map(&["-pa", &1])
 
           {System.find_executable("elixir"),

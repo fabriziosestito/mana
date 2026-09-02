@@ -20,7 +20,8 @@ defmodule ManaJSON.MixProject do
       ],
       description:
         "Native JSON for apps compiled with mana. encode/decode are a " <>
-          "native BIF backed by serde_json; on BEAM the module delegates to Jason."
+          "native BIF backed by serde_json; on BEAM the module is a stub and " <>
+          "the host app uses Jason directly (config_env() switch)."
     ]
   end
 
@@ -29,12 +30,9 @@ defmodule ManaJSON.MixProject do
   end
 
   defp deps do
-    [
-      # BEAM-side fallback for the stub bodies + the conformance oracle.
-      # (No dep on :mana itself — discovery is via the mana_native: key
-      # above, so the package stays free of dep-diamond conflicts with the
-      # consumer's own mana path dep.)
-      {:jason, "~> 1.2"}
-    ]
+    # No deps: the package ships the native crate under native/mana_json/ and
+    # a pure BEAM stub. It never references Jason — the host app selects Jason
+    # vs ManaJSON in its own config (config_env() == :mana).
+    []
   end
 end

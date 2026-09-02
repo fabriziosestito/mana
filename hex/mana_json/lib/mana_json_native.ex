@@ -1,29 +1,18 @@
 defmodule :mana_json_native do
   @moduledoc """
-  The native-bound JSON BIFs. This package's `mana_native:` mix metadata
-  (see mix.exs) tells the mana build to bind `encode/1` and `decode/1` to
-  the symbols in `native/mana_json/` (`mana_json_native_encode_1` /
-  `_decode_1`).
+  BEAM-side stub for the native JSON shim. Both functions return
+  `{:error, :not_supported_on_beam}` so a misconfigured runtime fails
+  loudly instead of silently doing nothing.
 
-  On BEAM the bodies below run as ordinary Elixir — they delegate to Jason
-  so a normal Elixir run and the conformance oracle behave the same as the
-  native path. When compiled with mana, these bodies are cut and never
-  reached.
-
-  (A `use Mana.Native` marker exists for documentation, but is intentionally
-  not used here to avoid a compile-time dependency on the mana package — the
-  build discovers this module solely through the `mana_native:` mix key.)
+  This module is only ever loaded under the `:mana` build env (the package
+  is `only: [:mana]` in the host app). When the host app is compiled with
+  mana, the build binds `encode/1` and `decode/1` to the symbols in
+  `native/mana_json/` (`mana_json_native_encode_1` / `_decode_1`, backed by
+  serde_json) and these stub bodies are cut. On every other env Phoenix
+  uses Jason directly (see the host app's config/config.exs), so these
+  stubs are never reached.
   """
 
-  def encode(term) do
-    {:ok, IO.iodata_to_binary(Jason.encode_to_iodata!(term))}
-  rescue
-    e -> {:error, Exception.message(e)}
-  end
-
-  def decode(input) do
-    {:ok, Jason.decode!(input)}
-  rescue
-    e -> {:error, Exception.message(e)}
-  end
+  def encode(_term), do: {:error, :not_supported_on_beam}
+  def decode(_input), do: {:error, :not_supported_on_beam}
 end
