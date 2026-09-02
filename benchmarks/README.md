@@ -45,8 +45,8 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | zlib gzip 4KB html | 36.7 µs | 34.4 µs | 2026-09-02, LiveView milestone (real DEFLATE via miniz_oxide — at BEAM parity) |
 | zlib gunzip 4KB html | 62.3 µs | 45.9 µs | 2026-09-02, miniz_oxide inflate (1.36x behind zlib — cold path) |
 | zlib raw deflate+inflate roundtrip | 41.4 µs | 51.7 µs | 2026-09-02, permessage-deflate shape (mana 1.25x faster) |
-| lv event roundtrip (keepalive) | — | 66 µs | 2026-09-02, LiveView phx-click→diff on a warm socket (BEAM baseline; native LiveView serving is conformance-green via Conf.Ws but blocked in the benchmarks/--app builds — see note) |
-| lv mount+join (new conn) | — | 1230 µs | 2026-09-02, full HTTP mount + upgrade + phx_join (BEAM baseline) |
+| lv event roundtrip (keepalive) | 340 µs | 63 µs | 2026-09-02, LiveView phx-click→diff on a warm socket (5.4x behind — channel + diff + JSON + WS framing per event is the next lever) |
+| lv mount+join (new conn) | 3130 µs | 1150 µs | 2026-09-02, full HTTP mount + upgrade + phx_join (2.7x behind) |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction
