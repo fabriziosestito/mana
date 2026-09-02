@@ -47,6 +47,10 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | zlib raw deflate+inflate roundtrip | 41.4 µs | 51.7 µs | 2026-09-02, permessage-deflate shape (mana 1.25x faster) |
 | lv event roundtrip (keepalive) | 340 µs | 63 µs | 2026-09-02, LiveView phx-click→diff on a warm socket (5.4x behind — channel + diff + JSON + WS framing per event is the next lever) |
 | lv mount+join (new conn) | 3130 µs | 1150 µs | 2026-09-02, full HTTP mount + upgrade + phx_join (2.7x behind) |
+| json encode diff (native serde vs Jason) | 1.25 µs | 0.98 µs | 2026-09-02, mana-native JSON — BEAM parity on the LiveView-diff shape, vs 37x behind with mana's compiled Jason (47 µs) |
+| json decode diff | 1.61 µs | 1.53 µs | 2026-09-02, mana-native JSON — parity (compiled Jason was 19.5 µs, 12x behind) |
+| json encode big | 134 µs | 55 µs | 2026-09-02, 50-key nested (2.4x behind — arbitrary_precision + Value intermediate is the lever; compiled Jason was 1381 µs) |
+| json decode big | 123 µs | 94 µs | 2026-09-02, 50-key nested (1.3x behind; compiled Jason was 904 µs) |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction

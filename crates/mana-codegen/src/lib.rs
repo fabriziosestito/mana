@@ -471,7 +471,7 @@ fn action_key(
         if let Some(fun) = m.funs.iter().find(|f| &f.name == fname) {
             for e in &fun.edges {
                 if let Edge::Remote(tm, tf) = e {
-                    if is_bif_module(tm) {
+                    if is_bif_module(tm) || is_native_module(tm) {
                         continue;
                     }
                     let key = (tm.clone(), tf.clone());
@@ -1797,7 +1797,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.builder.build_return(Some(&v)).map_err(be)?;
                 Ok(())
             }
-            Expr::Call { module, name, args } if !is_bif_module(module) => {
+            Expr::Call { module, name, args }
+                if !is_bif_module(module) && !is_native_module(module) =>
+            {
                 if self.missing_modules.borrow().contains(module) {
                     let v = self.emit_missing_call_abort(f, module, name, args.len())?;
                     self.builder.build_return(Some(&v)).map_err(be)?;
@@ -1954,7 +1956,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
             }
             Expr::Call { module, name, args } => {
-                if is_bif_module(module) {
+                if let Some(nf) = native_fn(module, name, args.len()) {
+                    // external native module: lower to a direct call to the
+                    // package's linked symbol (ctx, args...) -> term
+                    let callee = self.rt_fn(&nf.symbol, || self.term_fn_type(args.len()));
+                    let argv = self.eval_args(f, args, scope)?;
+                    let call = self
+                        .builder
+                        .build_call(callee, &argv, "native")
+                        .map_err(be)?;
+                    let v = call_result(call)?.into_int_value();
+                    if nf.may_raise {
+                        self.check_exc(f, v)
+                    } else {
+                        Ok(v)
+                    }
+                } else if is_bif_module(module) {
                     self.compile_bif(f, module, name, args, scope)
                 } else if self.missing_modules.borrow().contains(module) {
                     self.emit_missing_call_abort(f, module, name, args.len())
@@ -9014,6 +9031,50 @@ fn is_bif_module(m: &str) -> bool {
     BIF_MODULES.contains(&m)
 }
 
+// ---- external native modules (hex-package `native/` crates) ----
+//
+// Unlike BIF_MODULES (native code baked into libmana_rt.a, known to the
+// compiler), these are declared per-build from the `mana_native:` metadata
+// of a project's deps: a stub module whose calls lower to a symbol linked
+// from the package's compiled `native/` crate. The manifest is DATA, not
+// part of the tool binary, so it must NOT leak into cached summaries — the
+// summarizer records a call into a native module as an ordinary remote dep
+// (cache-safe); the per-fn (gc,raise) verdicts are injected at fixpoint
+// time (compute_may_gc / compute_may_raise) and consulted by the reference
+// walkers, both of which run every build.
+
+#[derive(Clone, Debug)]
+pub struct NativeFn {
+    /// The `#[no_mangle]` symbol in the package's native crate.
+    pub symbol: String,
+    pub may_gc: bool,
+    pub may_raise: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NativeManifest {
+    pub fns: HashMap<(String, String, usize), NativeFn>,
+    pub modules: HashSet<String>,
+}
+
+static NATIVE_MODULES: std::sync::OnceLock<NativeManifest> = std::sync::OnceLock::new();
+
+/// Install the native-module manifest for this build (once, before compile).
+pub fn set_native_manifest(m: NativeManifest) {
+    let _ = NATIVE_MODULES.set(m);
+}
+
+fn is_native_module(m: &str) -> bool {
+    NATIVE_MODULES.get().is_some_and(|nm| nm.modules.contains(m))
+}
+
+fn native_fn(module: &str, name: &str, arity: usize) -> Option<&'static NativeFn> {
+    NATIVE_MODULES
+        .get()?
+        .fns
+        .get(&(module.to_string(), name.to_string(), arity))
+}
+
 fn is_raise(primop: &str) -> bool {
     matches!(
         primop,
@@ -9205,7 +9266,12 @@ fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)>) 
             Some(((m.clone(), f.clone()), (fs.gc_base, fs.gc_deps.clone())))
         })
         .collect();
+    let conds = inject_native_conds(conds, true);
     let set = effect_fixpoint(conds);
+    // native fns were injected only to resolve their callers; they are not
+    // compiled functions, so drop them from the result (the reference
+    // walker never has them as keys either).
+    let set: GcSet = set.into_iter().filter(|(m, _)| !is_native_module(m)).collect();
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
         if let Some(mods) = all_asts(units) {
             let slow = compute_may_gc_slow(&mods, reachable);
@@ -9233,7 +9299,9 @@ fn compute_may_raise(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)
             Some(((m.clone(), f.clone()), (fs.raise_base, fs.raise_deps.clone())))
         })
         .collect();
+    let conds = inject_native_conds(conds, false);
     let set = effect_fixpoint(conds);
+    let set: GcSet = set.into_iter().filter(|(m, _)| !is_native_module(m)).collect();
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
         if let Some(mods) = all_asts(units) {
             let slow = compute_may_raise_slow(&mods, reachable);
@@ -9241,6 +9309,32 @@ fn compute_may_raise(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)
         }
     }
     set
+}
+
+/// Native-module callees appear in summary deps but never in `defs` (they
+/// are not compiled). Inject them into the fixpoint with the manifest's
+/// per-fn verdict as their base and no further deps, so a compiled caller's
+/// dep on a native fn resolves. `gc` selects the may_gc vs may_raise flag.
+fn inject_native_conds(
+    mut conds: HashMap<(String, FunName), (bool, Vec<(String, FunName)>)>,
+    gc: bool,
+) -> HashMap<(String, FunName), (bool, Vec<(String, FunName)>)> {
+    if NATIVE_MODULES.get().is_none() {
+        return conds;
+    }
+    let mut extra: Vec<((String, FunName), bool)> = Vec::new();
+    for (_, deps) in conds.values() {
+        for (m, f) in deps {
+            if is_native_module(m) {
+                let v = native_fn(m, &f.name, f.arity).map_or(true, |nf| if gc { nf.may_gc } else { nf.may_raise });
+                extra.push(((m.clone(), f.clone()), v));
+            }
+        }
+    }
+    for (k, v) in extra {
+        conds.entry(k).or_insert((v, Vec::new()));
+    }
+    conds
 }
 
 /// The parsed ASTs of every unit, or None if any unit came from a summary
@@ -9408,6 +9502,13 @@ fn expr_may_raise(
                     .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound))
         }
         Expr::Call { module, name, args } => {
+            if is_native_module(module) {
+                let nr = native_fn(module, name, args.len()).map_or(true, |nf| nf.may_raise);
+                return nr
+                    || args
+                        .iter()
+                        .any(|a| expr_may_raise(a, cur_mod, raise_set, letrec_bound));
+            }
             if matches!(
                 module.as_str(),
                 "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
@@ -9518,6 +9619,13 @@ fn expr_may_gc(
                 return args
                     .iter()
                     .any(|a| raise_arg_may_gc(a, cur_mod, gc_set, letrec_bound));
+            }
+            if is_native_module(module) {
+                let ng = native_fn(module, name, args.len()).map_or(true, |nf| nf.may_gc);
+                return ng
+                    || args
+                        .iter()
+                        .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound));
             }
             // allocating erlang BIFs are GC points
             if module == "erlang" && erlang_may_gc(name, args.len()) {
@@ -10439,9 +10547,9 @@ fn reachable_funs(
         for edge in &fun.edges {
             let (tmod, tfun) = match edge {
                 Edge::Local(f) => (module.clone(), f.clone()),
-                Edge::Remote(m, _) if is_bif_module(m) => continue, // BIF
+                Edge::Remote(m, _) if is_bif_module(m) || is_native_module(m) => continue, // BIF / native
                 Edge::Remote(m, f) => (m.clone(), f.clone()),
-                Edge::RemoteAnyArity(m, _) if is_bif_module(m) => continue,
+                Edge::RemoteAnyArity(m, _) if is_bif_module(m) || is_native_module(m) => continue,
                 Edge::RemoteAnyArity(m, fa) => {
                     if have_module.contains(m.as_str()) {
                         if let Some(target) = mod_by_name.get(m.as_str()) {

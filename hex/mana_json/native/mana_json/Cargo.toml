@@ -1,0 +1,24 @@
+[package]
+name = "mana_json_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mana_json_native"
+# staticlib → libmana_json_native.a, whose extern mana_rt_* references
+# resolve at manac's final link against libmana_rt.a
+crate-type = ["staticlib"]
+
+[dependencies]
+mana-native = { path = "../../../../crates/mana-native" }
+# decode parses into a serde_json::Value (arbitrary_precision keeps bignum
+# literals exact); encode walks the term straight to bytes with no Value tree.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+# shortest round-trip float formatting for the direct encoder (what
+# serde_json itself uses), so encoded floats round-trip as floats.
+ryu = "1"
+
+[profile.release]
+opt-level = 3
+
+[workspace]

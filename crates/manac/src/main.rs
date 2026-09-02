@@ -36,6 +36,8 @@ fn run() -> Result<(), String> {
     let mut entry_spec: Option<String> = None;
     let mut emit_ir = false;
     let mut seed_exports: Vec<String> = Vec::new();
+    let mut native_manifest: Option<PathBuf> = None;
+    let mut native_objs: Vec<PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -49,6 +51,17 @@ fn run() -> Result<(), String> {
                 entry_spec = Some(args.next().ok_or("--entry requires [MODULE:]FUN/ARITY")?)
             }
             "--emit-ir" => emit_ir = true,
+            // external native modules (hex-package native/ crates): a
+            // manifest of `MODULE FUN ARITY SYMBOL MAYGC MAYRAISE` lines,
+            // plus the compiled static lib(s) to link.
+            "--native-manifest" => {
+                native_manifest = Some(PathBuf::from(
+                    args.next().ok_or("--native-manifest requires a path")?,
+                ))
+            }
+            "--native-obj" => native_objs.push(PathBuf::from(
+                args.next().ok_or("--native-obj requires a path")?,
+            )),
             // the runtime-implemented module list, for the mix driver's
             // dependency-closure BFS (one line per module)
             "--print-bif-modules" => {
@@ -73,6 +86,11 @@ fn run() -> Result<(), String> {
     }
     if inputs.is_empty() {
         return Err("no input files (try --help)".into());
+    }
+
+    if let Some(path) = &native_manifest {
+        let m = parse_native_manifest(path)?;
+        mana_codegen::set_native_manifest(m);
     }
 
     // Load every input in parallel: read + hash, then either a summary-cache
@@ -184,7 +202,7 @@ fn run() -> Result<(), String> {
     )?;
 
     let t_link = std::time::Instant::now();
-    let link_result = link(&objs, &out);
+    let link_result = link(&objs, &native_objs, &out);
     let link_s = t_link.elapsed().as_secs_f64();
     let _ = std::fs::remove_dir_all(&obj_dir);
     link_result?;
@@ -276,10 +294,13 @@ fn erl_to_core(input: &Path) -> Result<PathBuf, String> {
     Ok(input.with_extension("core"))
 }
 
-fn link(objs: &[PathBuf], out: &Path) -> Result<(), String> {
+fn link(objs: &[PathBuf], native_objs: &[PathBuf], out: &Path) -> Result<(), String> {
     let rt = runtime_lib()?;
     let status = Command::new("cc")
         .args(objs)
+        // package native static libs go before libmana_rt.a so their
+        // undefined mana_rt_* symbols resolve against the runtime
+        .args(native_objs)
         .arg(&rt)
         .args(["-lpthread", "-ldl", "-lm"])
         .arg("-o")
@@ -290,6 +311,43 @@ fn link(objs: &[PathBuf], out: &Path) -> Result<(), String> {
         return Err("linking failed".into());
     }
     Ok(())
+}
+
+/// Parse a native-module manifest: whitespace-separated
+/// `MODULE FUN ARITY SYMBOL MAYGC MAYRAISE` lines (MAYGC/MAYRAISE = 0|1),
+/// blank lines and `#` comments ignored.
+fn parse_native_manifest(path: &Path) -> Result<mana_codegen::NativeManifest, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading {}: {}", path.display(), e))?;
+    let mut m = mana_codegen::NativeManifest::default();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() != 6 {
+            return Err(format!(
+                "{}:{}: expected `MODULE FUN ARITY SYMBOL MAYGC MAYRAISE`, got {:?}",
+                path.display(),
+                n + 1,
+                line
+            ));
+        }
+        let arity: usize = f[2]
+            .parse()
+            .map_err(|_| format!("{}:{}: bad arity {:?}", path.display(), n + 1, f[2]))?;
+        m.modules.insert(f[0].to_string());
+        m.fns.insert(
+            (f[0].to_string(), f[1].to_string(), arity),
+            mana_codegen::NativeFn {
+                symbol: f[3].to_string(),
+                may_gc: f[4] != "0",
+                may_raise: f[5] != "0",
+            },
+        );
+    }
+    Ok(m)
 }
 
 /// Find libmana_rt.a: $MANA_RT_LIB overrides; otherwise look next to manac

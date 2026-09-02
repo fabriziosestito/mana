@@ -47,10 +47,14 @@ defmodule PhxApp.MixProject do
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:jason, "~> 1.2"},
+      # Native JSON — only compiled under the :mana build env; on every other
+      # env Phoenix uses Jason (see config/config.exs).
+      {:mana_json, path: "../../../hex/mana_json", only: [:mana]},
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
-      # native compilation (mix mana.compile --app) from inside this app
-      {:mana, path: "../../../hex/mana", only: :dev, runtime: false}
+      # native compilation (mix mana.compile --app) — the task lives here; keep
+      # it in :dev too so the demo workflow can invoke it, plus the :mana env.
+      {:mana, path: "../../../hex/mana", only: [:dev, :mana], runtime: false}
     ]
   end
 
