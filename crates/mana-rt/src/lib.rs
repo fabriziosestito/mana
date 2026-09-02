@@ -10349,6 +10349,7 @@ pub extern "C" fn mana_rt_ets_insert(ctx: *mut ProcCtx, tab: u64, obj: u64, new:
     } else {
         objs.push(obj);
     }
+    let kind = ets_kind(tab);
     let mut guard = ETS_STORE.lock().unwrap();
     let rows = guard.get_or_insert_with(Vec::new);
     for o in objs {
@@ -10360,53 +10361,80 @@ pub extern "C" fn mana_rt_ets_insert(ctx: *mut ProcCtx, tab: u64, obj: u64, new:
             return raise_badarg(ctx);
         }
         let key = unsafe { *(o as *const u64).add(1) };
-        match kv_find(rows, tab, key) {
-            Some(i) => {
-                if new != 0 {
-                    return known.false_a;
+        match kind {
+            ETS_SET => match kv_find(rows, tab, key) {
+                Some(i) => {
+                    if new != 0 {
+                        return known.false_a;
+                    }
+                    rows[i].2 = eternal_deep_copy(o);
                 }
-                rows[i].2 = eternal_deep_copy(o);
-            }
-            None => {
-                let copy = eternal_deep_copy(o);
-                let ckey = unsafe { *(copy as *const u64).add(1) };
-                rows.push((tab, ckey, copy));
+                None => {
+                    let copy = eternal_deep_copy(o);
+                    let ckey = unsafe { *(copy as *const u64).add(1) };
+                    rows.push((tab, ckey, copy));
+                }
+            },
+            _ => {
+                // bag dedups exact-equal objects; duplicate_bag always
+                // appends. Rows keep insertion order.
+                let dup = kind == ETS_BAG
+                    && rows.iter().any(|&(t, k, v)| {
+                        t == tab
+                            && mana_rt_eq_exact(k, key) == 1
+                            && mana_rt_eq_exact(v, o) == 1
+                    });
+                if !dup {
+                    let copy = eternal_deep_copy(o);
+                    let ckey = unsafe { *(copy as *const u64).add(1) };
+                    rows.push((tab, ckey, copy));
+                }
             }
         }
     }
     known.true_a
 }
 
-/// ets:lookup/2 → list of stored tuples (eternal — safe to share).
+/// ets:lookup/2 → list of all stored tuples for the key, in insertion
+/// order (bags may hold several — eternal, safe to share).
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_lookup(ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    let guard = ETS_STORE.lock().unwrap();
-    let found = guard
-        .as_ref()
-        .and_then(|rows| kv_find(rows, tab, key).map(|i| rows[i].2));
-    drop(guard);
-    match found {
-        Some(tuple) => {
-            let cell = alloc_nursery(ctx, 2);
-            unsafe {
-                *cell = tuple;
-                *cell.add(1) = NIL;
-            }
-            cell as u64 | TAG_CONS
+    let found: Vec<u64> = {
+        let guard = ETS_STORE.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|&&(t, k, _)| t == tab && mana_rt_eq_exact(k, key) == 1)
+                    .map(|&(_, _, v)| v)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // rows are eternal — build the list newest-cons-last (reverse iter)
+    let mut out = NIL;
+    for &tuple in found.iter().rev() {
+        let mut fr = [ctx.roots_head, 1, out];
+        ctx.roots_head = fr.as_ptr() as u64;
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = tuple;
+            *cell.add(1) = fr[2];
         }
-        None => NIL,
+        ctx.roots_head = fr[0];
+        out = cell as u64 | TAG_CONS;
+        let _ = &mut fr;
     }
+    out
 }
 
-/// ets:delete/2 (by key).
+/// ets:delete/2 (by key) — removes every row for the key (bag semantics).
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_delete(_ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
     let mut guard = ETS_STORE.lock().unwrap();
     if let Some(rows) = guard.as_mut() {
-        if let Some(i) = kv_find(rows, tab, key) {
-            rows.remove(i);
-        }
+        rows.retain(|&(t, k, _)| !(t == tab && mana_rt_eq_exact(k, key) == 1));
     }
     known().true_a
 }
@@ -10505,15 +10533,47 @@ pub extern "C" fn mana_rt_ets_match(ctx: *mut ProcCtx, tab: u64, pattern: u64) -
     out
 }
 
-/// Known-table registry (eternal name terms) — ets:info existence checks.
-static ETS_TABLES: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+/// Known-table registry: (eternal name term, kind). Kind drives insert
+/// dedup and the shape of lookup_element. Unregistered tables (the app-env
+/// tag) default to Set.
+static ETS_TABLES: std::sync::Mutex<Vec<(u64, u8)>> = std::sync::Mutex::new(Vec::new());
 
-/// ets:new/2 — registers the (named) table; options ignored (TODO(ets)).
+const ETS_SET: u8 = 0;
+const ETS_BAG: u8 = 1;
+const ETS_DUP_BAG: u8 = 2;
+
+/// Kind of a table by name term; Set for anything not registered.
+fn ets_kind(tab: u64) -> u8 {
+    let tabs = ETS_TABLES.lock().unwrap();
+    tabs.iter()
+        .find(|&&(t, _)| mana_rt_eq_exact(t, tab) == 1)
+        .map(|&(_, k)| k)
+        .unwrap_or(ETS_SET)
+}
+
+/// ets:new/2 — registers the (named) table and records its kind from the
+/// options (`bag` / `duplicate_bag` / `ordered_set` → Set + TODO(ets); all
+/// other options ignored).
 #[no_mangle]
-pub extern "C" fn mana_rt_ets_new(_ctx: *mut ProcCtx, name: u64) -> u64 {
+pub extern "C" fn mana_rt_ets_new(_ctx: *mut ProcCtx, name: u64, opts: u64) -> u64 {
+    let mut kind = ETS_SET;
+    let mut cur = opts;
+    while cur & TAG_MASK == TAG_CONS {
+        let p = (cur & !TAG_MASK) as *const u64;
+        let opt = unsafe { *p };
+        cur = unsafe { *p.add(1) };
+        if opt & TAG_MASK == TAG_ATOM {
+            match atom_bytes(opt) {
+                b"bag" => kind = ETS_BAG,
+                b"duplicate_bag" => kind = ETS_DUP_BAG,
+                _ => {}
+            }
+        }
+    }
     let mut tabs = ETS_TABLES.lock().unwrap();
-    if !tabs.iter().any(|&t| mana_rt_eq_exact(t, name) == 1) {
-        tabs.push(eternal_deep_copy(name));
+    match tabs.iter().position(|&(t, _)| mana_rt_eq_exact(t, name) == 1) {
+        Some(i) => tabs[i].1 = kind,
+        None => tabs.push((eternal_deep_copy(name), kind)),
     }
     name
 }
@@ -10523,7 +10583,7 @@ pub extern "C" fn mana_rt_ets_new(_ctx: *mut ProcCtx, name: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_info(_ctx: *mut ProcCtx, tab: u64) -> u64 {
     let tabs = ETS_TABLES.lock().unwrap();
-    if tabs.iter().any(|&t| mana_rt_eq_exact(t, tab) == 1) {
+    if tabs.iter().any(|&(t, _)| mana_rt_eq_exact(t, tab) == 1) {
         NIL
     } else {
         known().undefined
@@ -10544,6 +10604,156 @@ pub extern "C" fn mana_rt_ets_match_delete(_ctx: *mut ProcCtx, tab: u64, pattern
         });
     }
     known().true_a
+}
+
+/// ets:member/2 — true if any object has the key.
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_member(_ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
+    let k = known();
+    let guard = ETS_STORE.lock().unwrap();
+    let hit = guard
+        .as_ref()
+        .map(|rows| {
+            rows.iter()
+                .any(|&(t, rk, _)| t == tab && mana_rt_eq_exact(rk, key) == 1)
+        })
+        .unwrap_or(false);
+    if hit {
+        k.true_a
+    } else {
+        k.false_a
+    }
+}
+
+/// ets:delete_object/2 — remove every row whose stored object equals the
+/// given one (Registry's per-key unsubscribe cleanup).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_delete_object(ctx: *mut ProcCtx, tab: u64, obj: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let ok = obj & TAG_MASK == TAG_BOXED
+        && obj != 0
+        && unsafe { *(obj as *const u64) } & 0xff == KIND_TUPLE
+        && unsafe { *(obj as *const u64) } >> 8 >= 1;
+    if !ok {
+        return raise_badarg(ctx);
+    }
+    let key = unsafe { *(obj as *const u64).add(1) };
+    let mut guard = ETS_STORE.lock().unwrap();
+    if let Some(rows) = guard.as_mut() {
+        rows.retain(|&(t, k, v)| {
+            !(t == tab && mana_rt_eq_exact(k, key) == 1 && mana_rt_eq_exact(v, obj) == 1)
+        });
+    }
+    known().true_a
+}
+
+/// ets:take/2 — return all objects for the key (as ets:lookup would) and
+/// remove them.
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_take(ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let found: Vec<u64> = {
+        let mut guard = ETS_STORE.lock().unwrap();
+        match guard.as_mut() {
+            Some(rows) => {
+                let hits = rows
+                    .iter()
+                    .filter(|&&(t, k, _)| t == tab && mana_rt_eq_exact(k, key) == 1)
+                    .map(|&(_, _, v)| v)
+                    .collect();
+                rows.retain(|&(t, k, _)| !(t == tab && mana_rt_eq_exact(k, key) == 1));
+                hits
+            }
+            None => Vec::new(),
+        }
+    };
+    let mut out = NIL;
+    for &tuple in found.iter().rev() {
+        let mut fr = [ctx.roots_head, 1, out];
+        ctx.roots_head = fr.as_ptr() as u64;
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = tuple;
+            *cell.add(1) = fr[2];
+        }
+        ctx.roots_head = fr[0];
+        out = cell as u64 | TAG_CONS;
+        let _ = &mut fr;
+    }
+    out
+}
+
+/// Count rows of `tab` matching a restricted select head (guards must be
+/// empty). Shared by select_count and select_delete.
+fn ets_select_matches(spec: u64, tab: u64, out_heads: &mut Vec<u64>) -> Result<usize, ()> {
+    // parse [{Head, [], _Body}] — heads only, guards must be []
+    let mut heads: Vec<u64> = Vec::new();
+    let mut cur = spec;
+    while cur & TAG_MASK == TAG_CONS {
+        let p = (cur & !TAG_MASK) as *const u64;
+        let clause = unsafe { *p };
+        cur = unsafe { *p.add(1) };
+        if clause & TAG_MASK != TAG_BOXED || clause == 0 {
+            return Err(());
+        }
+        unsafe {
+            let cp = clause as *const u64;
+            if *cp != (3 << 8) | KIND_TUPLE {
+                return Err(());
+            }
+            if *cp.add(2) != NIL {
+                return Err(()); // TODO(ets): guards
+            }
+            heads.push(*cp.add(1));
+        }
+    }
+    let guard = ETS_STORE.lock().unwrap();
+    let mut count = 0usize;
+    if let Some(rows) = guard.as_ref() {
+        for &(t, _, v) in rows {
+            if t != tab {
+                continue;
+            }
+            for &h in &heads {
+                let mut caps = Vec::new();
+                if ets_match_term(h, v, &mut caps) {
+                    count += 1;
+                    out_heads.push(v);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// ets:select_count/2 — number of objects matching the spec (empty guards).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_select_count(ctx: *mut ProcCtx, tab: u64, spec: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut hits = Vec::new();
+    match ets_select_matches(spec, tab, &mut hits) {
+        Ok(n) => ((n as u64) << 3) | TAG_SMALL,
+        Err(()) => raise_badarg(ctx),
+    }
+}
+
+/// ets:select_delete/2 — delete objects matching the spec, return the count.
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_select_delete(ctx: *mut ProcCtx, tab: u64, spec: u64) -> u64 {
+    let ctx = unsafe { &mut *ctx };
+    let mut hits: Vec<u64> = Vec::new();
+    let n = match ets_select_matches(spec, tab, &mut hits) {
+        Ok(n) => n,
+        Err(()) => return raise_badarg(ctx),
+    };
+    let mut guard = ETS_STORE.lock().unwrap();
+    if let Some(rows) = guard.as_mut() {
+        rows.retain(|&(t, _, v)| {
+            !(t == tab && hits.iter().any(|&h| mana_rt_eq_exact(h, v) == 1))
+        });
+    }
+    ((n as u64) << 3) | TAG_SMALL
 }
 
 /// Match-spec BODY term substitution: '$N' → capture, '$_' → object,
@@ -10717,6 +10927,9 @@ pub extern "C" fn mana_rt_ets_select(ctx: *mut ProcCtx, tab: u64, spec: u64) -> 
 
 /// ets:lookup_element/3 — badarg on missing table/key (Bandit.Clock's
 /// date_header rescues the resulting ArgumentError to compute a fallback).
+/// For bag / duplicate_bag tables the result is the LIST of the Pos-th
+/// elements across every object with the key, in insertion order (this is
+/// what Phoenix.Registry.dispatch consumes).
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_lookup_element(
     ctx: *mut ProcCtx,
@@ -10724,30 +10937,83 @@ pub extern "C" fn mana_rt_ets_lookup_element(
     key: u64,
     pos: u64,
 ) -> u64 {
+    match ets_lookup_element_impl(ctx, tab, key, pos) {
+        Ok(v) => v,
+        Err(true) => raise_badarg(unsafe { &mut *ctx }),
+        // empty on a /3 call is badarg
+        Err(false) => raise_badarg(unsafe { &mut *ctx }),
+    }
+}
+
+/// ets:lookup_element/4 — like /3 but returns Default when the key is
+/// absent instead of raising (pg:get_members/2 relies on this).
+#[no_mangle]
+pub extern "C" fn mana_rt_ets_lookup_element4(
+    ctx: *mut ProcCtx,
+    tab: u64,
+    key: u64,
+    pos: u64,
+    default: u64,
+) -> u64 {
+    match ets_lookup_element_impl(ctx, tab, key, pos) {
+        Ok(v) => v,
+        Err(true) => raise_badarg(unsafe { &mut *ctx }),
+        Err(false) => default, // key absent → default
+    }
+}
+
+/// Shared body: Ok(term) on success, Err(true) on a genuine badarg (bad
+/// pos or malformed tuple), Err(false) when the key has no rows.
+fn ets_lookup_element_impl(ctx: *mut ProcCtx, tab: u64, key: u64, pos: u64) -> Result<u64, bool> {
     let ctx = unsafe { &mut *ctx };
     if pos & TAG_MASK != TAG_SMALL || (pos as i64 >> 3) < 1 {
-        return raise_badarg(ctx);
+        return Err(true);
     }
     let n = (pos as i64 >> 3) as usize;
-    let guard = ETS_STORE.lock().unwrap();
-    let found = guard
-        .as_ref()
-        .and_then(|rows| kv_find(rows, tab, key).map(|i| rows[i].2));
-    drop(guard);
-    let Some(tuple) = found else {
-        return raise_badarg(ctx);
+    let found: Vec<u64> = {
+        let guard = ETS_STORE.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|&&(t, k, _)| t == tab && mana_rt_eq_exact(k, key) == 1)
+                    .map(|&(_, _, v)| v)
+                    .collect()
+            })
+            .unwrap_or_default()
     };
-    unsafe {
-        let p = tuple as *const u64;
-        if tuple & TAG_MASK != TAG_BOXED || *p & 0xff != KIND_TUPLE {
-            return raise_badarg(ctx);
-        }
-        let arity = (*p >> 8) as usize;
-        if n > arity {
-            return raise_badarg(ctx);
-        }
-        *p.add(n)
+    if found.is_empty() {
+        return Err(false);
     }
+    // element at position n of each stored tuple (all eternal)
+    let mut elems: Vec<u64> = Vec::with_capacity(found.len());
+    for tuple in found {
+        unsafe {
+            let p = tuple as *const u64;
+            if tuple & TAG_MASK != TAG_BOXED || *p & 0xff != KIND_TUPLE || n > (*p >> 8) as usize {
+                return Err(true);
+            }
+            elems.push(*p.add(n));
+        }
+    }
+    if ets_kind(tab) == ETS_SET {
+        return Ok(elems[0]);
+    }
+    // bag: return the list of elements, insertion order
+    let mut out = NIL;
+    for &e in elems.iter().rev() {
+        let mut fr = [ctx.roots_head, 1, out];
+        ctx.roots_head = fr.as_ptr() as u64;
+        let cell = alloc_nursery(ctx, 2);
+        unsafe {
+            *cell = e;
+            *cell.add(1) = fr[2];
+        }
+        ctx.roots_head = fr[0];
+        out = cell as u64 | TAG_CONS;
+        let _ = &mut fr;
+    }
+    Ok(out)
 }
 
 /// application env — same store under a reserved table tag (0b111 is never
