@@ -8,7 +8,7 @@ defmodule Smoke.Phx do
     Application.put_env(:plug, :validate_header_keys_during_test, false)
 
     Application.put_env(:phx_app, PhxAppWeb.Endpoint,
-      adapter: Bandit.PhoenixAdapter,
+      adapter: Bench.Env.http_adapter(),
       http: [ip: {127, 0, 0, 1}, port: 0],
       server: true,
       secret_key_base: @secret,

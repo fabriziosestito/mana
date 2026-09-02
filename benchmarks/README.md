@@ -51,6 +51,11 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | json decode diff | 1.61 µs | 1.53 µs | 2026-09-02, mana-native JSON — parity (compiled Jason was 19.5 µs, 12x behind) |
 | json encode big | 134 µs | 55 µs | 2026-09-02, 50-key nested (2.4x behind — arbitrary_precision + Value intermediate is the lever; compiled Jason was 1381 µs) |
 | json decode big | 123 µs | 94 µs | 2026-09-02, 50-key nested (1.3x behind; compiled Jason was 904 µs) |
+| lv event roundtrip (keepalive) | 165 µs | 60 µs | 2026-09-02, server on native JSON (ManaJSON), bench client still on compiled Jason — 5.4x → 2.7x from JSON alone |
+| lv event roundtrip (keepalive) | 45 µs | 62 µs | 2026-09-02, **fair client** (client JSON = runtime-selected: serde natively, Jason on BEAM; MANA_SCHEDULERS=1) — **mana 1.4x faster**. Callgrind: the old gap was ~78% the benchmark client's own compiled Jason; the whole server WS path (Bandit framing + channel + serde) is ~5% of instructions |
+| lv event roundtrip (keepalive) | 66 µs | 62 µs | 2026-09-02, same, MANA_SCHEDULERS=16 — the three processes (client, transport, channel) land on different schedulers (round-robin, no stealing): cross-thread wakes cost ~20 µs |
+| lv mount+join (new conn) | 1750 µs | 1040 µs | 2026-09-02, fair client, schedulers=1 (1.7x behind — the HTTP dead-render path, see phx landing) |
+| phx landing (keepalive) | 457 µs | 215 µs | 2026-09-02, re-run, schedulers=1 (2.1x). Callgrind attribution of the native request: Phoenix app 62% (render 20%, session cookie 16%, CSRF 12% — `Base.encode64url` alone 12.8% self), Bandit transport ~13% (adapter header work, date header, `String.downcase` on header tokens; parsing via native decode_packet is <1%), bench client 21%, runtime: minor GC 12.6%, zeroed 64 KiB recv buffers (calloc) 11% |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction

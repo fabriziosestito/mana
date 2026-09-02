@@ -9,11 +9,19 @@ defmodule Bench.Ws do
   @ws_key "AQIDBAUGBwgJCgsMDQ4PEA=="
 
   def run do
+    port = boot()
+    IO.puts("Bench.Ws: #{Bench.Env.tag()}")
+    bench(port)
+  end
+
+  @doc "Boot the Phoenix app on a free port with the runtime-selected adapter/JSON; returns the port."
+  def boot do
     :logger.remove_handler(:default)
     Application.put_env(:plug, :validate_header_keys_during_test, false)
+    Application.put_env(:phoenix, :json_library, Bench.Env.json_library())
 
     Application.put_env(:phx_app, PhxAppWeb.Endpoint,
-      adapter: Bandit.PhoenixAdapter,
+      adapter: Bench.Env.http_adapter(),
       http: [ip: {127, 0, 0, 1}, port: 0],
       server: true,
       secret_key_base: @secret,
@@ -26,7 +34,10 @@ defmodule Bench.Ws do
     {:ok, _} = Phoenix.PubSub.Application.start(:normal, [])
     {:ok, _} = PhxApp.Application.start(:normal, [])
     {:ok, {_ip, port}} = PhxAppWeb.Endpoint.server_info(:http)
+    port
+  end
 
+  defp bench(port) do
     Benchee.run(
       %{
         "lv mount+join (new conn)" => fn ->
@@ -47,7 +58,8 @@ defmodule Bench.Ws do
     :ok
   end
 
-  defp join(port) do
+  @doc "Dead-render /counter, upgrade, phx_join; returns {socket, topic}."
+  def join(port) do
     {headers, body} = get(port, "/counter")
     tokens = extract(headers, body)
     sock = upgrade(port, tokens)
@@ -65,7 +77,8 @@ defmodule Bench.Ws do
     {sock, topic}
   end
 
-  defp click(sock, topic) do
+  @doc "One phx-click event round-trip on a joined socket."
+  def click(sock, topic) do
     push(sock, "1", "2", topic, "event", %{"type" => "click", "event" => "inc", "value" => %{}})
     {[_, _, ^topic, "phx_reply", _ev], _} = recv_msg(sock)
     :ok
@@ -105,8 +118,13 @@ defmodule Bench.Ws do
     c
   end
 
+  # The client's own JSON work must not dominate the measurement: use the
+  # runtime-selected library (native serde natively, Jason on BEAM) so the
+  # client costs about the same on both runtimes.
+  defp json, do: Bench.Env.json_library()
+
   defp push(c, join_ref, ref, topic, event, payload) do
-    text = Jason.encode!([join_ref, ref, topic, event, payload])
+    text = json().encode!([join_ref, ref, topic, event, payload])
     len = byte_size(text)
 
     len_part =
@@ -137,7 +155,7 @@ defmodule Bench.Ws do
       end
 
     <<payload::binary-size(len), rest::binary>> = need(c, rest, len)
-    {Jason.decode!(payload), rest}
+    {json().decode!(payload), rest}
   end
 
   defp need(_c, buf, n) when byte_size(buf) >= n, do: buf
