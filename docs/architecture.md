@@ -181,6 +181,12 @@ exception to the no-blocking rule and a known debt (`TODO(io-pool)`).
 Files are fast because the calls skip BEAM's port machinery: a 1 KB file
 round-trip measures about 6 times faster than BEAM.
 
+The runtime also implements streaming zlib on top of the `miniz_oxide`
+crate. This gives real DEFLATE compression for HTTP gzip responses and for
+WebSocket permessage-deflate. A stream is an opaque `{mana_zlib, N}`
+handle, like a socket handle. Compiled Phoenix LiveView applications run
+over real WebSockets with this stack.
+
 ## Application boot
 
 `mix mana.compile --app` builds a binary that boots like an OTP release.
@@ -244,6 +250,9 @@ replaces.
 - The runtime reports local file timestamps as UTC.
 - The regex engine is Rust's `regex` crate: no backreferences and no
   lookaround.
+- zlib compresses with miniz_oxide, not erlang's zlib. Decompression is
+  exact, but compressed bytes differ from BEAM, and the deflate output
+  window is always 32K regardless of the requested window bits.
 - Bit operations on negative bignums abort (`TODO(bignum-bitops)`).
 - Binary segments wider than 64 bits abort (`TODO(bignum-segments)`).
 - Process stacks are fixed size (`TODO(stacks)`).

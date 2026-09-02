@@ -162,9 +162,28 @@ When asked to open a PR:
   tokens/messages drained at scheduler safepoints, same discipline as the
   timer thread). File ops and stdout are the documented exception: direct
   syscalls, µs-scale on local disks — TODO(io-pool) is the real fix. Packet
-  modes beyond raw are TODO(packet). File/socket handles are
-  `{mana_file, N}` / `{mana_socket, N}` tuples, not ports — `is_port/1` is
-  false on them (documented divergence; only user code ever sees them).
+  modes beyond raw are TODO(packet). File/socket/zlib handles are
+  `{mana_file, N}` / `{mana_socket, N}` / `{mana_zlib, N}` tuples, not ports
+  or NIF refs — `is_port/1` is false on them (documented divergence; only
+  user code ever sees them).
+
+- **zlib is real DEFLATE (miniz_oxide), not byte-identical to erlang's
+  zlib.** gzip/gunzip/compress/uncompress/zip/unzip plus the streaming API
+  (open/inflateInit/deflateInit/deflate/safeInflate/resets/ends) back
+  Bandit's permessage-deflate and HTTP gzip. Compressed OUTPUT differs from
+  BEAM byte-for-byte (miniz ≠ zlib), so conformance checks inflation of
+  fixed blobs + roundtrips, never compressed bytes. deflateInit honors
+  level + strategy + the windowBits sign (raw vs zlib); the window
+  magnitude, method and memLevel are ignored (miniz always uses a 32K
+  window — a decoding superset). Only breaks a peer that requests
+  server_max_window_bits < 15, which browsers never do.
+
+- **ets distinguishes set / bag / duplicate_bag** (kind parsed from the
+  new/2 options). Bags allow several rows per key; lookup_element returns a
+  LIST for bag-kind tables (Registry.dispatch's contract) and a single
+  element for set tables. This is what Phoenix.PubSub's Registry needs
+  (pid_ets is always a duplicate_bag). Ordered-set iteration, update_counter
+  and first/next remain TODO(ets).
 
 - **The build cache must key EVERY codegen input.** manac keeps a
   content-addressed object cache (Go's build-cache model) under the OS user
