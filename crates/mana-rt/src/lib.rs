@@ -10047,16 +10047,17 @@ pub extern "C" fn mana_rt_binary_split(ctx: *mut ProcCtx, bin: u64, pat: u64, op
         }
         cur = unsafe { *p.add(1) };
     }
-    // copy out — allocation below can move the source binary
-    let hay: Vec<u8> = bin_bytes(bin).to_vec();
-    let pats: Vec<Vec<u8>> = pats.iter().map(|p| p.to_vec()).collect();
-    let pref: Vec<&[u8]> = pats.iter().map(|p| p.as_slice()).collect();
-    let mut parts: Vec<Vec<u8>> = Vec::new();
+    // search over the live bytes (no allocation happens until the result is
+    // built), recording part RANGES; the parts then become zero-copy views
+    // of the subject via bin_slice (BEAM returns sub-binaries here too), so
+    // a split copies nothing but its list cells
+    let hay: &[u8] = bin_bytes(bin);
+    let mut parts: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
     loop {
-        match bin_search(&hay, &pref, start) {
+        match bin_search(hay, &pats, start) {
             Some((at, len)) => {
-                parts.push(hay[start..at].to_vec());
+                parts.push((start, at - start));
                 start = at + len;
                 if !global {
                     break;
@@ -10065,32 +10066,32 @@ pub extern "C" fn mana_rt_binary_split(ctx: *mut ProcCtx, bin: u64, pat: u64, op
             None => break,
         }
     }
-    parts.push(hay[start..].to_vec());
+    parts.push((start, hay.len() - start));
     if trim_all {
-        parts.retain(|p| !p.is_empty());
+        parts.retain(|&(_, l)| l != 0);
     } else if trim {
-        while parts.last().is_some_and(|p| p.is_empty()) {
+        while parts.last().is_some_and(|&(_, l)| l == 0) {
             parts.pop();
         }
     }
-    // build the result list back-to-front, rooting the partial list and
-    // the fresh binary across each cell allocation
+    // build the result list back-to-front, rooting the subject, the
+    // partial list and the fresh part across each allocation
     let saved = ctx.roots_head;
-    let mut fr = [0u64, 2, NIL, 0];
+    let mut fr = [0u64, 3, bin, NIL, 0];
     fr[0] = saved;
     ctx.roots_head = fr.as_ptr() as u64;
-    for bytes in parts.iter().rev() {
-        fr[3] = bytes_to_new_bin(ctx, bytes);
+    for &(off, len) in parts.iter().rev() {
+        fr[4] = mana_rt_bin_slice(ctx, fr[2], off as u64, len as i64);
         let cell = alloc_nursery(ctx, 2);
         unsafe {
-            *cell = fr[3];
-            *cell.add(1) = fr[2];
+            *cell = fr[4];
+            *cell.add(1) = fr[3];
         }
-        fr[2] = cell as u64 | TAG_CONS;
-        fr[3] = 0;
+        fr[3] = cell as u64 | TAG_CONS;
+        fr[4] = 0;
     }
     ctx.roots_head = saved;
-    fr[2]
+    fr[3]
 }
 
 /// binary:match/2,3 (mode 0: {S,L}|nomatch) and matches (mode 1: list).
