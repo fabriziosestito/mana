@@ -61,6 +61,11 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | phx landing (new conn) | **300 µs** | 401 µs | 2026-09-03, same — mana 1.3x ahead |
 | lv event roundtrip (keepalive) | **35 µs** | 62 µs | 2026-09-03, same — mana 1.8x ahead (fair client, schedulers=1) |
 | lv mount+join (new conn) | **888 µs** | 1040 µs | 2026-09-03, same — mana 1.2x ahead (was 1.7x behind) |
+| phx landing (keepalive) | **180 µs** | 215 µs | 2026-09-03, inline `rest::binary` views (no bin_slice call/copy) + zero-copy `binary:split` (parts are views, not copies) |
+| str upcase 1KB | 80 µs | 14 µs | 2026-09-03, inline rest views (was 149) |
+| str upcase 1KB | **26.6 µs** | 14 µs | 2026-09-03, **case pre-dispatch switch**: String.Unicode.upcase/3 is ~1400 byte-prefix clauses; one `switch` on the first byte replaces the sequential prefix compares. 5.6x total this series; residual = per-byte view + cons allocation (a match-context shape would remove the view) |
+| str split+join | 13.6 µs | 9.2 µs | 2026-09-03, zero-copy split (was 18.9) |
+| changeset valid | **2.4 µs** | 1.9 µs | 2026-09-03, case pre-dispatch (clause tables everywhere) |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction

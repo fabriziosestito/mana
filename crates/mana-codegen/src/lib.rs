@@ -85,6 +85,7 @@ const KIND_FLOAT: u64 = 1;
 const KIND_FUN: u64 = 2;
 const KIND_MAP: u64 = 4;
 const KIND_BIN: u64 = 5;
+const KIND_SUBBIN: u64 = 13;
 
 /// ctx word offsets (ProcCtx contract).
 const CTX_ROOTS: u64 = 2;
@@ -3222,6 +3223,23 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         f: FunctionValue<'ctx>,
         subject: IntValue<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
+        let (parent, poff) = self.bin_parent_off(f, subject)?;
+        let pdata = self
+            .builder
+            .build_int_add(parent, self.i64t.const_int(8, false), "bba.pd")
+            .map_err(be)?;
+        self.builder.build_int_add(pdata, poff, "bba.base").map_err(be)
+    }
+
+    /// (root binary term, byte offset into it) for a preflighted binary
+    /// subject: the subject itself with offset 0 for a plain KIND_BIN, or
+    /// the view's parent + stored offset for a KIND_SUBBIN. Inline branch
+    /// on the view bit (kinds 5/13 differ only in bit 3).
+    fn bin_parent_off(
+        &self,
+        f: FunctionValue<'ctx>,
+        subject: IntValue<'ctx>,
+    ) -> CgResult<(IntValue<'ctx>, IntValue<'ctx>)> {
         let sp = self
             .builder
             .build_int_to_ptr(subject, self.ptrt, "bba.p")
@@ -3247,11 +3265,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let cur = self.builder.get_insert_block().unwrap();
         let view_bb = self.ctx.append_basic_block(f, "bba.view");
         let merge = self.ctx.append_basic_block(f, "bba.merge");
-        // plain bin: data starts one word past the header
-        let plain = self
-            .builder
-            .build_int_add(subject, self.i64t.const_int(8, false), "bba.plain")
-            .map_err(be)?;
         self.builder
             .build_conditional_branch(is_view, view_bb, merge)
             .map_err(be)?;
@@ -3276,17 +3289,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_load(self.i64t, off_gep, "bba.off")
             .map_err(be)?
             .into_int_value();
-        let pdata = self
-            .builder
-            .build_int_add(parent, self.i64t.const_int(8, false), "bba.pd")
-            .map_err(be)?;
-        let viewed = self.builder.build_int_add(pdata, poff, "bba.va").map_err(be)?;
         let view_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge).map_err(be)?;
         self.builder.position_at_end(merge);
-        let phi = self.builder.build_phi(self.i64t, "bba.base").map_err(be)?;
-        phi.add_incoming(&[(&plain, cur), (&viewed, view_end)]);
-        Ok(phi.as_basic_value().into_int_value())
+        let pphi = self.builder.build_phi(self.i64t, "bba.parent").map_err(be)?;
+        pphi.add_incoming(&[(&subject, cur), (&parent, view_end)]);
+        let ophi = self.builder.build_phi(self.i64t, "bba.poff").map_err(be)?;
+        let zero = self.i64t.const_zero();
+        ophi.add_incoming(&[(&zero, cur), (&poff, view_end)]);
+        Ok((
+            pphi.as_basic_value().into_int_value(),
+            ophi.as_basic_value().into_int_value(),
+        ))
     }
 
     fn kind_test(
@@ -3503,6 +3517,136 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
+    /// Case pre-dispatch: for the maximal prefix of clauses whose first
+    /// pattern has a static discriminant (small-int / nil literal, or a
+    /// binary starting with a constant byte), jump straight to the FIRST
+    /// clause carrying the subject's key via an LLVM `switch`; clauses then
+    /// run sequentially from there as before. Subjects with no matching
+    /// key (or of another shape) go to the first key-less clause — or
+    /// nomatch. Turns Elixir's generated 1400-clause byte tables
+    /// (String.Unicode) from O(n) prefix compares per byte into one jump.
+    fn emit_case_dispatch(
+        &self,
+        f: FunctionValue<'ctx>,
+        vals: &CaseVals<'ctx>,
+        clauses: &[Clause],
+        blocks: &[BasicBlock<'ctx>],
+        fail_bb: BasicBlock<'ctx>,
+    ) -> CgResult<()> {
+        // keyed prefix
+        let mut keys: Vec<DiscKey> = Vec::new();
+        for c in clauses {
+            match c.patterns.first().and_then(Self::clause_disc) {
+                Some(k) => keys.push(k),
+                None => break,
+            }
+        }
+        // the switch needs one discriminant CLASS over the prefix
+        let all_word = keys.iter().all(|k| matches!(k, DiscKey::Word(_)));
+        let all_byte = keys.iter().all(|k| matches!(k, DiscKey::Byte0(_)));
+        if keys.len() < 4 || !(all_word || all_byte) {
+            self.builder.build_unconditional_branch(blocks[0]).map_err(be)?;
+            return Ok(());
+        }
+        let default_bb = if keys.len() < clauses.len() { blocks[keys.len()] } else { fail_bb };
+        let subject = match vals {
+            CaseVals::Ssa(vs) => vs[0],
+            CaseVals::Slots(slots) => self.reload(slots[0])?,
+        };
+        // first clause per distinct key (earlier clauses win)
+        let mut seen: HashSet<DiscKey> = HashSet::new();
+        let mut arms: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            if seen.insert(*k) {
+                let c = match k {
+                    DiscKey::Word(w) => self.i64t.const_int(*w, false),
+                    DiscKey::Byte0(b) => self.i64t.const_int(*b as u64, false),
+                };
+                arms.push((c, blocks[i]));
+            }
+        }
+        let disc = if all_word {
+            subject
+        } else {
+            // binary subject with len >= 1: its first byte; anything else:
+            // an impossible key (256) -> default
+            let miss_bb = self.ctx.append_basic_block(f, "disp.miss");
+            let bin_bb = self.ctx.append_basic_block(f, "disp.bin");
+            let merge = self.ctx.append_basic_block(f, "disp.merge");
+            let ok = self.kind_test(f, subject, |s, header| {
+                let k = s.builder.build_and(header, s.i64t.const_int(0xff, false), "dp.k").map_err(be)?;
+                let k2 = s.builder.build_or(k, s.i64t.const_int(8, false), "dp.k2").map_err(be)?;
+                let is_bin = s
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, k2, s.i64t.const_int(13, false), "dp.bin")
+                    .map_err(be)?;
+                let len = s
+                    .builder
+                    .build_right_shift(header, s.i64t.const_int(8, false), false, "dp.len")
+                    .map_err(be)?;
+                let nonempty = s
+                    .builder
+                    .build_int_compare(IntPredicate::UGE, len, s.i64t.const_int(1, false), "dp.ne")
+                    .map_err(be)?;
+                s.builder.build_and(is_bin, nonempty, "dp.ok").map_err(be)
+            })?;
+            let entry_end = self.builder.get_insert_block().unwrap();
+            self.builder.build_conditional_branch(ok, bin_bb, miss_bb).map_err(be)?;
+            self.builder.position_at_end(bin_bb);
+            let base = self.bin_base_addr(f, subject)?;
+            let bp = self.builder.build_int_to_ptr(base, self.ptrt, "dp.p").map_err(be)?;
+            let b = self
+                .builder
+                .build_load(self.ctx.i8_type(), bp, "dp.b0")
+                .map_err(be)?
+                .into_int_value();
+            let b64 = self.builder.build_int_z_extend(b, self.i64t, "dp.b64").map_err(be)?;
+            let bin_end = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(merge).map_err(be)?;
+            self.builder.position_at_end(miss_bb);
+            let miss = self.i64t.const_int(256, false);
+            self.builder.build_unconditional_branch(merge).map_err(be)?;
+            self.builder.position_at_end(merge);
+            let phi = self.builder.build_phi(self.i64t, "dp.disc").map_err(be)?;
+            phi.add_incoming(&[(&b64, bin_end), (&miss, miss_bb)]);
+            let _ = entry_end;
+            phi.as_basic_value().into_int_value()
+        };
+        self.builder.build_switch(disc, default_bb, &arms).map_err(be)?;
+        Ok(())
+    }
+
+    /// Static discriminant of a clause's FIRST pattern for the case
+    /// pre-dispatch switch: the whole term word for small-int / nil
+    /// literals, or the first byte for a binary pattern that starts with a
+    /// constant byte-sized integer segment. None = this clause may match
+    /// any subject (variable, atom, tuple, alias...), which ends the
+    /// switchable prefix. Only `Some` keys are ever skipped, and only when
+    /// the subject's key provably differs — so ordering, guards and
+    /// fallthrough semantics are unchanged.
+    fn clause_disc(p: &Pattern) -> Option<DiscKey> {
+        match p {
+            Pattern::Lit(Literal::Int(n)) if (-(1i64 << 60)..(1i64 << 60)).contains(n) => {
+                Some(DiscKey::Word(((*n as u64) << 3) | TAG_SMALL))
+            }
+            Pattern::Lit(Literal::Nil) => Some(DiscKey::Word(NIL)),
+            Pattern::Binary(segs) => {
+                let first = segs.first()?;
+                let spec = parse_seg_spec(&first.spec).ok()?;
+                match (&*first.value, spec.kind) {
+                    (Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_))), SegKind::Int { size: SegSize::Bytes(n) })
+                        if n >= 1 =>
+                    {
+                        let bytes = seg_const_bytes(&Expr::Lit(l.clone()), n, spec.little).ok()??;
+                        Some(DiscKey::Byte0(bytes[0]))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn compile_case(
         &self,
         f: FunctionValue<'ctx>,
@@ -3516,20 +3660,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         )>,
     ) -> CgResult<()> {
         let fail_bb = self.ctx.append_basic_block(f, "case.nomatch");
-        let mut next = self.ctx.append_basic_block(f, "clause0");
-        self.builder.build_unconditional_branch(next).map_err(be)?;
+        let blocks: Vec<BasicBlock<'ctx>> = (0..clauses.len())
+            .map(|i| self.ctx.append_basic_block(f, &format!("clause{}", i)))
+            .collect();
+        self.emit_case_dispatch(f, vals, clauses, &blocks, fail_bb)?;
 
         // clauses are mutually exclusive at runtime: each attempt may reuse
         // the temp slots of the previous one (subject slots sit below wm)
         let wm = self.next_slot.get();
         for (i, clause) in clauses.iter().enumerate() {
             self.next_slot.set(wm);
-            self.builder.position_at_end(next);
-            next = if i + 1 < clauses.len() {
-                self.ctx.append_basic_block(f, &format!("clause{}", i + 1))
-            } else {
-                fail_bb
-            };
+            self.builder.position_at_end(blocks[i]);
+            let next = if i + 1 < clauses.len() { blocks[i + 1] } else { fail_bb };
             let nvals = match vals {
                 CaseVals::Ssa(vs) => vs.len(),
                 CaseVals::Slots(slots) => slots.len(),
@@ -4285,6 +4427,50 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     off = self.builder.build_int_add(off, nbytes, "boff").map_err(be)?;
                 }
                 SegKind::Bin { size } => {
+                    // `rest::binary` after a static prefix (the string-walk
+                    // shape <<c, rest::binary>>): build the zero-copy view
+                    // inline — 3 words, no runtime call, no byte copy. The
+                    // preflight already proved len >= off. Allocate first,
+                    // then re-read the subject: the alloc may GC and move it.
+                    if matches!(size, SegSize::All) && prefix_static && slot.is_some() {
+                        let vp = self.alloc_words(3)?;
+                        let subject = self.reload(slot.unwrap())?;
+                        let sp = self
+                            .builder
+                            .build_int_to_ptr(subject, self.ptrt, "brv.p")
+                            .map_err(be)?;
+                        let header = self
+                            .builder
+                            .build_load(self.i64t, sp, "brv.h")
+                            .map_err(be)?
+                            .into_int_value();
+                        let total = self
+                            .builder
+                            .build_right_shift(header, self.i64t.const_int(8, false), false, "brv.tot")
+                            .map_err(be)?;
+                        let len = self.builder.build_int_sub(total, off, "brv.len").map_err(be)?;
+                        let (parent, poff) = self.bin_parent_off(f, subject)?;
+                        let abs = self.builder.build_int_add(poff, off, "brv.abs").map_err(be)?;
+                        let hdr = self
+                            .builder
+                            .build_or(
+                                self.builder
+                                    .build_left_shift(len, self.i64t.const_int(8, false), "brv.l8")
+                                    .map_err(be)?,
+                                self.i64t.const_int(KIND_SUBBIN, false),
+                                "brv.hdr",
+                            )
+                            .map_err(be)?;
+                        self.store_word(vp, 0, hdr)?;
+                        self.store_word(vp, 1, parent)?;
+                        self.store_word(vp, 2, abs)?;
+                        let v = self
+                            .builder
+                            .build_ptr_to_int(vp, self.i64t, "brv")
+                            .map_err(be)?;
+                        self.match_pattern(f, v, &seg.value, scope, fail)?;
+                        continue;
+                    }
                     let len: IntValue<'ctx> = match size {
                         SegSize::All => self.i64t.const_int(u64::MAX, false), // -1
                         _ => self.seg_bytes(f, size, scope, Some(fail))?,
@@ -8800,6 +8986,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
 enum Rooted<'ctx> {
     Slot(u64),
     Val(IntValue<'ctx>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum DiscKey {
+    /// immediate term word (small int, nil)
+    Word(u64),
+    /// first byte of a binary subject
+    Byte0(u8),
 }
 
 enum CaseVals<'ctx> {
