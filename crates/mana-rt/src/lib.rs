@@ -2249,7 +2249,11 @@ fn int_cmp_exact(a: u64, b: u64) -> i64 {
 
 struct ReTable {
     by_key: std::collections::HashMap<String, usize>,
-    regexes: Vec<regex::Regex>,
+    // Arc, not Regex: a `Regex` clone gets a fresh lazy-DFA cache pool, so
+    // cloning out of the table per call re-determinized the DFA on every
+    // run (~190K instructions for a trivial pattern). Sharing one Regex
+    // value keeps its cache warm across calls and threads.
+    regexes: Vec<std::sync::Arc<regex::Regex>>,
 }
 
 static RE_TABLE: std::sync::Mutex<Option<ReTable>> = std::sync::Mutex::new(None);
@@ -2317,7 +2321,7 @@ fn re_intern(source: &str, fl: ReFlags) -> Result<usize, String> {
         .ignore_whitespace(fl.extended)
         .build()
         .map_err(|e| e.to_string())?;
-    tab.regexes.push(re);
+    tab.regexes.push(std::sync::Arc::new(re));
     let idx = tab.regexes.len() - 1;
     tab.by_key.insert(key, idx);
     Ok(idx)
