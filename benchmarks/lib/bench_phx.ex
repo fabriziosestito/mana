@@ -61,13 +61,7 @@ defmodule Bench.Phx do
   defp read_response(c, acc) do
     case :binary.split(acc, "\r\n\r\n") do
       [head, body] ->
-        len =
-          case Regex.run(~r/content-length: (\d+)/i, head) do
-            [_, n] -> String.to_integer(n)
-            _ -> 0
-          end
-
-        read_body(c, body, len)
+        read_body(c, body, content_length(head))
 
       _ ->
         {:ok, chunk} = :gen_tcp.recv(c, 0, 5000)
@@ -80,5 +74,17 @@ defmodule Bench.Phx do
   defp read_body(c, buf, len) do
     {:ok, more} = :gen_tcp.recv(c, len - byte_size(buf), 5000)
     read_body(c, buf <> more, len)
+  end
+
+  # content-length from a response head without a regex (cheap client)
+  defp content_length(head) do
+    head
+    |> String.split("\r\n")
+    |> Enum.find_value(0, fn line ->
+      case String.split(line, ": ", parts: 2) do
+        [k, v] -> if String.downcase(k) == "content-length", do: String.to_integer(v)
+        _ -> nil
+      end
+    end)
   end
 end
