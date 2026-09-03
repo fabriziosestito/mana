@@ -55,7 +55,12 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | lv event roundtrip (keepalive) | 45 µs | 62 µs | 2026-09-02, **fair client** (client JSON = runtime-selected: serde natively, Jason on BEAM; MANA_SCHEDULERS=1) — **mana 1.4x faster**. Callgrind: the old gap was ~78% the benchmark client's own compiled Jason; the whole server WS path (Bandit framing + channel + serde) is ~5% of instructions |
 | lv event roundtrip (keepalive) | 66 µs | 62 µs | 2026-09-02, same, MANA_SCHEDULERS=16 — the three processes (client, transport, channel) land on different schedulers (round-robin, no stealing): cross-thread wakes cost ~20 µs |
 | lv mount+join (new conn) | 1750 µs | 1040 µs | 2026-09-02, fair client, schedulers=1 (1.7x behind — the HTTP dead-render path, see phx landing) |
-| phx landing (keepalive) | 457 µs | 215 µs | 2026-09-02, re-run, schedulers=1 (2.1x). Callgrind attribution of the native request: Phoenix app 62% (render 20%, session cookie 16%, CSRF 12% — `Base.encode64url` alone 12.8% self), Bandit transport ~13% (adapter header work, date header, `String.downcase` on header tokens; parsing via native decode_packet is <1%), bench client 21%, runtime: minor GC 12.6%, zeroed 64 KiB recv buffers (calloc) 11% |
+| phx landing (keepalive) | 457 µs | 215 µs | 2026-09-02, re-run, schedulers=1 (2.1x). Callgrind attribution of the native request: `Base.url_encode64` **37% inclusive** (6 calls/request: session cookie + CSRF token signing) — not the encoder itself but the `element(i, {4096 chars})` table literal being heap-ALLOCATED at each use (4097 words × 4 per 6 input bytes), which also drove most of the minor-GC share (12%); zeroed 64 KiB recv buffers 11%; Bandit transport ~13% (adapter header work; parsing is native decode_packet, <1%) |
+| phx landing (keepalive) | 431 µs | 215 µs | 2026-09-02, per-thread recv scratch (no 64 KiB calloc per read) |
+| phx landing (keepalive) | **194 µs** | 215 µs | 2026-09-03, **constant tuples/lists/floats compile to static terms** (codegen) — the Base table literal is built once at link time. 2.2x faster; **mana 1.1x ahead of BEAM**. `Base.url_encode64` 200 B: 152 → 1.7 µs (BEAM 1.05) |
+| phx landing (new conn) | **300 µs** | 401 µs | 2026-09-03, same — mana 1.3x ahead |
+| lv event roundtrip (keepalive) | **35 µs** | 62 µs | 2026-09-03, same — mana 1.8x ahead (fair client, schedulers=1) |
+| lv mount+join (new conn) | **888 µs** | 1040 µs | 2026-09-03, same — mana 1.2x ahead (was 1.7x behind) |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction
