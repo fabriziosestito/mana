@@ -134,6 +134,34 @@ compiler (`cc`).
   corosensei, rayon, blake3, regex, sha1/sha2/hmac, getrandom, dirs.
 - No `unsafe` outside `mana-rt` term decoding and the GEP helpers in codegen
   that already use it.
+- **What may be native (the BIF rule).** `mana-rt` implements BIFs only. The
+  test is: "on BEAM, is this function C (BIF/NIF) or is it Erlang/Elixir
+  code?"
+  1. BIF/NIF on BEAM (`erlang:*`, `binary:*`, `maps:*`, `unicode`, `re`,
+     `zlib`, `crypto`, `ets`, `os` nif stubs...) → native in `mana-rt` is
+     legitimate. This is parity, not a shortcut.
+  2. Erlang/Elixir code on BEAM (`Base`, `String`, `Enum`, `Keyword`, ...) →
+     stays compiled code here. If our compiled version is slow, that is a
+     **codegen shape problem**: fix the class (how such code is lowered), not
+     the instance. Never port a library function into the runtime for speed;
+     that path ends in maintaining a second stdlib with subtly different
+     semantics.
+  3. Compiler-gap exception: a native replacement is allowed when the source
+     uses a construct manac cannot compile yet (sub-byte bitstrings →
+     `Elixir.Float.round/ceil/floor`; ports → `Elixir.System.cmd`). Each
+     carries a `TODO(...)` naming the gap and is deleted when the gap closes.
+     Do not add new ones for anything that compiles today.
+  4. Opt-in native library code ships in a hex package via `Mana.Native`
+     (`hex/mana_json`), never swapped silently under the stdlib.
+- `TODO(native-bridge)`: a `Mana.Native` package today runs on the calling
+  process's scheduler thread and may only call process-context `mana_rt_*`
+  entry points. Packages that want their own Rust runtime (a tokio reactor, a
+  thread pool, a native server owning sockets) need a runtime bridge that does
+  not exist yet: foreign-thread message injection into a pid, spawning a
+  process from outside a scheduler, and parking/waking a process on an
+  arbitrary fd or event. Design it as a small set of `mana_rt_native_*`
+  exports over the existing reactor/timer patterns (`SegQueue` + scheduler
+  wake at the loop-top safepoint; eternal or shared-space terms only).
 
 ## Commits
 
