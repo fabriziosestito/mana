@@ -85,6 +85,7 @@ const KIND_FLOAT: u64 = 1;
 const KIND_FUN: u64 = 2;
 const KIND_MAP: u64 = 4;
 const KIND_BIN: u64 = 5;
+const KIND_SUBBIN: u64 = 13;
 
 /// ctx word offsets (ProcCtx contract).
 const CTX_ROOTS: u64 = 2;
@@ -3222,6 +3223,23 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         f: FunctionValue<'ctx>,
         subject: IntValue<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
+        let (parent, poff) = self.bin_parent_off(f, subject)?;
+        let pdata = self
+            .builder
+            .build_int_add(parent, self.i64t.const_int(8, false), "bba.pd")
+            .map_err(be)?;
+        self.builder.build_int_add(pdata, poff, "bba.base").map_err(be)
+    }
+
+    /// (root binary term, byte offset into it) for a preflighted binary
+    /// subject: the subject itself with offset 0 for a plain KIND_BIN, or
+    /// the view's parent + stored offset for a KIND_SUBBIN. Inline branch
+    /// on the view bit (kinds 5/13 differ only in bit 3).
+    fn bin_parent_off(
+        &self,
+        f: FunctionValue<'ctx>,
+        subject: IntValue<'ctx>,
+    ) -> CgResult<(IntValue<'ctx>, IntValue<'ctx>)> {
         let sp = self
             .builder
             .build_int_to_ptr(subject, self.ptrt, "bba.p")
@@ -3247,11 +3265,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let cur = self.builder.get_insert_block().unwrap();
         let view_bb = self.ctx.append_basic_block(f, "bba.view");
         let merge = self.ctx.append_basic_block(f, "bba.merge");
-        // plain bin: data starts one word past the header
-        let plain = self
-            .builder
-            .build_int_add(subject, self.i64t.const_int(8, false), "bba.plain")
-            .map_err(be)?;
         self.builder
             .build_conditional_branch(is_view, view_bb, merge)
             .map_err(be)?;
@@ -3276,17 +3289,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_load(self.i64t, off_gep, "bba.off")
             .map_err(be)?
             .into_int_value();
-        let pdata = self
-            .builder
-            .build_int_add(parent, self.i64t.const_int(8, false), "bba.pd")
-            .map_err(be)?;
-        let viewed = self.builder.build_int_add(pdata, poff, "bba.va").map_err(be)?;
         let view_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge).map_err(be)?;
         self.builder.position_at_end(merge);
-        let phi = self.builder.build_phi(self.i64t, "bba.base").map_err(be)?;
-        phi.add_incoming(&[(&plain, cur), (&viewed, view_end)]);
-        Ok(phi.as_basic_value().into_int_value())
+        let pphi = self.builder.build_phi(self.i64t, "bba.parent").map_err(be)?;
+        pphi.add_incoming(&[(&subject, cur), (&parent, view_end)]);
+        let ophi = self.builder.build_phi(self.i64t, "bba.poff").map_err(be)?;
+        let zero = self.i64t.const_zero();
+        ophi.add_incoming(&[(&zero, cur), (&poff, view_end)]);
+        Ok((
+            pphi.as_basic_value().into_int_value(),
+            ophi.as_basic_value().into_int_value(),
+        ))
     }
 
     fn kind_test(
@@ -4285,6 +4299,50 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     off = self.builder.build_int_add(off, nbytes, "boff").map_err(be)?;
                 }
                 SegKind::Bin { size } => {
+                    // `rest::binary` after a static prefix (the string-walk
+                    // shape <<c, rest::binary>>): build the zero-copy view
+                    // inline — 3 words, no runtime call, no byte copy. The
+                    // preflight already proved len >= off. Allocate first,
+                    // then re-read the subject: the alloc may GC and move it.
+                    if matches!(size, SegSize::All) && prefix_static && slot.is_some() {
+                        let vp = self.alloc_words(3)?;
+                        let subject = self.reload(slot.unwrap())?;
+                        let sp = self
+                            .builder
+                            .build_int_to_ptr(subject, self.ptrt, "brv.p")
+                            .map_err(be)?;
+                        let header = self
+                            .builder
+                            .build_load(self.i64t, sp, "brv.h")
+                            .map_err(be)?
+                            .into_int_value();
+                        let total = self
+                            .builder
+                            .build_right_shift(header, self.i64t.const_int(8, false), false, "brv.tot")
+                            .map_err(be)?;
+                        let len = self.builder.build_int_sub(total, off, "brv.len").map_err(be)?;
+                        let (parent, poff) = self.bin_parent_off(f, subject)?;
+                        let abs = self.builder.build_int_add(poff, off, "brv.abs").map_err(be)?;
+                        let hdr = self
+                            .builder
+                            .build_or(
+                                self.builder
+                                    .build_left_shift(len, self.i64t.const_int(8, false), "brv.l8")
+                                    .map_err(be)?,
+                                self.i64t.const_int(KIND_SUBBIN, false),
+                                "brv.hdr",
+                            )
+                            .map_err(be)?;
+                        self.store_word(vp, 0, hdr)?;
+                        self.store_word(vp, 1, parent)?;
+                        self.store_word(vp, 2, abs)?;
+                        let v = self
+                            .builder
+                            .build_ptr_to_int(vp, self.i64t, "brv")
+                            .map_err(be)?;
+                        self.match_pattern(f, v, &seg.value, scope, fail)?;
+                        continue;
+                    }
                     let len: IntValue<'ctx> = match size {
                         SegSize::All => self.i64t.const_int(u64::MAX, false), // -1
                         _ => self.seg_bytes(f, size, scope, Some(fail))?,
