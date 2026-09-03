@@ -1485,8 +1485,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
                 ("os", "system_time", 1) => ("mana_rt_system_time", 0, &[]),
                 ("os", "getenv", 1) => ("mana_rt_os_getenv", 0, &[]),
+                // Compiler-gap overrides (AGENTS.md "BIF rule" #3) — Elixir
+                // library code we cannot compile yet. Delete each when its
+                // gap closes; never add one for code that compiles today.
+                // TODO(port): System.cmd is built on Erlang ports.
                 ("Elixir.System", "cmd", 2) => ("mana_rt_system_cmd", 0, &[NIL_C]),
                 ("Elixir.System", "cmd", 3) => ("mana_rt_system_cmd", 0, &[]),
+                // TODO(bitstring): Float.round/ceil/floor decompose IEEE
+                // bits with sub-byte segments.
                 ("Elixir.Float", "round", 2) => ("mana_rt_float_prec", 0, &[0]),
                 ("Elixir.Float", "ceil", 2) => ("mana_rt_float_prec", 0, &[1]),
                 ("Elixir.Float", "floor", 2) => ("mana_rt_float_prec", 0, &[2]),
