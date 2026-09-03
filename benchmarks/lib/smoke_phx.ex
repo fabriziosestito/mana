@@ -47,8 +47,8 @@ defmodule Smoke.Phx do
   defp read_response(c, acc) do
     case :binary.split(acc, "\r\n\r\n") do
       [head, body] ->
-        [_, len] = Regex.run(~r/content-length: (\d+)/i, head)
-        read_body(c, body, String.to_integer(len))
+        # cheap client: the bench measures the server, not a regex per response
+        read_body(c, body, content_length(head))
 
       _ ->
         {:ok, chunk} = :gen_tcp.recv(c, 0, 5000)
@@ -61,5 +61,17 @@ defmodule Smoke.Phx do
   defp read_body(c, buf, len) do
     {:ok, more} = :gen_tcp.recv(c, len - byte_size(buf), 5000)
     read_body(c, buf <> more, len)
+  end
+
+  # content-length from a response head without a regex (cheap client)
+  defp content_length(head) do
+    head
+    |> String.split("\r\n")
+    |> Enum.find_value(0, fn line ->
+      case String.split(line, ": ", parts: 2) do
+        [k, v] -> if String.downcase(k) == "content-length", do: String.to_integer(v)
+        _ -> nil
+      end
+    end)
   end
 end
