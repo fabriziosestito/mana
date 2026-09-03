@@ -875,6 +875,88 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)
     }
 
+    /// A fully-constant term (literal, or tuple/cons/binary whose parts are
+    /// all constant) as an LLVM constant `i64`. Boxed constants become
+    /// content-addressed linkonce_odr globals like `static_binary`: built
+    /// once at link time, never allocated per evaluation, never copied by
+    /// the GC (only nursery pointers are forwarded; constants hold only
+    /// immediates and other constants, so majors have nothing to scan).
+    /// Motivating shape: Elixir's `Base` reads `element(i, {4096 chars})`
+    /// four times per 6 input bytes — allocating that tuple each time made
+    /// url_encode64 150x slower than BEAM. None: not constant.
+    fn const_term(&self, f: FunctionValue<'ctx>, e: &Expr) -> CgResult<Option<IntValue<'ctx>>> {
+        Ok(Some(match e {
+            Expr::Lit(Literal::Int(n)) => self.small_int(*n),
+            Expr::Lit(Literal::Nil) => self.nil(),
+            Expr::Lit(Literal::Atom(a)) => {
+                let g = self.atom_global(a);
+                g.as_pointer_value()
+                    .const_to_int(self.i64t)
+                    .const_add(self.i64t.const_int(TAG_ATOM, false)) // 8-aligned: add == or
+            }
+            Expr::Lit(Literal::Float(x)) => {
+                let header = self.i64t.const_int((1 << 8) | KIND_FLOAT, false);
+                let bits = self.i64t.const_int(x.to_bits(), false);
+                self.const_boxed("mana_flt", &[header, bits], 0)
+            }
+            Expr::Binary(segs) if binary_all_const(segs) => {
+                // compile_binary_construct returns the static term for an
+                // all-constant binary (no builder instructions emitted)
+                let mut scope = Scope::default();
+                self.compile_binary_construct(f, segs, &mut scope)?
+            }
+            Expr::Tuple(items) => {
+                let mut words = vec![self
+                    .i64t
+                    .const_int(((items.len() as u64) << 8) | KIND_TUPLE, false)];
+                for it in items {
+                    match self.const_term(f, it)? {
+                        Some(v) => words.push(v),
+                        None => return Ok(None),
+                    }
+                }
+                self.const_boxed("mana_tup", &words, 0)
+            }
+            Expr::Cons(h, t) => {
+                let (Some(hv), Some(tv)) = (self.const_term(f, h)?, self.const_term(f, t)?) else {
+                    return Ok(None);
+                };
+                self.const_boxed("mana_cons", &[hv, tv], TAG_CONS)
+            }
+            _ => return Ok(None),
+        }))
+    }
+
+    /// Emit `words` as a constant global and return its address (| tag).
+    /// Keyed by the words' printed form so equal constants share a symbol
+    /// within the module; linkonce_odr dedups across modules.
+    fn const_boxed(&self, prefix: &str, words: &[IntValue<'ctx>], tag: u64) -> IntValue<'ctx> {
+        let key: String = words
+            .iter()
+            .map(|w| inkwell::values::AnyValue::print_to_string(w).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sym = format!("{}.{}", prefix, &blake3::hash(key.as_bytes()).to_hex().as_str()[..16]);
+        let g = match self.module.get_global(&sym) {
+            Some(g) => g,
+            None => {
+                let init = self.i64t.const_array(words);
+                let g = self.module.add_global(init.get_type(), None, &sym);
+                g.set_initializer(&init);
+                g.set_constant(true);
+                g.set_alignment(8);
+                g.set_linkage(Linkage::LinkOnceODR);
+                g
+            }
+        };
+        let addr = g.as_pointer_value().const_to_int(self.i64t);
+        if tag == 0 {
+            addr
+        } else {
+            addr.const_add(self.i64t.const_int(tag, false)) // 8-aligned: add == or
+        }
+    }
+
     // ---- frames & slots ----
 
     /// Set up the root frame for the function whose entry block the builder
@@ -1842,6 +1924,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Expr::Var(v) => self.read_var(scope, v),
             Expr::Lit(l) => self.compile_literal(l),
             Expr::Tuple(items) => {
+                if let Some(c) = self.const_term(f, e)? {
+                    return Ok(c);
+                }
                 let refs: Vec<&Expr> = items.iter().collect();
                 let slots = self.eval_all_rooted(f, &refs, scope)?;
                 let p = self.alloc_words(1 + slots.len() as u64)?;
@@ -1858,6 +1943,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)
             }
             Expr::Cons(h, t) => {
+                if let Some(c) = self.const_term(f, e)? {
+                    return Ok(c);
+                }
                 let slots = self.eval_all_rooted(f, &[h.as_ref(), t.as_ref()], scope)?;
                 let p = self.alloc_words_kind(2, true)?;
                 for (i, s) in slots.iter().enumerate() {
