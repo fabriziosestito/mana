@@ -614,7 +614,17 @@ fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64>) {
                 continue;
             }
         }
-        *p.state.lock() = PState::Running;
+        {
+            // a pid can sit in the run queue more than once (woken, ran,
+            // parked again, woken again before the stale entry drained);
+            // resuming a Waiting coroutine would make its park return
+            // spuriously. Only Runnable entries run.
+            let mut st = p.state.lock();
+            if *st != PState::Runnable {
+                continue;
+            }
+            *st = PState::Running;
+        }
         ctx.roots_head = p.saved_roots;
         ctx.exc_class = p.saved_exc_class;
         ctx.exc_reason = p.saved_exc_reason;
@@ -6556,7 +6566,18 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
                     return 1;
                 }
             }
-            *p.state.lock() = PState::Waiting(deadline);
+            // publish Waiting, THEN re-check ingress: a sender on another
+            // scheduler pushes to ingress before it reads our state. If it
+            // pushed between our drain above and this store, it saw Running
+            // and did not wake us — re-checking here closes that window.
+            {
+                let mut st = p.state.lock();
+                *st = PState::Waiting(deadline);
+                if !p.ingress.is_empty() {
+                    *st = PState::Running;
+                    continue;
+                }
+            }
         }
         suspend_current(ctx);
     }
@@ -7557,6 +7578,18 @@ pub extern "C" fn mana_rt_subtract(ctx: *mut ProcCtx, left: u64, right: u64) -> 
 /// Canonical key order: term order, with exactness tiebreak so that keys
 /// like 1 and 1.0 remain distinct (int sorts before float).
 fn map_key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
+    if a == b {
+        return std::cmp::Ordering::Equal;
+    }
+    // binary keys (params, headers, JSON maps) dominate lookups on the web
+    // path: compare bytes directly — Erlang orders binaries by bytes, and
+    // byte-equal binaries are exactly equal, so no rank/exactness passes
+    if let (Some((pa, la)), Some((pb, lb))) = (bin_parts(a), bin_parts(b)) {
+        let (x, y) = unsafe {
+            (std::slice::from_raw_parts(pa, la), std::slice::from_raw_parts(pb, lb))
+        };
+        return x.cmp(y);
+    }
     let c = mana_rt_compare(a, b);
     if c != 0 {
         return c.cmp(&0);
@@ -7603,7 +7636,10 @@ fn map_index(p: *const u64, n: usize, key: u64) -> Result<usize, usize> {
     // fields, changesets) a raw-u64 scan resolves the hit without any
     // generic compares. Misses (and boxed keys) fall to binary search,
     // which also supplies the insertion position for put.
-    if n <= 16 {
+    // Plug.Conn / Phoenix.Socket structs have 30-40 fields: a linear
+    // identity scan over 64 words is still cheaper than ~6 generic
+    // compares (atoms compare by TEXT in the generic path)
+    if n <= 64 {
         if let Some(i) = keys.iter().position(|&k| k == key) {
             return Ok(i);
         }
@@ -7858,10 +7894,25 @@ pub extern "C" fn mana_rt_map_update_exact(ctx: *mut ProcCtx, key: u64, val: u64
     let Some((p, n)) = map_parts(m) else {
         return raise_map_err(ctxr, true, m);
     };
-    if map_index(p, n, key).is_err() {
+    let Ok(i) = map_index(p, n, key) else {
         return raise_map_err(ctxr, false, key);
+    };
+    // the key exists: copy the map once and patch the value slot (no
+    // second key search, no insertion path) — this is `%{struct | f: v}`,
+    // ~70 times per Phoenix request on Plug.Conn
+    let saved = ctxr.roots_head;
+    let mut fr = [0u64, 2, val, m];
+    fr[0] = saved;
+    ctxr.roots_head = fr.as_ptr() as u64;
+    let newp = alloc_nursery(ctxr, 1 + 2 * n);
+    ctxr.roots_head = saved;
+    let (val, m) = (fr[2], fr[3]);
+    let (p, _) = map_parts(m).unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(p, newp, 1 + 2 * n);
+        *newp.add(1 + n + i) = val;
     }
-    mana_rt_map_put(ctx, key, val, m)
+    newp as u64
 }
 
 /// maps:is_key/2 → true/false atoms (badmap on non-map).
@@ -10007,6 +10058,25 @@ fn pattern_bins(pat: u64) -> Result<Vec<&'static [u8]>, ()> {
 
 /// Leftmost match at or after `from`; longest pattern wins ties.
 fn bin_search(hay: &[u8], pats: &[&[u8]], from: usize) -> Option<(usize, usize)> {
+    // longest match at the leftmost position (BEAM's binary:match rule).
+    // Single pattern: scan for its first byte, then one slice compare — the
+    // per-position starts_with loop was ~15% of a Phoenix request across
+    // binary:split/match on header lines.
+    if let [p] = pats {
+        if p.is_empty() {
+            return None;
+        }
+        let mut i = from;
+        while i + p.len() <= hay.len() {
+            let Some(k) = hay[i..].iter().position(|&b| b == p[0]) else { return None };
+            i += k;
+            if hay[i..].starts_with(p) {
+                return Some((i, p.len()));
+            }
+            i += 1;
+        }
+        return None;
+    }
     for i in from..hay.len() {
         let mut best = 0usize;
         for p in pats {
@@ -11675,7 +11745,14 @@ fn module_is_compiled(m: u64) -> bool {
     if m & TAG_MASK == TAG_ATOM && is_cut_module(atom_bytes(m)) {
         return true;
     }
-    export_table().keys().any(|&(em, _, _)| em == m)
+    // set of module atoms with at least one export, built once: this is on
+    // the code:ensure_loaded / function_exported? path that Plug and Phoenix
+    // hit per request, and scanning the whole export table each call cost
+    // ~4% of a request.
+    static MODULES: std::sync::OnceLock<rustc_hash::FxHashSet<u64>> = std::sync::OnceLock::new();
+    MODULES
+        .get_or_init(|| export_table().keys().map(|&(em, _, _)| em).collect())
+        .contains(&m)
 }
 
 /// Modules the compiler implements natively (BIF cuts) or compiles as
