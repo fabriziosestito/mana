@@ -26,7 +26,7 @@ Design pillars (do not violate them casually):
   distribution. Whole-program knowledge at compile time is the intended
   performance advantage over BEAM.
 - **Erlang semantics still apply** where implemented: per-process heaps
-  (future GC), guaranteed tail calls (in progress), pattern-match fall-through
+  (future GC), guaranteed tail calls (uniform tailcc ABI), pattern-match fall-through
   to `match_fail`, immutable terms.
 
 ## Layout
@@ -398,11 +398,19 @@ When asked to open a PR:
   emit code that mutates an existing heap term's fields** after
   construction. Change any of this only in lockstep across both crates, and
   run the GC stress program (`Conf.Gc`). `MANA_GC_LOG=1` prints collections.
-- **Tail calls are hints, not guarantees.** Calls in tail position get the
-  LLVM `tail` marker under the C calling convention. Deep non-self recursion
-  can still overflow the stack. The planned fix is `tailcc` + `musttail`
-  with a uniform signature — don't ship code that relies on unbounded
-  mutual recursion until then.
+- **Tail calls are guaranteed** (uniform ABI). Every compiled function has
+  the same LLVM prototype, `tailcc i64 f(ctx, x0..x4)` — the six x86-64
+  integer registers, never a stack parameter — and calls in tail position
+  are `musttail`. Arity > 5 passes the rest through `ProcCtx.argv_spill`
+  (word 6), written right before the call and read by the callee prologue
+  before anything else. Pointers that escape to the runtime are C wrappers
+  (`<sym>.c`); the export table carries {c_code, fun_code}; the runtime
+  enters fun bodies through the codegen trampoline `mana_call_fun`. Keep
+  every one of these in lockstep: a C-convention pointer called as tailcc
+  (or the reverse) mismatches callee-pop and jumps into garbage. Do not
+  give a compiled function a stack parameter: tailcc callee-cleanup plus a
+  growing musttail chain, and the x86 backend's bare `jmp` for a constant
+  stack argument, were both real crashes here.
 - **Small ints don't overflow-check.** Arithmetic wraps within the tagged
   range (`TODO(bignum)`). Don't use compiled output for correctness claims
   near ±2^60.

@@ -37,7 +37,7 @@
 //! static, never collected). Closures are lambda-lifted in closure-passing
 //! style: lifted signature `(ctx, args..., closure)`.
 //!
-//! TODO(lco): tailcc + musttail for guaranteed cross-function tail calls.
+//! Tail calls are guaranteed: uniform `tailcc` prototype + `musttail` (see NREG).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -51,6 +51,7 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{BasicMetadataTypeEnum, FunctionType, IntType, PointerType};
+use inkwell::values::LLVMTailCallKind;
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, CallSiteValue, FunctionValue, GlobalValue,
     InstructionValue, IntValue, PointerValue, ValueKind,
@@ -92,6 +93,20 @@ const CTX_ROOTS: u64 = 2;
 const CTX_EXC_CLASS: u64 = 3;
 const CTX_EXC_REASON: u64 = 4;
 const CTX_REDUCTIONS: u64 = 5;
+/// word 6: pointer to the per-scheduler argument spill area (uniform ABI)
+const CTX_ARGV_SPILL: u64 = 6;
+/// Uniform compiled-function signature: `ctx` + NREG term words, and NREG
+/// is chosen so that EVERY parameter is register-passed on x86-64 SysV (6
+/// integer registers: ctx + 5). Every compiled function has exactly this
+/// LLVM prototype, so a `musttail` never needs stack argument space at
+/// all — which sidesteps both tailcc pitfalls we hit: (1) callee-cleanup
+/// popping more than a C entry reserved when the chain grows, and (2) the
+/// x86 backend emitting a bare `jmp` without storing a constant stack
+/// argument (`c5(a,b,c,d,e) -> a6(a,b,c,d,e,[])` compiled to `jmp a6`).
+/// Arity > NREG passes args NREG-1.. through the ctx spill area, written
+/// by the caller right before the call and read by the callee prologue
+/// before anything else runs.
+const NREG: usize = 5;
 /// Reserved non-term word (tag 0b101): "an exception is unwinding".
 const EXC_SENTINEL: u64 = 0b101;
 
@@ -632,11 +647,166 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// `(ctx, term × arity) -> term`
-    fn term_fn_type(&self, arity: usize) -> FunctionType<'ctx> {
+    /// Named compiled functions use LLVM's `tailcc`: with the C convention a
+    /// callee taking >6 integer args gets stack-passed arguments, and a
+    /// `tail` hint on such a call is NOT honored — the call stays a real
+    /// call and a self-recursive server loop (gen_server:loop/7) grows the
+    /// coroutine stack by one frame per iteration until it faults. `tailcc`
+    /// guarantees `musttail` regardless of arity. Pointers that escape to
+    /// the runtime (exports table, program entry) go through `ccc_wrapper`.
+    const TAILCC: u32 = 18; // LLVMCallConv: tailcc
+
+    fn declare_compiled(&self, sym: &str, arity: usize) -> FunctionValue<'ctx> {
+        let f = self.module.add_function(sym, self.term_fn_type(arity), None);
+        f.set_call_conventions(Self::TAILCC);
+        f
+    }
+
+    /// Emit a `tailcc` call to a named compiled function. `tail` = the call
+    /// is in tail position, immediately before `ret`: `musttail` when the
+    /// caller is `tailcc` too (LLVM requires matching conventions); a
+    /// `tail` hint otherwise (lifted fun bodies stay `ccc`, see TODO(lco-funs)).
+    fn call_compiled(
+        &self,
+        callee: FunctionValue<'ctx>,
+        args: &[BasicMetadataValueEnum<'ctx>],
+        name: &str,
+        tail: bool,
+    ) -> CgResult<CallSiteValue<'ctx>> {
+        let packed = self.pack_args(args)?;
+        let call = self.builder.build_call(callee, &packed, name).map_err(be)?;
+        call.set_call_convention(Self::TAILCC);
+        if tail {
+            self.mark_tail(call);
+        }
+        Ok(call)
+    }
+
+    /// `musttail` if the current function shares the callee's convention,
+    /// else the best-effort `tail` hint.
+    fn mark_tail(&self, call: CallSiteValue<'ctx>) {
+        let caller_cc = self
+            .builder
+            .get_insert_block()
+            .and_then(|b| b.get_parent())
+            .map(|f| f.get_call_conventions())
+            .unwrap_or(0);
+        if caller_cc == call.get_call_convention() {
+            call.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindMustTail);
+        } else {
+            call.set_tail_call(true);
+        }
+    }
+
+    /// A C-ABI entry for a `tailcc` function: the runtime calls compiled code
+    /// through function pointers (mana_exports, spawn, apply) with `extern "C"`.
+    /// The runtime's C-ABI view of a compiled function: `extern "C" fn(ctx,
+    /// a0..a{arity-1})` with the natural C prototype (call_dynamic
+    /// transmutes to exactly that), forwarding into the uniform tailcc body.
+    fn ccc_wrapper(&self, target: FunctionValue<'ctx>, arity: usize) -> FunctionValue<'ctx> {
+        let sym = format!("{}.c", target.get_name().to_string_lossy());
+        if let Some(w) = self.module.get_function(&sym) {
+            return w;
+        }
+        let w = self.module.add_function(&sym, self.c_fn_type(arity), None);
+        w.set_linkage(Linkage::LinkOnceODR);
+        let saved = self.builder.get_insert_block();
+        let bb = self.ctx.append_basic_block(w, "entry");
+        self.builder.position_at_end(bb);
+        let argv: Vec<BasicMetadataValueEnum> =
+            (0..=arity).map(|i| w.get_nth_param(i as u32).unwrap().into()).collect();
+        let packed = self.pack_args(&argv).unwrap();
+        let call = self.builder.build_call(target, &packed, "fwd").unwrap();
+        call.set_call_convention(Self::TAILCC);
+        let v = call_result(call).unwrap();
+        self.builder.build_return(Some(&v)).unwrap();
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+        w
+    }
+
+    /// The natural C prototype `i64 (ptr ctx, i64 x arity)`: runtime BIFs
+    /// and Mana.Native package symbols are `extern "C"` and keep it.
+    fn c_fn_type(&self, arity: usize) -> FunctionType<'ctx> {
         let mut params: Vec<BasicMetadataTypeEnum> =
             vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
         params.extend((0..arity).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
         self.i64t.fn_type(&params, false)
+    }
+
+    /// The uniform prototype (see NREG). `_arity` is kept for call-site
+    /// documentation; the type no longer depends on it.
+    fn term_fn_type(&self, _arity: usize) -> FunctionType<'ctx> {
+        let mut params: Vec<BasicMetadataTypeEnum> =
+            vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
+        params.extend((0..NREG).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
+        self.i64t.fn_type(&params, false)
+    }
+
+    /// Pack `ctx + args` into the uniform call vector: the first NREG-1
+    /// args ride in registers; when there are more, the last register slot
+    /// carries nothing and args NREG-1.. go to the ctx spill area (a
+    /// per-scheduler scratch consumed by the callee prologue before any
+    /// other code runs, so no GC point and no re-entrancy can intervene).
+    fn pack_args(
+        &self,
+        argv: &[BasicMetadataValueEnum<'ctx>],
+    ) -> CgResult<Vec<BasicMetadataValueEnum<'ctx>>> {
+        let nargs = argv.len() - 1;
+        let undef: BasicMetadataValueEnum = self.i64t.get_undef().into();
+        let mut out: Vec<BasicMetadataValueEnum> = Vec::with_capacity(1 + NREG);
+        out.push(argv[0]);
+        if nargs <= NREG {
+            out.extend_from_slice(&argv[1..]);
+            while out.len() < 1 + NREG {
+                out.push(undef);
+            }
+            return Ok(out);
+        }
+        out.extend_from_slice(&argv[1..NREG]); // args 0..NREG-2 in registers
+        let ctx = argv[0].into_pointer_value();
+        let spill = self.mem_load(ctx, CTX_ARGV_SPILL, MemKind::Ctx)?;
+        let sp = self
+            .builder
+            .build_int_to_ptr(spill, self.ptrt, "spill")
+            .map_err(be)?;
+        for (i, a) in argv[NREG..].iter().enumerate() {
+            let gep = unsafe {
+                self.builder
+                    .build_in_bounds_gep(self.i64t, sp, &[self.i64t.const_int(i as u64, false)], "spill.g")
+                    .map_err(be)?
+            };
+            self.builder.build_store(gep, a.into_int_value()).map_err(be)?;
+        }
+        out.push(undef);
+        Ok(out)
+    }
+
+    /// Prologue counterpart of `pack_args`: the value of the callee's
+    /// `i`-th argument (0-based) given its total arg count. MUST be called
+    /// at function entry before any call or allocation.
+    fn param_at(&self, f: FunctionValue<'ctx>, i: usize, nargs: usize) -> CgResult<IntValue<'ctx>> {
+        if nargs <= NREG || i < NREG - 1 {
+            return Ok(f.get_nth_param(1 + i as u32).unwrap().into_int_value());
+        }
+        let ctx = f.get_nth_param(0).unwrap().into_pointer_value();
+        let spill = self.mem_load(ctx, CTX_ARGV_SPILL, MemKind::Ctx)?;
+        let sp = self
+            .builder
+            .build_int_to_ptr(spill, self.ptrt, "spill")
+            .map_err(be)?;
+        let k = (i - (NREG - 1)) as u64;
+        let gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(self.i64t, sp, &[self.i64t.const_int(k, false)], "spill.g")
+                .map_err(be)?
+        };
+        Ok(self
+            .builder
+            .build_load(self.i64t, gep, "spill.arg")
+            .map_err(be)?
+            .into_int_value())
     }
 
     fn ctx_val(&self) -> PointerValue<'ctx> {
@@ -1386,11 +1556,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             if !include.contains(fname) {
                 continue;
             }
-            let f = self.module.add_function(
-                &mangle(&self.module_name, fname),
-                self.term_fn_type(fun.params.len()),
-                None,
-            );
+            let f = self.declare_compiled(&mangle(&self.module_name, fname), fun.params.len());
             self.fns.borrow_mut().insert(fname.clone(), f);
             if exported.contains(fname) && fname.name != "module_info" {
                 self.exports.borrow_mut().push((fname.clone(), f));
@@ -1591,13 +1757,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.cur_frame.set(None); // frameless: single forwarding call
         if plan.0.is_empty() {
             // identity (compile_pattern: patterns are plain binaries here)
-            let v = f.get_nth_param(1).unwrap().into_int_value();
+            let v = self.param_at(f, 0, fname.arity)?;
             self.builder.build_return(Some(&v)).map_err(be)?;
             return Ok(true);
         }
         let mut cargs: Vec<BasicMetadataValueEnum> = vec![self.ctx_val().into()];
         for i in 0..fname.arity - plan.1 {
-            cargs.push(f.get_nth_param(1 + i as u32).unwrap().into_int_value().into());
+            cargs.push(self.param_at(f, i, fname.arity)?.into());
         }
         for &c in plan.2 {
             cargs.push(self.i64t.const_int(c, false).into());
@@ -1624,10 +1790,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .set(Some(f.get_nth_param(0).unwrap().into_pointer_value()));
         self.handlers.borrow_mut().clear();
         self.propagate_bb.set(None);
+        // args first (the spill area is only valid until the next call)
+        let n = fun.params.len();
+        let vals: Vec<IntValue> = (0..n).map(|i| self.param_at(f, i, n)).collect::<CgResult<_>>()?;
         self.setup_frame(&fun.body, &fun.params, &[])?;
         let mut scope = Scope::default();
         for (i, p) in fun.params.iter().enumerate() {
-            let v = f.get_nth_param(1 + i as u32).unwrap().into_int_value();
+            let v = vals[i];
             v.set_name(p);
             self.bind_var(&mut scope, p, v)?;
         }
@@ -1712,18 +1881,19 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 var_names.push(closure_slot_name.clone());
             }
             let sib_names: Vec<FunName> = l.sibs.iter().map(|(n, _)| n.clone()).collect();
+            // args (incl. the trailing closure) first: the spill area is only
+            // valid until the next call
+            let n = l.params.len() + 1;
+            let vals: Vec<IntValue> = (0..n).map(|i| self.param_at(f, i, n)).collect::<CgResult<_>>()?;
             self.setup_frame(&l.body, &var_names, &sib_names)?;
 
             let mut scope = Scope::default();
             for (i, p) in l.params.iter().enumerate() {
-                let v = f.get_nth_param(1 + i as u32).unwrap().into_int_value();
+                let v = vals[i];
                 v.set_name(p);
                 self.bind_var(&mut scope, p, v)?;
             }
-            let closure = f
-                .get_nth_param(1 + l.params.len() as u32)
-                .unwrap()
-                .into_int_value();
+            let closure = vals[l.params.len()];
             closure.set_name("closure");
             if !l.captures.is_empty() {
                 // loads happen before any GC point (entry, no allocs yet)
@@ -1758,7 +1928,45 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
+    /// `mana_call_fun(ctx, x0..x5, code) -> term`: the runtime's C-ABI door
+    /// into fun bodies, which are `tailcc` with the uniform prototype (the
+    /// runtime cannot call tailcc code directly: callee-pop vs caller-pop).
+    fn emit_call_fun_trampoline(&self) -> CgResult<()> {
+        let mut params: Vec<BasicMetadataTypeEnum> =
+            vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
+        params.extend((0..NREG).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
+        params.push(BasicMetadataTypeEnum::PointerType(self.ptrt)); // code
+        let t = self.module.add_function("mana_call_fun", self.i64t.fn_type(&params, false), None);
+        let bb = self.ctx.append_basic_block(t, "entry");
+        self.builder.position_at_end(bb);
+        let argv: Vec<BasicMetadataValueEnum> =
+            (0..=NREG).map(|i| t.get_nth_param(i as u32).unwrap().into()).collect();
+        let code = t.get_nth_param(1 + NREG as u32).unwrap().into_pointer_value();
+        let call = self
+            .builder
+            .build_indirect_call(self.term_fn_type(0), code, &argv, "fun")
+            .map_err(be)?;
+        call.set_call_convention(Self::TAILCC);
+        let v = call_result(call)?;
+        self.builder.build_return(Some(&v)).map_err(be)?;
+        Ok(())
+    }
+
     fn emit_main(&self, entry: &FunName) -> CgResult<()> {
+        self.emit_call_fun_trampoline()?;
+        // make_fun/3 of an uncompiled function: a uniform tailcc body that
+        // raises undef when the fun is applied
+        let undef = self.declare_compiled("mana_fun_undef", 0);
+        {
+            let bb = self.ctx.append_basic_block(undef, "entry");
+            self.builder.position_at_end(bb);
+            let ctx = undef.get_nth_param(0).unwrap().into_pointer_value();
+            let class = self.atom_term("error")?;
+            let reason = self.atom_term("undef")?;
+            self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
+            self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
+            self.builder.build_return(Some(&self.sentinel())).map_err(be)?;
+        }
         let i32t = self.ctx.i32_type();
         let main = self
             .module
@@ -1796,6 +2004,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
 
         let target = self.fns.borrow()[entry];
+        let target = self.ccc_wrapper(target, 0);
         let entry_ptr = target.as_global_value().as_pointer_value();
         let call = self
             .builder
@@ -1881,7 +2090,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 // the sentinel propagates through the returned value —
                 // tail calls need no exception check
                 let (call, _) = self.compile_apply(f, target, args, scope, true)?;
-                call.set_tail_call(true);
+                // every compiled callee (named, lift, shim, fun object) has
+                // the uniform tailcc prototype: guaranteed tail call
+                self.mark_tail(call);
                 let v = call_result(call)?;
                 self.builder.build_return(Some(&v)).map_err(be)?;
                 Ok(())
@@ -1897,8 +2108,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let callee = self.remote_fn(module, name, args.len());
                 let argv = self.eval_args(f, args, scope)?;
                 self.pop_frame()?;
-                let call = self.builder.build_call(callee, &argv, "tail").map_err(be)?;
-                call.set_tail_call(true);
+                let call = self.call_compiled(callee, &argv, "tail", true)?;
                 let v = call_result(call)?;
                 self.builder.build_return(Some(&v)).map_err(be)?;
                 Ok(())
@@ -2054,7 +2264,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 if let Some(nf) = native_fn(module, name, args.len()) {
                     // external native module: lower to a direct call to the
                     // package's linked symbol (ctx, args...) -> term
-                    let callee = self.rt_fn(&nf.symbol, || self.term_fn_type(args.len()));
+                    let callee = self.rt_fn(&nf.symbol, || self.c_fn_type(args.len()));
                     let argv = self.eval_args(f, args, scope)?;
                     let call = self
                         .builder
@@ -2080,7 +2290,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         },
                     ));
                     let argv = self.eval_args(f, args, scope)?;
-                    let call = self.builder.build_call(callee, &argv, "call").map_err(be)?;
+                    let call = self.call_compiled(callee, &argv, "call", false)?;
                     let v = call_result(call)?.into_int_value();
                     if may_raise {
                         self.check_exc(f, v)
@@ -2478,7 +2688,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     if tail {
                         self.pop_frame()?;
                     }
-                    let call = self.builder.build_call(lf, &argv, "call").map_err(be)?;
+                    let call = self.call_compiled(lf, &argv, "call", tail)?;
                     Ok((call, true)) // letrec bodies: conservatively may raise
                 } else {
                     let callee = self.local_fn(fname)?;
@@ -2489,13 +2699,19 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     if tail {
                         self.pop_frame()?;
                     }
-                    let call = self.builder.build_call(callee, &argv, "call").map_err(be)?;
+                    let call = self.call_compiled(callee, &argv, "call", false)?;
                     Ok((call, may_raise))
                 }
             }
             ApplyTarget::Var(v) => {
                 let argv = self.eval_args(f, args, scope)?;
                 let fun_val = self.read_var(scope, v)?;
+                // a musttail releases this frame before the callee runs:
+                // the root frame must be unlinked first (like the LocalFun
+                // arms above), else the callee's GC walks a dead alloca
+                if tail {
+                    self.pop_frame()?;
+                }
                 let call = self.compile_apply_value(f, fun_val, &argv, args.len(), tail)?;
                 Ok((call, true))
             }
@@ -2563,12 +2779,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
         let mut full_args = argv.to_vec();
         full_args.push(fun_val.into());
+        let packed = self.pack_args(&full_args)?;
+        let call = self
+            .builder
+            .build_indirect_call(self.term_fn_type(nargs + 1), code_ptr, &packed, "apply")
+            .map_err(be)?;
+        // fun bodies (lifts, shims) are tailcc with the uniform prototype
+        call.set_call_convention(Self::TAILCC);
         if tail {
-            self.pop_frame()?;
+            self.mark_tail(call);
         }
-        self.builder
-            .build_indirect_call(self.term_fn_type(nargs + 1), code_ptr, &full_args, "apply")
-            .map_err(be)
+        Ok(call)
     }
 
     /// `[header | code | captures...]`, boxed (tag 000). Allocates first,
@@ -2643,9 +2864,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             n,
             sanitize(hint)
         );
-        let f = self
-            .module
-            .add_function(&name, self.term_fn_type(arity + 1), None);
+        let f = self.declare_compiled(&name, arity + 1);
         f.set_linkage(Linkage::Internal);
         let mut lifted = self.lifted.borrow_mut();
         lifted.push(f);
@@ -2721,9 +2940,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             && !is_bif_module(target_mod)
             && self.missing_modules.borrow().contains(target_mod)
         {
-            let shim = self
-                .module
-                .add_function(&sym, self.term_fn_type(fname.arity + 1), None);
+            let shim = self.declare_compiled(&sym, fname.arity + 1);
             shim.set_linkage(Linkage::LinkOnceODR);
             let saved_bb = self.builder.get_insert_block();
             let msg = format!(
@@ -2736,9 +2953,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             return Ok(shim);
         }
-        let shim = self
-            .module
-            .add_function(&sym, self.term_fn_type(fname.arity + 1), None);
+        let shim = self.declare_compiled(&sym, fname.arity + 1);
         shim.set_linkage(Linkage::LinkOnceODR);
 
         // BIF-module targets have no symbol to forward to: give the shim a
@@ -2770,8 +2985,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.propagate_bb.set(None);
             self.setup_frame(&body, &params, &[])?;
             let mut scope = Scope::default();
+            // shim signature is `args + closure` (arity + 1 terms)
             for (i, p) in params.iter().enumerate() {
-                let v = shim.get_nth_param(1 + i as u32).unwrap().into_int_value();
+                let v = self.param_at(shim, i, fname.arity + 1)?;
                 self.bind_var(&mut scope, p, v)?;
             }
             let r = self.compile_tail(shim, &body, &mut scope);
@@ -2810,11 +3026,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let saved = self.builder.get_insert_block();
         let bb = self.ctx.append_basic_block(shim, "entry");
         self.builder.position_at_end(bb);
-        let argv: Vec<BasicMetadataValueEnum> = (0..=fname.arity)
-            .map(|i| shim.get_nth_param(i as u32).unwrap().into())
-            .collect(); // ctx + args, dropping the trailing closure param
-        let call = self.builder.build_call(target, &argv, "fwd").map_err(be)?;
-        call.set_tail_call(true);
+        // ctx + args, dropping the trailing closure param (shim arity+1)
+        let mut argv: Vec<BasicMetadataValueEnum> = vec![shim.get_nth_param(0).unwrap().into()];
+        for i in 0..fname.arity {
+            argv.push(self.param_at(shim, i, fname.arity + 1)?.into());
+        }
+        let call = self.call_compiled(target, &argv, "fwd", true)?;
         let v = call_result(call)?;
         self.builder.build_return(Some(&v)).map_err(be)?;
         if let Some(bb) = saved {
@@ -8675,10 +8892,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 arity,
             },
         );
-        self.module.get_function(&sym).unwrap_or_else(|| {
-            self.module
-                .add_function(&sym, self.term_fn_type(arity), None)
-        })
+        self.module
+            .get_function(&sym)
+            .unwrap_or_else(|| self.declare_compiled(&sym, arity))
     }
 
     fn tag_of(&self, val: IntValue<'ctx>) -> CgResult<IntValue<'ctx>> {
@@ -8898,7 +9114,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         used.extend(behaviour_refs);
         // export table entries: {mod_atom, fun_atom, arity, code} in the
         // `mana_exports` section (raw pointers; the runtime tags them)
-        for (fname, code) in self.exports.borrow().iter() {
+        let export_list: Vec<(FunName, FunctionValue<'ctx>)> = self.exports.borrow().clone();
+        for (fname, code) in export_list.iter() {
+            let c_code = self.ccc_wrapper(*code, fname.arity);
+            // the closure-convention body make_fun/3 hands out (args ++ [fun])
+            let fun_code = self.fun_shim(None, fname).expect("fun shim for an export");
             let m = atoms
                 .get(self.module_name.as_str())
                 .expect("module atom exists")
@@ -8912,7 +9132,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     m.into(),
                     fa.into(),
                     self.i64t.const_int(fname.arity as u64, false).into(),
-                    code.as_global_value().as_pointer_value().into(),
+                    c_code.as_global_value().as_pointer_value().into(),
+                    fun_code.as_global_value().as_pointer_value().into(),
                 ],
                 false,
             );

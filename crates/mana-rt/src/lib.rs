@@ -125,6 +125,10 @@ const OLD_LIMIT_INIT: usize = 4 * OLD_CHUNK_WORDS;
 const STACK_BYTES: usize = 256 * 1024 * 1024; // lazy-commit reservation — TODO(stacks): growable
 const ROOT_STACK_BYTES: usize = 512 * 1024 * 1024; // lazy-commit reservation
 const REDUCTIONS_PER_SLICE: i64 = 4000;
+/// Uniform compiled ABI: `ctx + ABI_REGS` term words per call; arguments
+/// past ABI_REGS-1 travel through `ProcCtx::argv_spill` (see codegen NREG).
+const ABI_REGS: usize = 5;
+const ARGV_SPILL_WORDS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // memory primitives
@@ -223,7 +227,10 @@ struct Process {
     /// be young (local minors drain + scan).
     ingress: SegQueue<u64>,
     /// receiver-private message list — home scheduler only, no lock
-    private: Vec<u64>,
+    /// home-thread mailbox. VecDeque: remove_message pops from the front
+    /// (or near it) — with a Vec that was O(N) per receive under a backlog
+    /// (a gen_server behind 100k messages spent seconds shifting the tail).
+    private: std::collections::VecDeque<u64>,
     /// receive cursor into `private` — home scheduler only
     cursor: usize,
     state: Mutex<PState>,
@@ -301,6 +308,11 @@ pub struct ProcCtx {
     pub exc_class: u64,     // word 3 — codegen contract
     pub exc_reason: u64,    // word 4 — codegen contract
     pub reductions: i64,    // word 5 — codegen contract
+    /// word 6 — codegen contract: per-scheduler argument spill for the
+    /// uniform compiled ABI (`ctx + 6 words`). Callers of arity > 6 write
+    /// args 5.. here right before the call; the callee prologue reads them
+    /// before anything else runs. Only valid across that one call edge.
+    pub argv_spill: *mut u64,
     nursery_start: *mut u64,
     nursery_words: usize,
     global: &'static Global,
@@ -468,6 +480,7 @@ fn new_sched_ctx(global: &'static Global, sched_id: usize) -> *mut ProcCtx {
         exc_class: 0,
         exc_reason: 0,
         reductions: REDUCTIONS_PER_SLICE,
+        argv_spill: Box::into_raw(Box::new([0u64; ARGV_SPILL_WORDS])) as *mut u64,
         nursery_start: nursery,
         nursery_words: nwords,
         global,
@@ -515,9 +528,8 @@ fn make_coroutine(global: &'static Global, home: usize) -> ProcCoro {
             mana_rt_apply3(ctx, m, f, a)
         } else {
             unsafe {
-                let code = *((cl & !TAG_MASK) as *const u64).add(1);
-                let f: extern "C" fn(*mut ProcCtx, u64) -> u64 = std::mem::transmute(code);
-                f(ctx, cl)
+                let code = *((cl & !TAG_MASK) as *const u64).add(1) as usize;
+                call_fun_code(ctx, code, &[], cl)
             }
         }
     })
@@ -551,7 +563,7 @@ pub extern "C" fn mana_rt_run(
                 saved_exc_class: 0,
                 saved_exc_reason: 0,
                 ingress: SegQueue::new(),
-                private: Vec::new(),
+                private: std::collections::VecDeque::new(),
                 cursor: 0,
                 state: Mutex::new(PState::Runnable),
                 pending_closure: 0,
@@ -1100,7 +1112,7 @@ pub extern "C" fn mana_rt_demonitor_flush(ctx: *mut ProcCtx, r: u64) -> u64 {
     let cell = proc_ref(ctx.global, me).unwrap();
     let p = unsafe { proc_mut(cell) };
     while let Some(m) = p.ingress.pop() {
-        p.private.push(m);
+        p.private.push_back(m);
     }
     let is_down_for = |msg: u64| -> bool {
         if msg & TAG_MASK != TAG_BOXED || msg == 0 {
@@ -1183,7 +1195,16 @@ pub extern "C" fn mana_rt_hibernate(ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -
         if !p.private.is_empty() {
             break;
         }
-        *p.state.lock() = PState::Waiting(None);
+        // publish Waiting, then re-check ingress under the lock (same
+        // lost-wakeup window as recv_wait / park_on_socket)
+        {
+            let mut st = p.state.lock();
+            *st = PState::Waiting(None);
+            if !p.ingress.is_empty() {
+                *st = PState::Running;
+                continue;
+            }
+        }
         suspend_current(ctxr);
     }
     let a = fr[2];
@@ -2064,7 +2085,7 @@ fn spawn_mfa_inner(ctx: &mut ProcCtx, m: u64, f: u64, args: u64) -> u64 {
             saved_exc_class: 0,
             saved_exc_reason: 0,
             ingress: SegQueue::new(),
-            private: Vec::new(),
+            private: std::collections::VecDeque::new(),
             cursor: 0,
             state: Mutex::new(PState::Runnable),
             pending_closure: pending,
@@ -3758,8 +3779,13 @@ fn reactor_thread(g: &'static Global) {
                 continue;
             };
             let closed = ev.is_read_closed() || ev.is_write_closed() || ev.is_error();
+            // The waiter slot is NOT cleared here: it is the liveness signal
+            // drain_io_wakes uses to keep a token alive until the parker has
+            // actually suspended (the op clears its own slot when it
+            // completes). Clearing it here dropped tokens that raced the
+            // park — a lost socket wake.
             if ev.is_readable() || closed {
-                if let Some(pid) = entry.read_waiter.take() {
+                if let Some(pid) = entry.read_waiter {
                     IO_WAKES.push((pid, idx, true));
                     woke = true;
                 } else if entry.active != ActiveMode::Passive {
@@ -3769,7 +3795,7 @@ fn reactor_thread(g: &'static Global) {
                 }
             }
             if ev.is_writable() || closed {
-                if let Some(pid) = entry.write_waiter.take() {
+                if let Some(pid) = entry.write_waiter {
                     IO_WAKES.push((pid, idx, false));
                     woke = true;
                 }
@@ -4607,8 +4633,21 @@ fn park_on_socket(
         }
     }
     {
+        // publish Waiting, then re-check the mailbox under the lock: a
+        // sender that saw us Running pushed to ingress without queueing us.
+        // A message is not what this park waits for, but stranding it
+        // until the process next blocks in `receive` is a lost wakeup
+        // (Bandit's connection loop: tcp op, then gen_server receive).
+        // Return spuriously instead; the op retries and re-parks.
         let p = cur_proc(ctx);
-        *p.state.lock() = PState::Waiting(deadline);
+        let mut st = p.state.lock();
+        *st = PState::Waiting(deadline);
+        if !p.ingress.is_empty() {
+            *st = PState::Running;
+            drop(st);
+            clear_waiter(idx, pid, want_read);
+            return true;
+        }
     }
     suspend_current(ctx);
     if let Some(dl) = deadline {
@@ -6311,10 +6350,12 @@ pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) 
             t as u64
         }
         b"message_queue_len" => {
-            // ingress length is approximate cross-thread; good enough
+            // ingress length is approximate cross-thread; good enough. The
+            // cursor is a receive-scan position, not a consumption mark:
+            // the whole queue counts, like BEAM.
             let cell = proc_ref(ctx.global, id).unwrap();
             let p = unsafe { proc_mut(cell) };
-            let n = (p.private.len() - p.cursor.min(p.private.len())) + p.ingress.len();
+            let n = p.private.len() + p.ingress.len();
             let t = alloc_nursery(ctx, 3);
             unsafe {
                 *t = (2 << 8) | KIND_TUPLE;
@@ -6416,7 +6457,7 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
             saved_exc_class: 0,
             saved_exc_reason: 0,
             ingress: SegQueue::new(),
-            private: Vec::new(),
+            private: std::collections::VecDeque::new(),
             cursor: 0,
             state: Mutex::new(PState::Runnable),
             pending_closure: closure,
@@ -6498,7 +6539,7 @@ fn cur_proc(ctx: &ProcCtx) -> &mut Process {
 /// Move everything from the ingress queue into the private list.
 fn drain_ingress(p: &mut Process) {
     while let Some(m) = p.ingress.pop() {
-        p.private.push(m);
+        p.private.push_back(m);
     }
 }
 
@@ -6548,7 +6589,14 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
         if ms <= 0 {
             let p = cur_proc(ctx);
             drain_ingress(p);
-            return (p.private.len() <= p.cursor) as u64;
+            if p.private.len() <= p.cursor {
+                // A timed-out receive ends the scan: the messages this
+                // receive skipped must be visible to the next one (BEAM
+                // resets the save pointer on timeout).
+                p.cursor = 0;
+                return 1;
+            }
+            return 0;
         }
         Some(Instant::now() + Duration::from_millis(ms as u64))
     } else {
@@ -6563,6 +6611,7 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
             }
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
+                    p.cursor = 0; // timeout ends the scan (see above)
                     return 1;
                 }
             }
@@ -9304,20 +9353,34 @@ extern "C" {
     static __stop_mana_exports: u64;
 }
 
-fn export_table() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), usize> {
-    static TABLE: std::sync::OnceLock<rustc_hash::FxHashMap<(u64, u64, u64), usize>> =
+/// Export entry (codegen, `mana_exports` section, 5 words): {mod atom, fun
+/// atom, arity, c_code, fun_code}. `c_code` is the C-ABI wrapper the runtime
+/// calls directly (apply/3, spawn MFA); `fun_code` is the uniform `tailcc`
+/// closure shim (`args ++ [fun]`) that fun objects built by make_fun/3 carry
+/// — compiled code calls fun code with the tailcc convention, so a C
+/// pointer there would mismatch callee-pop and jump into garbage.
+struct Export {
+    c_code: usize,
+    fun_code: usize,
+}
+
+fn exports() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), Export> {
+    static TABLE: std::sync::OnceLock<rustc_hash::FxHashMap<(u64, u64, u64), Export>> =
         std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let mut map = rustc_hash::FxHashMap::default();
         unsafe {
             let start = &raw const __start_mana_exports;
             let stop = &raw const __stop_mana_exports;
-            let n = (stop as usize - start as usize) / 32;
+            let n = (stop as usize - start as usize) / 40;
             for i in 0..n {
-                let e = start.add(4 * i);
-                let (m, f, a, code) = (*e, *e.add(1), *e.add(2), *e.add(3));
+                let e = start.add(5 * i);
+                let (m, f, a, c_code, fun_code) = (*e, *e.add(1), *e.add(2), *e.add(3), *e.add(4));
                 if m != 0 && f != 0 {
-                    map.insert((m | TAG_ATOM, f | TAG_ATOM, a), code as usize);
+                    map.insert(
+                        (m | TAG_ATOM, f | TAG_ATOM, a),
+                        Export { c_code: c_code as usize, fun_code: fun_code as usize },
+                    );
                 }
             }
         }
@@ -9325,14 +9388,51 @@ fn export_table() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), usize> {
     })
 }
 
-/// Call `code` (a compiled function of `n` params) with unpacked args.
-/// Closures take the fun term as a trailing parameter (`fun_term != 0`).
+/// (mod, fun, arity) → C-ABI code pointer, for the runtime's own calls.
+fn export_table() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), usize> {
+    static TABLE: std::sync::OnceLock<rustc_hash::FxHashMap<(u64, u64, u64), usize>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| exports().iter().map(|(k, v)| (*k, v.c_code)).collect())
+}
+
+extern "C" {
+    /// Emitted by codegen in the entry module: a C-ABI trampoline that
+    /// forwards the uniform argument words into a `tailcc` fun body.
+    fn mana_call_fun(ctx: *mut ProcCtx, x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, code: usize) -> u64;
+}
+
+/// Call a fun object's code (uniform tailcc ABI) with `argv ++ [fun]`.
+unsafe fn call_fun_code(ctx: *mut ProcCtx, code: usize, argv: &[u64], fun_term: u64) -> u64 {
+    let n = argv.len() + 1; // + trailing closure
+    let mut x = [0u64; ABI_REGS];
+    if n <= ABI_REGS {
+        x[..argv.len()].copy_from_slice(argv);
+        x[argv.len()] = fun_term;
+    } else {
+        // args 0..ABI_REGS-2 in registers, the rest (incl. the closure) spilled
+        x[..ABI_REGS - 1].copy_from_slice(&argv[..ABI_REGS - 1]);
+        let spill = unsafe { (*ctx).argv_spill };
+        let rest: Vec<u64> = argv[ABI_REGS - 1..].iter().copied().chain(std::iter::once(fun_term)).collect();
+        assert!(rest.len() <= ARGV_SPILL_WORDS, "fun arity exceeds the argument spill");
+        for (i, v) in rest.iter().enumerate() {
+            unsafe { *spill.add(i) = *v };
+        }
+    }
+    unsafe { mana_call_fun(ctx, x[0], x[1], x[2], x[3], x[4], code) }
+}
+
+/// Call compiled code with unpacked args: `fun_term != 0` → `code` is a fun
+/// body (uniform tailcc ABI, via the trampoline, fun term trailing);
+/// otherwise `code` is an export's C-ABI wrapper (arities 0..8).
 unsafe fn call_dynamic(
     ctx: *mut ProcCtx,
     code: usize,
     argv: &[u64],
     fun_term: u64,
 ) -> Option<u64> {
+    if fun_term != 0 {
+        return Some(unsafe { call_fun_code(ctx, code, argv, fun_term) });
+    }
     type C = *mut ProcCtx;
     let a = argv;
     let r = match (a.len(), fun_term != 0) {
@@ -11942,10 +12042,13 @@ pub extern "C" fn mana_rt_list_to_atom(ctx: *mut ProcCtx, l: u64, existing: u64)
     }
 }
 
-/// Deferred-undef target for make_fun/3 misses: raises when called. Extra
-/// (argument/fun) registers are ignored — SysV lets callers pass more.
-extern "C" fn make_fun_undef(ctx: *mut ProcCtx) -> u64 {
-    raise_undef(unsafe { &mut *ctx })
+extern "C" {
+    /// Codegen-emitted uniform `tailcc` fun body that raises undef — the
+    /// code pointer for make_fun/3 of a function that is not compiled.
+    static mana_fun_undef: u8;
+}
+fn make_fun_undef_code() -> usize {
+    unsafe { &raw const mana_fun_undef as usize }
 }
 
 /// erlang:make_fun/3 — a fun value for an exported function. The closure
@@ -11959,7 +12062,7 @@ pub extern "C" fn mana_rt_make_fun(ctx: *mut ProcCtx, m: u64, f: u64, arity: u64
         return raise_badarg(ctx);
     }
     let a = (arity as i64 >> 3) as u64;
-    let code = export_table().get(&(m, f, a)).copied().unwrap_or_else(|| {
+    let code = exports().get(&(m, f, a)).map(|e| e.fun_code).unwrap_or_else(|| {
         if std::env::var_os("MANA_DEBUG_UNDEF").is_some() {
             eprintln!(
                 "mana: make_fun miss {}:{}/{}",
@@ -11968,7 +12071,7 @@ pub extern "C" fn mana_rt_make_fun(ctx: *mut ProcCtx, m: u64, f: u64, arity: u64
                 a
             );
         }
-        make_fun_undef as usize
+        make_fun_undef_code()
     });
     let p = alloc_nursery(ctx, 2);
     unsafe {
