@@ -58,6 +58,62 @@ defmodule Conf.Procs do
     after
       0 -> :erlang.display(:empty_poll)
     end
+
+    # a selective receive that times out must leave the messages it skipped
+    # visible to the next receive (BEAM resets the save pointer on timeout).
+    # Bandit relies on this: {:plug_conn, :sent} sits behind ThousandIsland's
+    # `receive :read_timeout after 0` flush on every keep-alive request.
+    send(me, {:skipped, 1})
+    send(me, {:skipped, 2})
+
+    receive do
+      :not_there -> :erlang.display(:impossible)
+    after
+      0 -> :ok
+    end
+
+    :erlang.display(Process.info(me, :message_queue_len))
+
+    receive do
+      {:skipped, n} -> :erlang.display({:still_there, n})
+    after
+      0 -> :erlang.display(:lost)
+    end
+
+    receive do
+      {:skipped, n} -> :erlang.display({:still_there, n})
+    after
+      10 -> :erlang.display(:lost)
+    end
+
+    :erlang.display(Process.info(me, :message_queue_len))
+
+    # same, for a POSITIVE timeout that actually elapses: the scan skips both
+    # messages, parks, times out, and must still reset
+    send(me, {:skipped, 3})
+    send(me, {:skipped, 4})
+
+    receive do
+      :not_there -> :erlang.display(:impossible)
+    after
+      10 -> :erlang.display(:positive_timeout)
+    end
+
+    :erlang.display(Process.info(me, :message_queue_len))
+
+    receive do
+      {:skipped, n} -> :erlang.display({:still_there, n})
+    after
+      0 -> :erlang.display(:lost)
+    end
+
+    receive do
+      {:skipped, n} -> :erlang.display({:still_there, n})
+    after
+      0 -> :erlang.display(:lost)
+    end
+
+    :erlang.display(Process.info(me, :message_queue_len))
   end
 
   defp ping(_pong, _me, 0, acc), do: {:pinged, acc}

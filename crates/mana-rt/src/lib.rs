@@ -1183,7 +1183,16 @@ pub extern "C" fn mana_rt_hibernate(ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -
         if !p.private.is_empty() {
             break;
         }
-        *p.state.lock() = PState::Waiting(None);
+        // publish Waiting, then re-check ingress under the lock (same
+        // lost-wakeup window as recv_wait / park_on_socket)
+        {
+            let mut st = p.state.lock();
+            *st = PState::Waiting(None);
+            if !p.ingress.is_empty() {
+                *st = PState::Running;
+                continue;
+            }
+        }
         suspend_current(ctxr);
     }
     let a = fr[2];
@@ -3758,8 +3767,13 @@ fn reactor_thread(g: &'static Global) {
                 continue;
             };
             let closed = ev.is_read_closed() || ev.is_write_closed() || ev.is_error();
+            // The waiter slot is NOT cleared here: it is the liveness signal
+            // drain_io_wakes uses to keep a token alive until the parker has
+            // actually suspended (the op clears its own slot when it
+            // completes). Clearing it here dropped tokens that raced the
+            // park — a lost socket wake.
             if ev.is_readable() || closed {
-                if let Some(pid) = entry.read_waiter.take() {
+                if let Some(pid) = entry.read_waiter {
                     IO_WAKES.push((pid, idx, true));
                     woke = true;
                 } else if entry.active != ActiveMode::Passive {
@@ -3769,7 +3783,7 @@ fn reactor_thread(g: &'static Global) {
                 }
             }
             if ev.is_writable() || closed {
-                if let Some(pid) = entry.write_waiter.take() {
+                if let Some(pid) = entry.write_waiter {
                     IO_WAKES.push((pid, idx, false));
                     woke = true;
                 }
@@ -4607,8 +4621,21 @@ fn park_on_socket(
         }
     }
     {
+        // publish Waiting, then re-check the mailbox under the lock: a
+        // sender that saw us Running pushed to ingress without queueing us.
+        // A message is not what this park waits for, but stranding it
+        // until the process next blocks in `receive` is a lost wakeup
+        // (Bandit's connection loop: tcp op, then gen_server receive).
+        // Return spuriously instead; the op retries and re-parks.
         let p = cur_proc(ctx);
-        *p.state.lock() = PState::Waiting(deadline);
+        let mut st = p.state.lock();
+        *st = PState::Waiting(deadline);
+        if !p.ingress.is_empty() {
+            *st = PState::Running;
+            drop(st);
+            clear_waiter(idx, pid, want_read);
+            return true;
+        }
     }
     suspend_current(ctx);
     if let Some(dl) = deadline {
@@ -6311,10 +6338,12 @@ pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) 
             t as u64
         }
         b"message_queue_len" => {
-            // ingress length is approximate cross-thread; good enough
+            // ingress length is approximate cross-thread; good enough. The
+            // cursor is a receive-scan position, not a consumption mark:
+            // the whole queue counts, like BEAM.
             let cell = proc_ref(ctx.global, id).unwrap();
             let p = unsafe { proc_mut(cell) };
-            let n = (p.private.len() - p.cursor.min(p.private.len())) + p.ingress.len();
+            let n = p.private.len() + p.ingress.len();
             let t = alloc_nursery(ctx, 3);
             unsafe {
                 *t = (2 << 8) | KIND_TUPLE;
@@ -6548,7 +6577,14 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
         if ms <= 0 {
             let p = cur_proc(ctx);
             drain_ingress(p);
-            return (p.private.len() <= p.cursor) as u64;
+            if p.private.len() <= p.cursor {
+                // A timed-out receive ends the scan: the messages this
+                // receive skipped must be visible to the next one (BEAM
+                // resets the save pointer on timeout).
+                p.cursor = 0;
+                return 1;
+            }
+            return 0;
         }
         Some(Instant::now() + Duration::from_millis(ms as u64))
     } else {
@@ -6563,6 +6599,7 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
             }
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
+                    p.cursor = 0; // timeout ends the scan (see above)
                     return 1;
                 }
             }
