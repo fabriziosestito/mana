@@ -66,6 +66,11 @@ Scoreboard (16-core linux, release runtime vs warm BEAM):
 | str upcase 1KB | **26.6 µs** | 14 µs | 2026-09-03, **case pre-dispatch switch**: String.Unicode.upcase/3 is ~1400 byte-prefix clauses; one `switch` on the first byte replaces the sequential prefix compares. 5.6x total this series; residual = per-byte view + cons allocation (a match-context shape would remove the view) |
 | str split+join | 13.6 µs | 9.2 µs | 2026-09-03, zero-copy split (was 18.9) |
 | changeset valid | **2.4 µs** | 1.9 µs | 2026-09-03, case pre-dispatch (clause tables everywhere) |
+| phx landing (keepalive) | **128 µs** | 215 µs | 2026-09-04, receive-timeout cursor reset (BEAM save-pointer semantics; Bandit no longer leaks one `{:plug_conn,:sent}` per request) + **guaranteed tail calls** (uniform all-register tailcc ABI + musttail). The earlier "1 ms stall" was a SIGSEGV: gen_server:loop/7 was a real call, leaking ~3 KB of stack per message — every long-lived gen_server died after ~80k messages |
+| http GET, keepalive | **43 µs** | 72 µs | 2026-09-04, same (was 125; 8/8 runs at 1 and 16 schedulers) |
+| gen_server 2M messages | 5.1 s, 25 MB | — | 2026-09-04, tailcc + VecDeque mailbox (was: SIGSEGV at ~80k; then O(N) `Vec::remove(0)` per receive under backlog) |
+| fib 25 | 624 µs | — | 2026-09-04, uniform-ABI register shuffle cost (was 575) |
+| changeset valid | 2.6 µs | 1.9 µs | 2026-09-04, same ABI cost (was 2.2) — the correctness fix outranks it; arity>5 spill is the lever if it matters |
 
 The campaign (maps fast paths, frame slimming, static constant binaries,
 inline map/binary matching) took the gap from ~5x to ~1.5x; instruction

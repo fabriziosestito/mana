@@ -37,7 +37,7 @@
 //! static, never collected). Closures are lambda-lifted in closure-passing
 //! style: lifted signature `(ctx, args..., closure)`.
 //!
-//! TODO(lco): tailcc + musttail for guaranteed cross-function tail calls.
+//! Tail calls are guaranteed: uniform `tailcc` prototype + `musttail` (see NREG).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
