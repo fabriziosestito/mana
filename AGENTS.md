@@ -231,42 +231,65 @@ matrix. Six heap corruptions shipped in 2026, all in four invariant classes:
 3. A heap header kind never has low bits `0b111`.
 4. A C-convention pointer is never called as `tailcc`, and the reverse.
 
-Gaps against the Go runtime, in the order to pick them up:
+Gaps against the Go runtime, in the order to pick them up. The evidence
+(primary sources, quotes, and the reasoning) is in
+`fabrizio/memory-safety-research.md`, which is not in the repository. The
+pattern that every production runtime follows: a cheap check on a path the
+collector already runs is always on and aborts. A full heap walk is a knob,
+off by default, on in stress runs. Nobody ships the walk in release.
 
-- `TODO(gc-checks)`: always-on cheap checks in the collector, like Go's
-  `found bad pointer in Go heap` throw. Today `forward_minor` and
-  `forward_major` abort only on an impossible tag. Add, at the point where
-  the collector already reads the header: the kind must be one of the seven
-  valid kinds, the size must be below the chunk size, and a nursery or old
-  pointer must land inside a live chunk. Abort on failure. These are a few
-  compares per object on a path that already touches the header. They are
-  never a knob.
-- `TODO(heap-verify)`: a full verifier behind an environment variable
-  (`MANA_GC_VERIFY=1`), like Go's `GODEBUG=gccheckmark=1`. After every
-  collection, walk every reachable term from every root and check each
-  word. This is O(live heap) per collection, so it is off by default and
-  on in the stress matrix. With it, a bad root is found in one run instead
-  of after a soak.
-- `TODO(abi-consts-check)`: a test or `build.rs` that reads the mirrored
-  constants (tags, kinds, `ProcCtx` word offsets, `NREG`, opcode tables) in
-  `crates/mana-rt/src/term.rs` and `crates/mana-codegen/src/lib.rs` and
-  fails if they differ. Today only this document guards them.
-- `TODO(rooted-type)`: a `Rooted<'frame>` term type for the runtime helpers,
-  so that a term held across an allocation is a compile error, not a review
-  item. `mana-native` already has this shape (`Env`, `H`). Bring it into
-  `mana-rt` for the helpers that allocate more than once.
-- `TODO(miri)`: run Miri or AddressSanitizer on the GC and the term helpers
-  with unit tests over synthetic heaps. Nothing in the runtime needs LLVM,
-  so this is possible today.
-- `TODO(race-detector)`: the scheduler invariant (only the home thread
-  touches a process's coroutine and saved fields) rests on
-  `unsafe impl Send + Sync for ProcessCell`. Add debug assertions on the
-  scheduler id at every access, and run the SMP matrix under ThreadSanitizer.
-- `TODO(stacks)`: stacks are fixed (32 MB root, 1 MB spawned). Deep body
-  recursion in a spawned process hits the guard page and dies. Go grows
-  stacks on demand. Segmented stacks are rejected (hot-split). The candidate
-  is stack copy on overflow with a rooted-frame walk, which the root frames
-  already make possible.
+1. `TODO(gc-checks)`: always-on cheap checks in the collector. This is Go's
+   default (`invalidptr=1`: the span must be in use and the pointer inside
+   `[base, limit)`, else `throw("found bad pointer in Go heap")`). Today
+   `forward_minor` and `forward_major` abort only on an impossible tag. Add,
+   where the collector already reads the header: the kind must be one of the
+   seven valid kinds, the size must be below the chunk size, and a nursery
+   or old pointer must land inside a live chunk. Abort with the word and the
+   owner pid. A few compares per object. Never a knob.
+2. `TODO(gc-poison)`: after a minor, fill the evacuated nursery with a
+   poison word whose tag is `0b101` (the sentinel), in the stress matrix
+   (`MANA_GC_POISON=1`) and in debug builds. Go `clobberfree`, HotSpot
+   `ZapUnusedHeapArea`, and SpiderMonkey zeal 14 all do this. Today a stale
+   pointer reads the old copy, which stays valid until the next allocation
+   overwrites it. That is why our bugs surfaced late. With poison, check 1
+   aborts at the first stale read.
+3. `TODO(rooted-type)`: make "term held across an allocation" a compile
+   error in `mana-rt`. Use the mozjs shape, not gc-arena's: allocation needs
+   `&mut` on the heap handle, a raw term read borrows a `NoGc` witness from
+   the same borrow, so the borrow checker rejects an allocation while a raw
+   term is live. Zero runtime cost. `mana-native` already has the rooting
+   half (`Env`, `H`). Start with the helpers that allocate more than once
+   (maps, ets, etf, decode_packet). Wasmtime's `Rooted<T>`/`RootScope` is
+   the same LIFO frame idea, but it reports misuse at run time.
+4. `TODO(abi-consts)`: one source for the mirrored constants (tags, kinds,
+   `ProcCtx` word offsets, `NREG`, opcode tables): a `mana-abi` crate that
+   both `mana-rt` and `mana-codegen` depend on. Delete the second copy. A
+   test that compares two copies is the fallback only.
+5. `TODO(heap-verify)`: a full verifier behind `MANA_GC_VERIFY=1` (Go
+   `gccheckmark`, HotSpot `VerifyAfterGC`, SpiderMonkey zeal 15). After
+   every collection, walk every reachable term from every root and check
+   each word. O(live heap), so off by default and on in the stress matrix.
+6. `TODO(sanitizers)`: run the conformance suite under AddressSanitizer
+   with corosensei's `sanitizer` Cargo feature (it exists for this). Run
+   Miri on the GC and term helpers over synthetic heaps in unit tests. Miri
+   cannot run FFI, mio, or coroutine switches, so mark those tests
+   `#[cfg_attr(miri, ignore)]`.
+7. `TODO(race-detector)`: the scheduler invariant (only the home thread
+   touches a process's coroutine and saved fields) rests on
+   `unsafe impl Send + Sync for ProcessCell`. Add debug assertions on the
+   scheduler id at every access. Then ThreadSanitizer on the SMP matrix.
+   TSan needs the fiber hooks (`__tsan_switch_to_fiber` with `no_sync`)
+   around every coroutine switch. Check whether corosensei's `sanitizer`
+   feature calls them. If not, patch it.
+8. `TODO(stacks)`: stacks are fixed (32 MB root, 1 MB spawned). Go copies
+   stacks, and that needs precise stack maps plus the rule that only the
+   stack points into the stack. BEAM copies too, because its stack holds
+   only tagged words. Our frames are LLVM frames with raw return addresses
+   and raw `prev` pointers in the root chain, so we cannot copy today.
+   Near term: a clean process exit with a reason on the guard page
+   (corosensei has the handler) and a `spawn_opt` stack-size hint. Later:
+   stack maps from LLVM, the same work as `TODO(liveness)`. Never segmented
+   stacks (Go measured 1.26 s to 5.37 s on a hot split).
 
 Where mana is already stronger than Go: no data races in compiled code
 (immutable terms, message passing only), no `unsafe` escape hatch for user
