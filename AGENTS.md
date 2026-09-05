@@ -208,6 +208,62 @@ PATH), Erlang/OTP (`erlc`) and Elixir (`mix`), a C compiler (`cc`).
   timer patterns (`SegQueue` plus a scheduler wake at the loop-top safepoint,
   eternal or shared-space terms only).
 
+## Memory safety: where we stand, and the gaps
+
+Compiled programs are memory safe by construction. The language has no
+pointers and no mutable heap terms. Every indexed access (`element/2`,
+`hd/1`, binary segments, `binary_part/3`) emits a kind test and a bounds
+test and raises `badarg`. Pattern matches fall through to `match_fail`.
+Integers promote to bignums. Processes share no mutable data, so a compiled
+program cannot race on memory. This is the same class as Go: a memory-safe
+language on top of a runtime that is not safe by construction.
+
+The runtime is NOT memory safe by construction. `mana-rt` has about 600
+`unsafe` sites (raw `*const u64` casts, `from_raw_parts`, `transmute` of
+export-table code pointers). The borrow checker cannot see the invariants
+that matter. They are held by the rules in this file and by the stress
+matrix. Six heap corruptions shipped in 2026, all in four invariant classes:
+
+1. A term in a Rust local is not a GC root. Root it in a frame before the
+   next allocation.
+2. There is no remembered set. Promote a term before you store it into old
+   space or into another process.
+3. A heap header kind never has low bits `0b111`.
+4. A C-convention pointer is never called as `tailcc`, and the reverse.
+
+Gaps against the Go runtime, in the order to pick them up:
+
+- `TODO(heap-verify)`: a heap verifier behind an environment variable
+  (`MANA_GC_VERIFY=1`). After every collection, walk every reachable term
+  and check the tag, the kind, and that each pointer lands in a live chunk.
+  Abort on the first bad word. Go has `GODEBUG` heap checks and write-barrier
+  assertions. We have one `eprintln!` in the collector. With this, the
+  stress matrix finds a bad root in one run instead of after a soak.
+- `TODO(abi-consts-check)`: a test or `build.rs` that reads the mirrored
+  constants (tags, kinds, `ProcCtx` word offsets, `NREG`, opcode tables) in
+  `crates/mana-rt/src/term.rs` and `crates/mana-codegen/src/lib.rs` and
+  fails if they differ. Today only this document guards them.
+- `TODO(rooted-type)`: a `Rooted<'frame>` term type for the runtime helpers,
+  so that a term held across an allocation is a compile error, not a review
+  item. `mana-native` already has this shape (`Env`, `H`). Bring it into
+  `mana-rt` for the helpers that allocate more than once.
+- `TODO(miri)`: run Miri or AddressSanitizer on the GC and the term helpers
+  with unit tests over synthetic heaps. Nothing in the runtime needs LLVM,
+  so this is possible today.
+- `TODO(race-detector)`: the scheduler invariant (only the home thread
+  touches a process's coroutine and saved fields) rests on
+  `unsafe impl Send + Sync for ProcessCell`. Add debug assertions on the
+  scheduler id at every access, and run the SMP matrix under ThreadSanitizer.
+- `TODO(stacks)`: stacks are fixed (32 MB root, 1 MB spawned). Deep body
+  recursion in a spawned process hits the guard page and dies. Go grows
+  stacks on demand. Segmented stacks are rejected (hot-split). The candidate
+  is stack copy on overflow with a rooted-frame walk, which the root frames
+  already make possible.
+
+Where mana is already stronger than Go: no data races in compiled code
+(immutable terms, message passing only), no `unsafe` escape hatch for user
+code, and the only foreign code is an explicit `Mana.Native` boundary.
+
 ## Writing
 
 This repository uses the `simple-english` skill (ASD-STE100 Simplified
