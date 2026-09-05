@@ -1,14 +1,14 @@
 # Architecture
 
 This document explains the design choices of manallvm and the reasons for
-them. It describes the system as it is today. For contributor rules, read
-`AGENTS.md`.
+them. It describes the system as it is today. For contributor rules and the
+module map of each crate, read `AGENTS.md`.
 
 ## What manallvm is
 
 manallvm compiles Erlang and Elixir programs to native binaries. The output
-is one static executable, like a Go binary. There is no BEAM virtual
-machine anywhere in the output. The standard toolchain (`erlc`, `elixirc`)
+is one static executable. There is no BEAM virtual machine anywhere in the
+output. The standard toolchain (`erlc`, `elixirc`)
 first lowers source code to Core Erlang. manallvm compiles that Core Erlang
 to machine code with LLVM. The binary links against our own runtime, which
 is written in Rust.
@@ -210,7 +210,7 @@ out, and plugs initialize at compile time.
 Warm builds take about one second for a Phoenix-sized program. Three
 layers make this possible:
 
-- **An object cache**, content-addressed like the Go build cache. The key
+- **An object cache**, content-addressed. The key
   hashes the compiler binary, the `.core` source text, the include set,
   and the effect verdicts of every remote callee. Any input that changes
   the emitted code must be part of the key.
