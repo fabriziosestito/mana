@@ -10,6 +10,7 @@ mod case;
 mod pattern;
 mod binary;
 mod bif;
+mod bif_erlang;
 mod bif_native;
 mod maps;
 
