@@ -1,32 +1,34 @@
 //! # mana-native
 //!
-//! The stable term ABI a hex package's `native/<pkg>/` Rust crate depends
-//! on to build and inspect mana terms — the closed-world analog of the
-//! `rustler` crate. A native function has the signature
+//! This crate is the stable term ABI for the `native/<pkg>/` Rust crate of
+//! a hex package. The crate builds and inspects mana terms. It is the
+//! closed-world analog of the `rustler` crate. A native function has this
+//! signature:
 //!
 //! ```ignore
 //! #[no_mangle]
 //! pub extern "C" fn my_pkg_native_hello_1(ctx: *mut ProcCtx, arg0: u64) -> u64 { ... }
 //! ```
 //!
-//! Terms are tagged 64-bit words (`u64`). `ProcCtx` is opaque here (only
-//! its first words matter, and only to the runtime). Read arguments with
-//! the [`Term`] inspection API; build results with an [`Env`], which roots
-//! every term it creates across allocations (mana's GC moves objects, so —
-//! unlike a BEAM NIF's `ErlNifEnv` — you must not hold a raw term across an
-//! allocation without rooting it; `Env` does that for you).
+//! Terms are tagged 64-bit words (`u64`). `ProcCtx` is opaque here. Only
+//! its first words matter, and only to the runtime. Read arguments with the
+//! [`Term`] inspection API. Build results with an [`Env`]. The `Env` roots
+//! every term that it creates across allocations. The mana GC moves
+//! objects. This differs from the `ErlNifEnv` of a BEAM NIF. You must not
+//! hold a raw term across an allocation without a root. `Env` does the
+//! rooting for you.
 
 #![allow(clippy::missing_safety_doc)]
 
-/// Opaque process context handle. Only the runtime interprets its fields;
-/// the ABI treats it as a pointer. Its word 2 is the GC root-chain head,
-/// which [`Env`] manipulates.
+/// The opaque process context handle. Only the runtime interprets its
+/// fields. The ABI treats it as a pointer. Its word 2 is the head of the GC
+/// root chain. [`Env`] changes this word.
 #[repr(C)]
 pub struct ProcCtx {
     _private: [u64; 0],
 }
 
-// -- tag / kind constants (mirror crates/mana-rt/src/lib.rs) --
+// Tag and kind constants. They must match crates/mana-rt/src/lib.rs.
 pub const TAG_MASK: u64 = 0b111;
 pub const TAG_BOXED: u64 = 0b000;
 pub const TAG_SMALL: u64 = 0b001;
@@ -54,20 +56,22 @@ extern "C" {
     fn mana_rt_map_from_list(ctx: *mut ProcCtx, list: u64) -> u64;
 }
 
-/// The sentinel a native fn returns to unwind (raise) — matches codegen.
+/// The sentinel that a native fn returns to unwind (raise). It must match
+/// codegen.
 pub const EXC_SENTINEL: u64 = 0b101;
 
-/// Raise `badarg`; return the result of this to unwind out of the native fn.
+/// Raise `badarg`. Return the result of this call to unwind out of the
+/// native fn.
 #[inline]
 pub fn raise_badarg(ctx: *mut ProcCtx) -> u64 {
     unsafe { mana_rt_native_raise_badarg(ctx) }
 }
 
-// ---------------------------------------------------------------------------
-// Inspection (read-only, never allocates — safe on an unrooted argument as
-// long as no allocation happens between reads).
+// Inspection. These reads never allocate. They are safe on an unrooted
+// argument as long as no allocation happens between the reads.
 
-/// A borrowed view of a term for inspection. Cheap (`Copy`), just the word.
+/// A borrowed view of a term for inspection. It is `Copy` and holds only
+/// the word.
 #[derive(Clone, Copy)]
 pub struct Term(pub u64);
 
@@ -96,7 +100,7 @@ impl Term {
     pub fn is_boxed(self) -> bool {
         self.0 & TAG_MASK == TAG_BOXED && self.0 != 0
     }
-    /// Boxed-object kind byte, or `None` if not boxed.
+    /// The kind byte of a boxed object, or `None` if the term is not boxed.
     #[inline]
     pub fn boxed_kind(self) -> Option<u64> {
         if self.is_boxed() {
@@ -121,7 +125,8 @@ impl Term {
         self.boxed_kind() == Some(KIND_TUPLE)
     }
 
-    /// Atom name bytes (interned, static). Precondition: `is_atom()`.
+    /// The atom name bytes. They are interned and static. Precondition:
+    /// `is_atom()`.
     #[inline]
     pub fn atom_name(self) -> &'static [u8] {
         unsafe {
@@ -131,15 +136,16 @@ impl Term {
         }
     }
 
-    /// Float value. Precondition: `is_float()`.
+    /// The float value. Precondition: `is_float()`.
     #[inline]
     pub fn as_float(self) -> f64 {
         unsafe { f64::from_bits(*((self.0 as *const u64).add(1))) }
     }
 
-    /// Binary/sub-binary bytes (view data pointer is GC-recomputed by the
-    /// runtime). Returns `None` if not a binary. The slice borrows the
-    /// process heap — copy out before any allocation.
+    /// The bytes of a binary or sub-binary. The runtime recomputes the data
+    /// pointer of a view after GC. Returns `None` if the term is not a
+    /// binary. The slice borrows the process heap. Copy the bytes out before
+    /// any allocation.
     #[inline]
     pub fn binary_bytes(self) -> Option<&'static [u8]> {
         let mut ptr: *const u8 = std::ptr::null();
@@ -151,9 +157,10 @@ impl Term {
         }
     }
 
-    /// Decimal digits of an integer term into `buf`; returns the digit
-    /// count (may exceed `buf.len()` — retry with a bigger buffer), or
-    /// `None` if not an integer. Allocates nothing.
+    /// Write the decimal digits of an integer term into `buf`. Returns the
+    /// digit count, or `None` if the term is not an integer. The count can
+    /// exceed `buf.len()`. In that case, retry with a bigger buffer. This
+    /// call allocates nothing.
     #[inline]
     pub fn int_decimal(self, buf: &mut [u8]) -> Option<usize> {
         let n = unsafe { mana_rt_native_int_decimal(self.0, buf.as_mut_ptr(), buf.len()) };
@@ -164,39 +171,41 @@ impl Term {
         }
     }
 
-    // -- containers (raw reads; no allocation) --
+    // Containers. These are raw reads with no allocation.
 
-    /// Tuple arity. Precondition: `is_tuple()`.
+    /// The tuple arity. Precondition: `is_tuple()`.
     #[inline]
     pub fn tuple_arity(self) -> usize {
         (unsafe { *(self.0 as *const u64) } >> 8) as usize
     }
-    /// 0-based tuple element. Precondition: `is_tuple()` and `i < arity`.
+    /// The 0-based tuple element. Precondition: `is_tuple()` and `i < arity`.
     #[inline]
     pub fn tuple_elem(self, i: usize) -> Term {
         Term(unsafe { *((self.0 as *const u64).add(1 + i)) })
     }
-    /// Cons head. Precondition: `is_cons()`.
+    /// The cons head. Precondition: `is_cons()`.
     #[inline]
     pub fn cons_head(self) -> Term {
         Term(unsafe { *((self.0 & !TAG_MASK) as *const u64) })
     }
-    /// Cons tail. Precondition: `is_cons()`.
+    /// The cons tail. Precondition: `is_cons()`.
     #[inline]
     pub fn cons_tail(self) -> Term {
         Term(unsafe { *((self.0 & !TAG_MASK) as *const u64).add(1) })
     }
-    /// Map size. Precondition: `is_map()`.
+    /// The map size. Precondition: `is_map()`.
     #[inline]
     pub fn map_size(self) -> usize {
         (unsafe { *(self.0 as *const u64) } >> 8) as usize
     }
-    /// 0-based map key (keys are stored sorted). Precondition: `is_map()`.
+    /// The 0-based map key. The keys are stored in sorted order.
+    /// Precondition: `is_map()`.
     #[inline]
     pub fn map_key(self, i: usize) -> Term {
         Term(unsafe { *((self.0 as *const u64).add(1 + i)) })
     }
-    /// 0-based map value (parallel to keys). Precondition: `is_map()`.
+    /// The 0-based map value. The values are parallel to the keys.
+    /// Precondition: `is_map()`.
     #[inline]
     pub fn map_val(self, i: usize) -> Term {
         let n = self.map_size();
@@ -204,28 +213,29 @@ impl Term {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Construction with rooting (the ErlNifEnv analog).
+// Construction with rooting. This is the analog of ErlNifEnv.
 
-/// A handle to a term rooted in an [`Env`]. Stays valid (its value tracked
-/// across GC moves) until the `Env` is dropped.
+/// A handle to a term that is rooted in an [`Env`]. The handle stays valid
+/// until the `Env` is dropped. The `Env` tracks its value across GC moves.
 #[derive(Clone, Copy)]
 pub struct H(usize);
 
-/// A rooting scope for building terms. Every term created through it is
-/// pushed onto the process GC root chain, so intermediate results survive
-/// the allocations of later builds. Restores the previous root head on drop.
+/// A rooting scope for term construction. The scope pushes every term that
+/// it creates onto the GC root chain of the process. Then intermediate
+/// results survive the allocations of later builds. On drop, the scope
+/// restores the previous root head.
 pub struct Env {
     ctx: *mut ProcCtx,
-    // [prev_root_head, slot_count, slot0, slot1, ...]
+    // Layout: [prev_root_head, slot_count, slot0, slot1, ...]
     roots: Vec<u64>,
 }
 
 impl Env {
     /// # Safety
-    /// `ctx` must be the live process context passed to the native fn.
+    /// `ctx` must be the live process context that the runtime passed to the
+    /// native fn.
     pub unsafe fn new(ctx: *mut ProcCtx) -> Env {
-        let prev = *(ctx as *const u64).add(2); // roots_head (word 2)
+        let prev = *(ctx as *const u64).add(2); // roots_head is word 2.
         let mut e = Env {
             ctx,
             roots: vec![prev, 0],
@@ -246,12 +256,12 @@ impl Env {
     #[inline]
     fn track(&mut self, t: u64) -> H {
         self.roots.push(t);
-        self.install(); // re-point in case the Vec reallocated
+        self.install(); // The Vec can reallocate. Point the runtime at the new buffer.
         H(self.roots.len() - 1)
     }
 
-    /// Current value of a handle (re-read from its root slot — always the
-    /// post-GC location).
+    /// The current value of a handle. The read comes from its root slot, so
+    /// it is always the location after GC.
     #[inline]
     pub fn get(&self, h: H) -> u64 {
         self.roots[h.0]
@@ -285,8 +295,8 @@ impl Env {
     /// Prepend `head` to `tail`.
     pub fn cons(&mut self, head: H, tail: H) -> H {
         let p = unsafe { mana_rt_native_alloc(self.ctx, 2) };
-        // read children AFTER the alloc (GC may have moved them; their
-        // root slots were updated in place)
+        // Read the children AFTER the alloc. The GC can move them. Their
+        // root slots were updated in place.
         let (h, tl) = (self.get(head), self.get(tail));
         unsafe {
             *p = h;
@@ -311,14 +321,15 @@ impl Env {
         unsafe {
             *p = ((n as u64) << 8) | KIND_TUPLE;
             for (i, &e) in elems.iter().enumerate() {
-                *p.add(1 + i) = self.get(e); // fresh read, no alloc between
+                *p.add(1 + i) = self.get(e); // A fresh read. No alloc happens between.
             }
         }
         self.track(p as u64) // TAG_BOXED == 0
     }
 
-    /// A map from key/value handle pairs. Keys are sorted and de-duplicated
-    /// by the runtime (`maps:from_list` semantics: last value wins).
+    /// A map from key/value handle pairs. The runtime sorts the keys and
+    /// removes duplicates. The semantics are those of `maps:from_list`: the
+    /// last value wins.
     pub fn map(&mut self, pairs: &[(H, H)]) -> H {
         let tuples: Vec<H> = pairs.iter().map(|&(k, v)| self.tuple(&[k, v])).collect();
         let list = self.list(&tuples);

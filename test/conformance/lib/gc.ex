@@ -1,32 +1,32 @@
 defmodule Conf.Gc do
   @moduledoc """
-  Conformance program: garbage collector stress. The initial heap is ~8KB,
-  so these loops force many copying collections; any root left in a
-  register across a GC point, any bad forwarding, or any mis-scanned object
+  Conformance program for garbage collector stress. The initial heap is
+  about 8KB, so these loops force many copying collections. A root left in
+  a register across a GC point, a bad forwarding, or a mis-scanned object
   shows up as wrong output or a crash.
   """
 
   def go do
-    # long list construction + traversal (cons churn)
+    # Long list construction and traversal (cons churn).
     l = range(1, 20_000)
     :erlang.display(sum(l, 0))
     :erlang.display(len(l, 0))
 
-    # reversal allocates a second copy while the first is live
+    # Reversal allocates a second copy while the first is live.
     r = rev(l, [])
     :erlang.display(hd_of(r))
     :erlang.display(sum(r, 0))
 
-    # tuple churn: build and immediately drop tuples in a loop
+    # Tuple churn: build tuples in a loop and drop them at once.
     :erlang.display(tuple_churn(10_000, 0))
 
-    # closures surviving collections: capture, allocate a lot, then call
+    # Closures that survive collections: capture, allocate a lot, then call.
     k = 42
     add_k = fn x -> x + k end
     junk = range(1, 5_000)
     :erlang.display(add_k.(sum(junk, 0)))
 
-    # deep structure copied through several collections
+    # A deep structure copied through several collections.
     t = build_tree(10)
     :erlang.display(tree_sum(t))
   end

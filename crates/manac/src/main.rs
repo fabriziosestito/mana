@@ -1,22 +1,25 @@
-//! manac — Core Erlang → native binary compiler driver.
+//! manac is the compiler driver. It compiles Core Erlang to a native binary.
 //!
 //! Usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES...
 //!
-//! Inputs are `.core` files or `.erl` files (run through `erlc +to_core`
-//! first). All modules are compiled together, closed-world: only code
-//! reachable from the entry (default: `main/0` in the first input's module)
-//! is compiled, one object per module, linked into a single binary.
+//! The inputs are `.core` files or `.erl` files. The driver runs `.erl`
+//! files through `erlc +to_core` first. The driver compiles all modules
+//! together, as a closed world. It compiles only the code that the entry
+//! reaches. The default entry is `main/0` in the module of the first input.
+//! Each module becomes one object. The linker joins the objects into a
+//! single binary.
 //!
-//! A file that fails to parse is skipped with a warning; it only becomes an
-//! error if the program actually needs that module.
+//! If a file does not parse, the driver skips it and prints a warning. The
+//! skip becomes an error only if the program needs that module.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
-    // AST walkers recurse per list cell; stdlib modules carry list literals
-    // thousands of elements deep — give the compiler a deep stack
+    // The AST walkers recurse once per list cell. The stdlib modules hold
+    // list literals that are thousands of elements deep. The compiler
+    // thread needs a deep stack.
     let child = std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
         .spawn(run)
@@ -42,18 +45,14 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "-o" => {
-                output = Some(PathBuf::from(
-                    args.next().ok_or("-o requires an argument")?,
-                ))
-            }
+            "-o" => output = Some(PathBuf::from(args.next().ok_or("-o requires an argument")?)),
             "--entry" => {
                 entry_spec = Some(args.next().ok_or("--entry requires [MODULE:]FUN/ARITY")?)
             }
             "--emit-ir" => emit_ir = true,
-            // external native modules (hex-package native/ crates): a
-            // manifest of `MODULE FUN ARITY SYMBOL MAYGC MAYRAISE` lines,
-            // plus the compiled static lib(s) to link.
+            // External native modules come from the `native/` crates of hex
+            // packages. The manifest holds `MODULE FUN ARITY SYMBOL MAYGC MAYRAISE`
+            // lines. The static libraries to link come with it.
             "--native-manifest" => {
                 native_manifest = Some(PathBuf::from(
                     args.next().ok_or("--native-manifest requires a path")?,
@@ -62,22 +61,22 @@ fn run() -> Result<(), String> {
             "--native-obj" => native_objs.push(PathBuf::from(
                 args.next().ok_or("--native-obj requires a path")?,
             )),
-            // the runtime-implemented module list, for the mix driver's
-            // dependency-closure BFS (one line per module)
+            // The mix driver uses this list of runtime modules for its
+            // dependency-closure BFS. The output has one module per line.
             "--print-bif-modules" => {
                 for m in mana_codegen::BIF_MODULES {
                     println!("{}", m);
                 }
                 return Ok(());
             }
-            // application-own modules: every export stays a root (deps are
-            // pruned; the app is wired by config atoms and template names)
-            "--seed-exports" => seed_exports
-                .push(args.next().ok_or("--seed-exports requires a module name")?),
+            // For modules that belong to the application, every export stays
+            // a root. Dependencies are pruned. Config atoms and template
+            // names wire the application together.
+            "--seed-exports" => {
+                seed_exports.push(args.next().ok_or("--seed-exports requires a module name")?)
+            }
             "-h" | "--help" => {
-                println!(
-                    "usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES..."
-                );
+                println!("usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES...");
                 return Ok(());
             }
             other if other.starts_with('-') => return Err(format!("unknown flag {}", other)),
@@ -93,15 +92,17 @@ fn run() -> Result<(), String> {
         mana_codegen::set_native_manifest(m);
     }
 
-    // Load every input in parallel: read + hash, then either a summary-cache
-    // hit (no parse — the AST is only re-materialized on an object-cache
-    // miss) or parse + summarize + publish. Failures are only fatal if the
-    // module is needed. Order is preserved: units[0] is the default entry
-    // module and link order follows input order. Workers get deep stacks —
-    // AST walkers and the parser recurse per list cell on stdlib literals.
+    // The driver loads every input in parallel. Each worker reads the file
+    // and hashes it. If the summary cache has the hash, the worker does not
+    // parse. The AST is rebuilt only on an object-cache miss. Otherwise the
+    // worker parses, summarizes, and publishes the summary. A failure is
+    // fatal only if the program needs the module. The order is kept:
+    // units[0] is the default entry module, and the link order is the input
+    // order. The workers get deep stacks. The AST walkers and the parser
+    // recurse once per list cell on stdlib literals.
     let t_total = std::time::Instant::now();
     let cache = obj_cache(emit_ir)?;
-    // the reference-walker cross-check needs every AST present
+    // The reference-walker cross-check needs every AST present.
     let force_ast = std::env::var_os("MANA_CHECK_ANALYSIS").is_some();
     let pool = rayon::ThreadPoolBuilder::new()
         .stack_size(256 * 1024 * 1024)
@@ -123,13 +124,14 @@ fn run() -> Result<(), String> {
                     }
                 };
                 let src = std::fs::read_to_string(&core_path).map_err(|e| {
-                    (String::new(), format!("reading {}: {}", core_path.display(), e))
+                    (
+                        String::new(),
+                        format!("reading {}: {}", core_path.display(), e),
+                    )
                 })?;
                 let source_hash = *blake3::hash(src.as_bytes()).as_bytes();
                 if !force_ast {
-                    if let Some(sum) =
-                        cache.as_ref().and_then(|c| c.get_summary(&source_hash))
-                    {
+                    if let Some(sum) = cache.as_ref().and_then(|c| c.get_summary(&source_hash)) {
                         return Ok(mana_codegen::ModuleUnit {
                             path: core_path,
                             source_hash,
@@ -152,8 +154,8 @@ fn run() -> Result<(), String> {
                         })
                     }
                     Err(e) => {
-                        // module name is unknown when parsing fails; key
-                        // by file stem
+                        // The module name is unknown when the parse fails.
+                        // The file stem is the key instead.
                         let name = core_path
                             .file_stem()
                             .map(|s| s.to_string_lossy().into_owned())
@@ -174,7 +176,7 @@ fn run() -> Result<(), String> {
     for r in loaded {
         match r {
             Ok(u) => units.push(u),
-            // empty name = a hard I/O or usage error, not a parse poison
+            // An empty name marks a hard I/O or usage error, not a parse poison.
             Err((name, e)) if name.is_empty() => return Err(e),
             Err((name, e)) => {
                 poisoned.insert(name, e);
@@ -224,11 +226,12 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// The content-addressed object cache under the OS user-cache dir
-/// (~/.cache/mana, ~/Library/Caches/mana, %LOCALAPPDATA%\mana), overridden
-/// by MANA_CACHE_DIR, disabled by MANA_NO_CACHE or --emit-ir. The tool
-/// identity is the manac binary's own content hash (dev-branch rule):
-/// rebuilding the compiler invalidates everything, correctly.
+/// The content-addressed object cache. It lives under the user cache
+/// directory of the OS (~/.cache/mana, ~/Library/Caches/mana,
+/// %LOCALAPPDATA%\mana). MANA_CACHE_DIR overrides the location.
+/// MANA_NO_CACHE or --emit-ir disables the cache. The tool identity is the
+/// content hash of the manac binary itself (the dev-branch rule). A rebuild
+/// of the compiler invalidates every cache entry. This is the correct result.
 fn obj_cache(emit_ir: bool) -> Result<Option<mana_codegen::ObjCache>, String> {
     if emit_ir || std::env::var_os("MANA_NO_CACHE").is_some() {
         return Ok(None);
@@ -237,7 +240,7 @@ fn obj_cache(emit_ir: bool) -> Result<Option<mana_codegen::ObjCache>, String> {
         Some(d) => PathBuf::from(d),
         None => match dirs::cache_dir() {
             Some(d) => d.join("mana"),
-            None => return Ok(None), // no home dir — run uncached
+            None => return Ok(None), // No home directory. Run without a cache.
         },
     };
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
@@ -250,8 +253,9 @@ fn obj_cache(emit_ir: bool) -> Result<Option<mana_codegen::ObjCache>, String> {
     }))
 }
 
-/// `[MODULE:]FUN/ARITY`; module defaults to the first input file's module.
-/// (Module names may contain dots — 'Elixir.Foo' — but never colons.)
+/// Parse `[MODULE:]FUN/ARITY`. If the module is absent, the module of the
+/// first input file is the default. A module name can contain dots, for
+/// example 'Elixir.Foo', but never a colon.
 fn resolve_entry(
     spec: Option<&str>,
     default_module: &str,
@@ -267,13 +271,7 @@ fn resolve_entry(
         Some((m, f)) => (m.to_string(), f.to_string()),
         None => (default_module.to_string(), mf.to_string()),
     };
-    Ok((
-        module,
-        mana_syntax::FunName {
-            name: fun,
-            arity,
-        },
-    ))
+    Ok((module, mana_syntax::FunName { name: fun, arity }))
 }
 
 fn erl_to_core(input: &Path) -> Result<PathBuf, String> {
@@ -298,8 +296,8 @@ fn link(objs: &[PathBuf], native_objs: &[PathBuf], out: &Path) -> Result<(), Str
     let rt = runtime_lib()?;
     let status = Command::new("cc")
         .args(objs)
-        // package native static libs go before libmana_rt.a so their
-        // undefined mana_rt_* symbols resolve against the runtime
+        // The package native static libraries go before libmana_rt.a. Then
+        // their undefined mana_rt_* symbols resolve against the runtime.
         .args(native_objs)
         .arg(&rt)
         .args(["-lpthread", "-ldl", "-lm"])
@@ -313,12 +311,12 @@ fn link(objs: &[PathBuf], native_objs: &[PathBuf], out: &Path) -> Result<(), Str
     Ok(())
 }
 
-/// Parse a native-module manifest: whitespace-separated
-/// `MODULE FUN ARITY SYMBOL MAYGC MAYRAISE` lines (MAYGC/MAYRAISE = 0|1),
-/// blank lines and `#` comments ignored.
+/// Parse a native-module manifest. Each line holds whitespace-separated
+/// fields: `MODULE FUN ARITY SYMBOL MAYGC MAYRAISE`. MAYGC and MAYRAISE are
+/// 0 or 1. The parser ignores blank lines and `#` comments.
 fn parse_native_manifest(path: &Path) -> Result<mana_codegen::NativeManifest, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("reading {}: {}", path.display(), e))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {}", path.display(), e))?;
     let mut m = mana_codegen::NativeManifest::default();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -350,8 +348,9 @@ fn parse_native_manifest(path: &Path) -> Result<mana_codegen::NativeManifest, St
     Ok(m)
 }
 
-/// Find libmana_rt.a: $MANA_RT_LIB overrides; otherwise look next to manac
-/// (cargo puts both artifacts in the same target dir).
+/// Find libmana_rt.a. If $MANA_RT_LIB is set, it wins. Otherwise the
+/// function looks next to manac. Cargo puts both artifacts in the same
+/// target directory.
 fn runtime_lib() -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("MANA_RT_LIB") {
         return Ok(PathBuf::from(p));

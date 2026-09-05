@@ -1,14 +1,14 @@
 defmodule Conf.Bin do
   @moduledoc """
-  Conformance program: byte-aligned binaries — construction, pattern
-  matching (heads, nesting, fixed-size and rest segments, endianness,
-  signedness), the binary BIF pack, term order, and GC/message traffic.
-  binary_to_atom is only exercised with atoms that exist in the program
-  (closed world = binary_to_existing_atom semantics).
+  Conformance program for byte-aligned binaries. It checks construction,
+  pattern matching (heads, nesting, fixed-size and rest segments,
+  endianness, signedness), the binary BIF pack, term order, and GC and
+  message traffic. binary_to_atom only runs with atoms that exist in the
+  program. The closed world gives it binary_to_existing_atom semantics.
   """
 
   def go do
-    # literals + display heuristics
+    # Literals and display heuristics.
     :erlang.display("hello")
     :erlang.display(<<>>)
     :erlang.display(<<1, 2, 3>>)
@@ -92,10 +92,10 @@ defmodule Conf.Bin do
     :erlang.display(catcher(fn -> :erlang.binary_to_existing_atom("no_such_atom_zzz") end))
     :erlang.display(catcher(fn -> <<opaque()::8>> end))
 
-    # GC pressure: build/slice binaries across collections
+    # GC pressure: build and slice binaries across collections.
     :erlang.display(churn(300, 0))
 
-    # binaries through messages (promotion path)
+    # Binaries through messages (the promotion path).
     me = self()
     :erlang.spawn(fn -> send(me, {:bin, <<1, 2, 3, "from child">>}) end)
 

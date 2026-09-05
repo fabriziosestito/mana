@@ -1,6 +1,6 @@
 defmodule Fib do
   @moduledoc """
-  Smallest possible mana program: single module, only `:erlang` BIFs.
+  The smallest possible mana program: a single module that uses only `:erlang` BIFs.
   """
 
   def main do

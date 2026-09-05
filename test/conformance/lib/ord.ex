@@ -1,8 +1,8 @@
 defmodule Conf.Ord do
   @moduledoc """
-  Conformance program: general term order, structural equality, and the
-  tuple/list BIF pack. Every result printed must match BEAM's term order
-  exactly (number < atom < ref < fun < pid < tuple < nil < list).
+  Conformance program for general term order, structural equality, and the
+  tuple and list BIF pack. Every printed result must match the BEAM term
+  order exactly (number < atom < ref < fun < pid < tuple < nil < list).
   """
 
   def go do
@@ -13,7 +13,7 @@ defmodule Conf.Ord do
     :erlang.display([] < [1])
     :erlang.display(:erlang.self() < {:t})
 
-    # atoms order by text
+    # Atoms order by text.
     :erlang.display(:abc < :abd)
     :erlang.display(:zebra > :apple)
     :erlang.display(sort([:pear, :apple, :zebra, :fig]))
@@ -56,7 +56,7 @@ defmodule Conf.Ord do
     :erlang.display(:erlang.is_number(7))
     :erlang.display(:erlang.is_boolean(false))
 
-    # badarg paths are catchable
+    # badarg paths are catchable.
     :erlang.display(
       try do
         :erlang.element(9, t)
@@ -73,13 +73,13 @@ defmodule Conf.Ord do
       end
     )
 
-    # sorted insertion keeps working across GC pressure
+    # Sorted insertion keeps working across GC pressure.
     big = churn_sort(200, [])
     :erlang.display(:erlang.length(big))
     :erlang.display(:erlang.hd(big))
   end
 
-  # insertion sort via general compare
+  # Insertion sort through general compare.
   defp sort([]), do: []
   defp sort([h | t]), do: insert(h, sort(t))
 

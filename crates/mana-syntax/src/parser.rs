@@ -1,4 +1,4 @@
-//! Recursive-descent parser for the Core Erlang subset emitted by `erlc +to_core`.
+//! Recursive-descent parser for the Core Erlang subset that `erlc +to_core` emits.
 
 use crate::ast::*;
 use crate::lexer::{tokenize, Tok};
@@ -21,9 +21,9 @@ impl Parser {
         &self.toks[self.pos.min(self.toks.len() - 1)].0
     }
 
-    /// Lookahead: is the upcoming `( ... )` a map PAIR wrapper — i.e. does
-    /// it contain a top-level `:=`/`=>` before it closes? (Distinguishes
-    /// `( k := v -| ann )` from an annotation-wrapped key `( k -| ann ) := v`.)
+    /// Lookahead: true if the next `( ... )` wraps a whole map pair, that is,
+    /// if it holds a top-level `:=` or `=>` before it closes. This separates
+    /// `( k := v -| ann )` from an annotation-wrapped key `( k -| ann ) := v`.
     fn pair_wrap_ahead(&self) -> bool {
         if *self.peek() != Tok::LParen {
             return false;
@@ -36,7 +36,7 @@ impl Parser {
                 }
                 Tok::RParen | Tok::RBrace | Tok::RBracket | Tok::MapClose | Tok::BinClose => {
                     if depth <= 1 {
-                        return false; // wrapper closed without a pair assoc
+                        return false; // The wrapper closed without a pair assoc.
                     }
                     depth -= 1;
                 }
@@ -87,7 +87,7 @@ impl Parser {
         Err(format!("line {}: {}", self.line(), msg))
     }
 
-    // ---- module ----
+    // Module
 
     fn parse_module(&mut self) -> PResult<Module> {
         self.expect(Tok::Module)?;
@@ -108,7 +108,8 @@ impl Parser {
         let mut behaviours: Vec<String> = Vec::new();
         if !self.eat(&Tok::RBracket) {
             loop {
-                // 'key' = const — behaviour(s) kept, the rest discarded
+                // Each attribute is 'key' = const. The parser keeps only the
+                // behaviour keys and discards the rest.
                 let key = self.parse_atom()?;
                 self.expect(Tok::Eq)?;
                 let value = self.parse_expr()?;
@@ -157,12 +158,16 @@ impl Parser {
     fn parse_atom(&mut self) -> PResult<String> {
         match self.bump() {
             Tok::Atom(s) => Ok(s),
-            other => Err(format!("line {}: expected atom, found {}", self.line(), other)),
+            other => Err(format!(
+                "line {}: expected atom, found {}",
+                self.line(),
+                other
+            )),
         }
     }
 
     fn parse_fname(&mut self) -> PResult<FunName> {
-        // fname may be wrapped in an annotation: ( 'f'/1 -| [...] )
+        // An fname can have an annotation wrapper: ( 'f'/1 -| [...] )
         if self.eat(&Tok::LParen) {
             let f = self.parse_fname()?;
             self.skip_annotation()?;
@@ -184,8 +189,9 @@ impl Parser {
         }
     }
 
-    /// Consume a `-| [...]` annotation if present. The content is arbitrary
-    /// constant terms; we parse structurally and discard.
+    /// If a `-| [...]` annotation is present, consumes it. The content is
+    /// arbitrary constant terms. The parser reads them structurally and
+    /// discards them.
     fn skip_annotation(&mut self) -> PResult<()> {
         if self.eat(&Tok::AnnoBar) {
             self.parse_expr()?;
@@ -193,14 +199,14 @@ impl Parser {
         Ok(())
     }
 
-    // ---- expressions ----
+    // Expressions
 
     fn parse_expr(&mut self) -> PResult<Expr> {
         match self.peek().clone() {
             Tok::LParen => {
                 self.bump();
                 if self.is_fname_ahead() {
-                    // annotated fname used as a value: ( 'f'/1 -| [...] )
+                    // An annotated fname used as a value: ( 'f'/1 -| [...] )
                     let f = self.parse_fname_no_paren()?;
                     self.skip_annotation()?;
                     self.expect(Tok::RParen)?;
@@ -232,7 +238,7 @@ impl Parser {
             }
             Tok::Atom(_) => {
                 if self.is_fname_ahead() {
-                    // bare fname as a value: let <F> = 'tr'/1 in ...
+                    // A bare fname used as a value: let <F> = 'tr'/1 in ...
                     let f = self.parse_fname_no_paren()?;
                     return Ok(Expr::FunRef {
                         module: None,
@@ -244,13 +250,10 @@ impl Parser {
             }
             Tok::Str(s) => {
                 self.bump();
-                // string literal is sugar for a char list
+                // A string literal is sugar for a char list.
                 let mut e = Expr::Lit(Literal::Nil);
                 for c in s.chars().rev() {
-                    e = Expr::Cons(
-                        Box::new(Expr::Lit(Literal::Int(c as i64))),
-                        Box::new(e),
-                    );
+                    e = Expr::Cons(Box::new(Expr::Lit(Literal::Int(c as i64))), Box::new(e));
                 }
                 Ok(e)
             }
@@ -274,7 +277,7 @@ impl Parser {
                 let mut update = None;
                 if !self.eat(&Tok::MapClose) {
                     loop {
-                        // pairs may be annotation-wrapped: `( k := v -| [...] )`
+                        // A pair can have an annotation wrapper: `( k := v -| [...] )`
                         let wrapped = self.pair_wrap_ahead();
                         if wrapped {
                             self.expect(Tok::LParen)?;
@@ -310,7 +313,7 @@ impl Parser {
             }
             Tok::Fun => {
                 self.bump();
-                // `fun 'm':'f'/a` / `fun 'f'/a` — a fun reference
+                // `fun 'm':'f'/a` or `fun 'f'/a` is a fun reference.
                 if matches!(self.peek(), Tok::Atom(_)) {
                     let first = self.parse_atom()?;
                     if self.eat(&Tok::Colon) {
@@ -333,7 +336,7 @@ impl Parser {
                 let mut params = Vec::new();
                 if !self.eat(&Tok::RParen) {
                     loop {
-                        // parameters may be annotation-wrapped:
+                        // A parameter can have an annotation wrapper:
                         // `fun (( _0 -| ['compiler_generated'] )) -> ...`
                         let wrapped = self.eat(&Tok::LParen);
                         let v = match self.bump() {
@@ -411,10 +414,11 @@ impl Parser {
                 }
             }
             Tok::Catch => {
-                // old-style `catch E`: value on success; thrown value for
-                // throw; {'EXIT', Reason} for exit; {'EXIT', {Reason, []}}
-                // for error (stacktrace omitted — TODO(stacktraces)). erlc
-                // usually lowers catch to try itself; unicode.erl keeps it.
+                // Old-style `catch E`. On success, the result is the value.
+                // For throw, the result is the thrown value. For exit, it is
+                // {'EXIT', Reason}. For error, it is {'EXIT', {Reason, []}}.
+                // TODO(stacktraces): the handler omits the stacktrace. erlc
+                // usually lowers catch to try itself. unicode.erl keeps it.
                 self.bump();
                 let arg = self.parse_expr()?;
                 let exit_a = || Expr::Lit(Literal::Atom("EXIT".into()));
@@ -429,10 +433,7 @@ impl Parser {
                         Clause {
                             patterns: vec![Pattern::Lit(Literal::Atom("exit".into()))],
                             guard: Expr::Lit(Literal::Atom("true".into())),
-                            body: Expr::Tuple(vec![
-                                exit_a(),
-                                Expr::Var("_CatchReason".into()),
-                            ]),
+                            body: Expr::Tuple(vec![exit_a(), Expr::Var("_CatchReason".into())]),
                         },
                         Clause {
                             patterns: vec![Pattern::Var("_CatchOther".into())],
@@ -512,8 +513,8 @@ impl Parser {
         }
     }
 
-    /// True if the next tokens are `'atom' / int` (an fname), used to
-    /// disambiguate inside parentheses.
+    /// True if the next tokens are `'atom' / int` (an fname). This check
+    /// disambiguates inside parentheses.
     fn is_fname_ahead(&self) -> bool {
         matches!(self.toks.get(self.pos).map(|t| &t.0), Some(Tok::Atom(_)))
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.0), Some(Tok::Slash))
@@ -557,14 +558,15 @@ impl Parser {
         }
     }
 
-    /// Module/function position of `call`: usually an atom, but erlc emits
-    /// arbitrary expressions for dynamic dispatch. Annotations stripped.
+    /// The module or function position of `call`. Usually it is an atom, but
+    /// erlc emits arbitrary expressions for dynamic dispatch. The parser
+    /// strips annotations.
     fn parse_call_pos(&mut self) -> PResult<Expr> {
         let e = self.parse_expr()?;
         Ok(e)
     }
 
-    /// An atom, possibly annotated/parenthesized (module/function position of `call`).
+    /// An atom with optional annotation and parentheses.
     fn parse_atom_expr(&mut self) -> PResult<String> {
         if self.eat(&Tok::LParen) {
             let a = self.parse_atom_expr()?;
@@ -617,7 +619,7 @@ impl Parser {
         Ok(e)
     }
 
-    /// `#{ #<v>(spec...), ... }#` — caller supplies how to parse the value
+    /// `#{ #<v>(spec...), ... }#`. The caller supplies the value parser
     /// (expression or pattern position). Consumes from BinOpen through BinClose.
     fn parse_binary<V>(
         &mut self,
@@ -629,7 +631,7 @@ impl Parser {
             return Ok(segs);
         }
         loop {
-            // segments may be annotation-wrapped: `( #<v>(spec) -| [...] )`
+            // A segment can have an annotation wrapper: `( #<v>(spec) -| [...] )`
             let wrapped = self.eat(&Tok::LParen);
             self.expect(Tok::SegOpen)?;
             let value = parse_value(self)?;
@@ -684,10 +686,10 @@ impl Parser {
         }
     }
 
-    // ---- clauses & patterns ----
+    // Clauses and patterns
 
     fn parse_clause(&mut self) -> PResult<Clause> {
-        // a whole clause may be annotated: ( <ps> when g -> b -| [...] )
+        // A whole clause can have an annotation: ( <ps> when g -> b -| [...] )
         if self.eat(&Tok::LParen) {
             let c = self.parse_clause()?;
             self.skip_annotation()?;
@@ -722,14 +724,12 @@ impl Parser {
 
     fn parse_pattern(&mut self) -> PResult<Pattern> {
         let first = self.parse_pattern_primary()?;
-        // aliases `P1 = P2` can follow any pattern (erlc parenthesizes and
-        // annotates either side); one side must be a variable
+        // An alias `P1 = P2` can follow any pattern. erlc parenthesizes and
+        // annotates either side. One side must be a variable.
         if self.eat(&Tok::Eq) {
             let second = self.parse_pattern()?;
             match (first, second) {
-                (Pattern::Var(v), p) | (p, Pattern::Var(v)) => {
-                    Ok(Pattern::Alias(v, Box::new(p)))
-                }
+                (Pattern::Var(v), p) | (p, Pattern::Var(v)) => Ok(Pattern::Alias(v, Box::new(p))),
                 _ => Err(format!(
                     "line {}: alias pattern without a variable side",
                     self.line()
@@ -746,7 +746,7 @@ impl Parser {
                 self.bump();
                 Ok(Pattern::Var(v))
             }
-            // `( pat -| ann )` — aliases inside handled by parse_pattern
+            // `( pat -| ann )`. parse_pattern handles aliases inside the parentheses.
             Tok::LParen => {
                 self.bump();
                 let pat = self.parse_pattern()?;
@@ -872,7 +872,13 @@ end
         let m = parse_module(src).expect("parse");
         assert_eq!(m.name, "m");
         assert_eq!(m.definitions.len(), 1);
-        assert_eq!(m.definitions[0].0, FunName { name: "f".into(), arity: 1 });
+        assert_eq!(
+            m.definitions[0].0,
+            FunName {
+                name: "f".into(),
+                arity: 1
+            }
+        );
     }
 
     #[test]
@@ -894,7 +900,7 @@ end
 
     #[test]
     fn parses_binary_literals() {
-        // shape taken from Elixir's generated __info__/1 (exports_md5 clause)
+        // The shape comes from the __info__/1 that Elixir generates (the exports_md5 clause).
         let src = r#"
 module 'm' ['f'/0]
     attributes []

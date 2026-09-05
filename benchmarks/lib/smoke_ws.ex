@@ -1,9 +1,9 @@
 defmodule Smoke.Ws do
   @moduledoc """
-  GC soak: join the counter LiveView once, then fire N phx-click events on
-  the same kept-alive websocket, awaiting each diff reply. Exercises the
-  parked-process minor GC and the websocket hot path under churn. N comes
-  from SMOKE_N (default 10_000).
+  GC soak. It joins the counter LiveView once, then fires N phx-click
+  events on the same kept-alive websocket and waits for each diff reply.
+  This checks the parked-process minor GC and the websocket hot path under
+  churn. N comes from SMOKE_N (default 10_000).
   """
 
   @secret String.duplicate("mana-secret!", 6)

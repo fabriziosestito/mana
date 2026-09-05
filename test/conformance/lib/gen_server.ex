@@ -1,13 +1,13 @@
 defmodule Conf.GenServer do
   @moduledoc """
-  Conformance program: real OTP gen_server compiled from the OTP beams —
-  start_link, call, cast, handle_info, named registration, timeouts,
-  stop semantics, monitors of servers, and an Agent on top.
+  Conformance program for a real OTP gen_server compiled from the OTP beams.
+  It checks start_link, call, cast, handle_info, named registration,
+  timeouts, stop semantics, monitors of servers, and an Agent on top.
   """
   use GenServer
 
   def go do
-    # anonymous server: call/cast round-trips
+    # anonymous server: call and cast round-trips
     {:ok, pid} = GenServer.start_link(__MODULE__, 0)
     :erlang.display(GenServer.call(pid, :get))
     GenServer.cast(pid, {:add, 5})
@@ -15,18 +15,18 @@ defmodule Conf.GenServer do
     :erlang.display(GenServer.call(pid, :get))
     :erlang.display(GenServer.call(pid, {:mul, 10}))
 
-    # plain messages arrive at handle_info
+    # Plain messages arrive at handle_info.
     send(pid, {:add_info, 3})
     :erlang.display(GenServer.call(pid, :get))
 
-    # state threading under load (GC pressure through the server loop)
+    # State threading under load: GC pressure through the server loop.
     Enum.each(1..200, fn i -> GenServer.cast(pid, {:add, i}) end)
     :erlang.display(GenServer.call(pid, :get))
 
-    # reply from a spawned task via GenServer.reply
+    # A reply from a spawned task through GenServer.reply.
     :erlang.display(GenServer.call(pid, :deferred))
 
-    # stop: terminate callback runs, then the server is gone
+    # Stop: the terminate callback runs, then the server is gone.
     :erlang.display(GenServer.stop(pid))
     :erlang.display(Process.alive?(pid))
 
@@ -37,7 +37,7 @@ defmodule Conf.GenServer do
     :erlang.display(GenServer.stop(:conf_named))
     :erlang.display(Process.whereis(:conf_named))
 
-    # call timeout: server that answers slowly
+    # Call timeout: a server that answers slowly.
     {:ok, slow} = GenServer.start_link(__MODULE__, 0)
 
     :erlang.display(
@@ -48,7 +48,7 @@ defmodule Conf.GenServer do
       end
     )
 
-    # monitor sees a server crash (reason preserved)
+    # A monitor sees a server crash. The reason is preserved.
     {:ok, doomed} = GenServer.start(Conf.GenServer.Doomed, nil)
     ref = Process.monitor(doomed)
     GenServer.cast(doomed, :boom)
@@ -59,7 +59,7 @@ defmodule Conf.GenServer do
 
     :erlang.display(Process.alive?(doomed))
 
-    # Agent (gen_server underneath)
+    # Agent: a gen_server underneath.
     {:ok, agent} = Agent.start_link(fn -> %{count: 0} end)
     Agent.update(agent, fn m -> Map.put(m, :count, m.count + 41) end)
     :erlang.display(Agent.get(agent, fn m -> m.count + 1 end))

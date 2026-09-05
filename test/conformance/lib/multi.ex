@@ -8,9 +8,9 @@ end
 
 defmodule Conf.Multi do
   @moduledoc """
-  Conformance program: cross-module calls and — crucially — cross-module
-  atom identity (`tag() == :hello` compares an atom created in MultiHelper's
-  object against one created in this module's object).
+  Conformance program for cross-module calls and, above all, cross-module
+  atom identity. `tag() == :hello` compares an atom created in the object
+  of MultiHelper against one created in the object of this module.
   """
 
   def go do

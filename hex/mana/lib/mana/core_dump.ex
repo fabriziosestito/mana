@@ -1,12 +1,12 @@
 defmodule Mana.CoreDump do
   @moduledoc """
-  Extracts textual Core Erlang from a compiled `.beam` file.
+  This module extracts textual Core Erlang from a compiled `.beam` file.
 
-  Reads the `debug_info` chunk (the project must be compiled with
-  `debug_info: true`, which is Mix's default outside `:prod`), asks the
-  compiler backend for the Core Erlang form, and pretty-prints it with
-  `:core_pp` — the same textual format `erlc +to_core` emits, which is
-  what `manac` parses.
+  It reads the `debug_info` chunk. The project must be compiled with
+  `debug_info: true`. This is the Mix default outside `:prod`. The module asks
+  the compiler backend for the Core Erlang form and pretty-prints it with
+  `:core_pp`. The result is the same textual format that `erlc +to_core`
+  emits. `manac` parses this format.
   """
 
   def dump!(beam_path, out_path) do

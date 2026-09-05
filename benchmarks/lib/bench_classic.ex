@@ -1,7 +1,8 @@
 defmodule Bench.Classic do
   @moduledoc """
-  The scoreboard, benchee-ified: identical module runs on BEAM and mana.
-  memory/reduction collection stays off (tracing is BEAM-internal).
+  The scoreboard as a benchee suite. The identical module runs on BEAM and
+  on mana. Memory and reduction collection stays off, because tracing is
+  BEAM-internal.
   """
 
   def run do

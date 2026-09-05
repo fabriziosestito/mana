@@ -1,7 +1,8 @@
 defmodule Bench.Phx do
   @moduledoc """
-  The scaffolded Phoenix app serving its landing page, measured with a raw
-  gen_tcp client: connect+GET+close cycles and keep-alive GETs.
+  The scaffolded Phoenix app that serves its landing page, measured with a
+  raw gen_tcp client. It measures connect, GET, and close cycles, and
+  keep-alive GETs.
   """
 
   @secret String.duplicate("mana-secret!", 6)
@@ -76,7 +77,7 @@ defmodule Bench.Phx do
     read_body(c, buf <> more, len)
   end
 
-  # content-length from a response head without a regex (cheap client)
+  # Reads the content-length from a response head without a regex, to keep the client cheap.
   defp content_length(head) do
     head
     |> String.split("\r\n")

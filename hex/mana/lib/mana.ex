@@ -1,6 +1,6 @@
 defmodule Mana do
   @moduledoc """
-  Locates the `manac` compiler binary for `mix mana.compile`.
+  This module finds the `manac` compiler binary for `mix mana.compile`.
 
   Resolution order:
 

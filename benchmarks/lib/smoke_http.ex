@@ -1,5 +1,5 @@
 defmodule Smoke.Http do
-  @moduledoc "Manual curl smoke: serve on a fixed port until killed."
+  @moduledoc "Manual curl smoke test. It serves on a fixed port until killed."
   def run do
     :logger.remove_handler(:default)
 

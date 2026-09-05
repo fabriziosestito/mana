@@ -1,10 +1,11 @@
 defmodule Conf.CounterHttp do
   @moduledoc """
   Minimal LiveView dead-render gate: GET /counter with a Host header that
-  carries NO port (`host: t`). That path resolves the port via
-  URI.default_port/1, which returns nil unless the elixir_config URI table
-  is seeded at boot — a portful Host header (localhost:PORT) masks the bug,
-  so this program pins the portless case. Prints only stable facts.
+  carries NO port (`host: t`). That path resolves the port with
+  URI.default_port/1. The function returns nil unless the elixir_config URI
+  table is seeded at boot. A Host header with a port (localhost:PORT) masks
+  the bug, so this program pins the portless case. It prints only stable
+  facts.
   """
 
   def go do

@@ -5,13 +5,14 @@ end
 defmodule Conf.Inspect do
   @moduledoc """
   The Inspect protocol end to end: inspect/1 and IO.inspect through
-  Inspect.Algebra, Code.Identifier and the leaf impls. Small maps only
-  (flatmap key order matches BEAM's sorted order); no pids/refs/funs
-  (nondeterministic rendering).
+  Inspect.Algebra, Code.Identifier, and the leaf impls. The program uses
+  small maps only, because the flatmap key order matches the sorted order
+  of BEAM. It uses no pids, refs, or funs, because their rendering is
+  nondeterministic.
   """
 
   def go do
-    # integers / floats
+    # integers and floats
     IO.puts(inspect(0))
     IO.puts(inspect(-42))
     IO.puts(inspect(1_152_921_504_606_846_975))
@@ -31,7 +32,7 @@ defmodule Conf.Inspect do
     IO.puts(inspect(:%{}))
     IO.puts(inspect(:+))
 
-    # binaries / strings
+    # binaries and strings
     IO.puts(inspect("hello"))
     IO.puts(inspect("with \"quotes\" and \n newline"))
     IO.puts(inspect("unicode: héllo ünïcode"))
@@ -57,7 +58,7 @@ defmodule Conf.Inspect do
     IO.puts(inspect({:ok, 1}))
     IO.puts(inspect({:error, {:nested, [1, 2]}, "msg"}))
 
-    # maps (small, deterministic sorted flatmap order on both sides)
+    # Maps: small, so the sorted flatmap order is deterministic on both sides.
     IO.puts(inspect(%{}))
     IO.puts(inspect(%{a: 1}))
     IO.puts(inspect(%{a: 1, b: 2, z: 26}))
@@ -79,7 +80,7 @@ defmodule Conf.Inspect do
     IO.puts(inspect("no quotes", binaries: :as_binaries))
     IO.puts(inspect([104, 105], charlists: :as_lists))
 
-    # IO.inspect returns its argument and supports label:
+    # IO.inspect returns its argument and supports label:.
     x = IO.inspect({:passthrough, 1}, label: "lbl")
     IO.puts(inspect(x == {:passthrough, 1}))
 

@@ -1,4 +1,4 @@
-//! Lexer for Core Erlang text as printed by `erlc +to_core`.
+//! Lexer for the Core Erlang text that `erlc +to_core` prints.
 
 use std::fmt;
 
@@ -23,10 +23,10 @@ pub enum Tok {
     Catch,
     Receive,
     After,
-    // literals & names
+    // literals and names
     Int(i64),
-    /// An integer literal too large for i64 (erlc folds long string
-    /// constants into single wide bitstring segments). Decimal digits.
+    /// An integer literal outside the 61-bit small range, as decimal digits.
+    /// erlc folds long string constants into single wide bitstring segments.
     BigInt(String),
     Float(f64),
     Atom(String),
@@ -126,9 +126,8 @@ impl<'a> Lexer<'a> {
             b'(' => Ok(Tok::LParen),
             b')' => Ok(Tok::RParen),
             b'{' => Ok(Tok::LBrace),
-            // `}` followed by `#`/`~` closes a bitstring/map; a plain
-            // tuple-close is always followed by `,`/`)`/... in valid Core
-            // Erlang, never `#` or `~`.
+            // `}#` closes a bitstring and `}~` closes a map. In valid Core
+            // Erlang, `#` or `~` never comes directly after a tuple-close `}`.
             b'}' => match self.peek() {
                 Some(b'#') => {
                     self.bump();
@@ -230,7 +229,7 @@ impl<'a> Lexer<'a> {
     fn lex_name(&mut self) -> String {
         let start = self.pos;
         while let Some(c) = self.peek() {
-            // '?' and '!' appear in Elixir-generated variable names
+            // Variable names that Elixir generates contain '?' and '!'.
             if c.is_ascii_alphanumeric() || c == b'_' || c == b'@' || c == b'?' || c == b'!' {
                 self.bump();
             } else {
@@ -245,7 +244,7 @@ impl<'a> Lexer<'a> {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.bump();
         }
-        // float: digits '.' digits, optional exponent
+        // A float is digits '.' digits, with an optional exponent.
         let is_float = self.peek() == Some(b'.')
             && matches!(self.src.get(self.pos + 1), Some(c) if c.is_ascii_digit());
         if is_float {
@@ -269,9 +268,9 @@ impl<'a> Lexer<'a> {
             return Ok(Tok::Float(if negative { -v } else { v }));
         }
         let text = String::from_utf8_lossy(&self.src[start..self.pos]);
-        // smalls are 61-bit tagged (-2^60 ..= 2^60-1): anything outside is
-        // a big literal even when it fits i64 — the old i64 cutoff let
-        // literals in [2^60, 2^63) wrap silently at codegen
+        // Small integers are 61-bit tagged (-2^60 ..= 2^60-1). A value outside
+        // this range is a big literal even when it fits i64. An i64 cutoff
+        // let literals in [2^60, 2^63) wrap silently at codegen.
         const SMALL_MAX: i64 = (1 << 60) - 1;
         const SMALL_MIN: i64 = -(1 << 60);
         match text.parse::<i64>() {
@@ -349,7 +348,7 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// Tokenize the whole input up front.
+/// Tokenizes the whole input before the parser starts.
 pub fn tokenize(src: &str) -> LexResult<Vec<(Tok, usize)>> {
     let mut lx = Lexer::new(src);
     let mut out = Vec::new();

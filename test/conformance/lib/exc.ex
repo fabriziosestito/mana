@@ -1,9 +1,9 @@
 defmodule Conf.Exc do
   @moduledoc """
-  Conformance program: exceptions — throw/exit/error caught, nested try,
-  re-raise on unmatched catch clauses, cross-function failures, badfun,
-  case_clause, after blocks. Uses Elixir's `catch class, reason` form only
-  (rescue needs Exception structs, i.e. maps/stdlib we don't support yet).
+  Conformance program for exceptions. It checks caught throw, exit, and
+  error, nested try, re-raise on unmatched catch clauses, cross-function
+  failures, badfun, case_clause, and after blocks. It uses only the Elixir
+  `catch class, reason` form, so the printed reasons are plain terms.
   """
 
   def go do
@@ -12,22 +12,22 @@ defmodule Conf.Exc do
     :erlang.display(catcher(fn -> :erlang.exit(:normal_ish) end))
     :erlang.display(catcher(fn -> :erlang.error(:boom) end))
 
-    # no exception: body value flows through
+    # No exception: the body value flows through.
     :erlang.display(catcher(fn -> 42 end))
 
-    # reasons carrying heap data survive the catch (GC scans eternal refs)
+    # Reasons that carry heap data survive the catch. GC scans eternal refs.
     :erlang.display(catcher(fn -> :erlang.throw({:data, [1, 2, 3]}) end))
 
-    # nested: inner catches only :specific, others pass to the outer
+    # Nested: the inner try catches only :specific. Others pass to the outer try.
     :erlang.display(nested(:specific))
     :erlang.display(nested(:other))
 
-    # failures raised by the machine, not by user code
+    # Failures raised by the machine, not by user code.
     :erlang.display(catcher(fn -> one_only(2) end))
     :erlang.display(catcher(fn -> case 7 do 1 -> :one end end))
     :erlang.display(catcher(fn -> not_a_fun() end))
 
-    # after runs on both paths
+    # after runs on both paths.
     :erlang.display(with_after(fn -> :fine end))
     :erlang.display(with_after(fn -> :erlang.throw(:oops) end))
   end

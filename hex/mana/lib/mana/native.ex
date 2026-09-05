@@ -1,9 +1,9 @@
 defmodule Mana.Native do
   @moduledoc """
-  Marker for modules whose function bodies are implemented in a native
-  crate shipped alongside the Hex package under `native/<pkg>/`, in the
-  spirit of `use Rustler` but targeting mana's closed-world single-binary
-  build.
+  Marker for modules whose function bodies live in a native crate. The crate
+  ships with the Hex package under `native/<pkg>/`. The idea is close to
+  `use Rustler`, but the target is the closed-world single-binary build of
+  mana.
 
   ## Usage
 
@@ -13,15 +13,15 @@ defmodule Mana.Native do
         def hello(_), do: {:error, :not_supported_on_beam}
       end
 
-  On BEAM the bodies you write here run as ordinary Elixir. On mana the
-  package ships a Rust crate at `native/<package>/` that exports
-  `#[no_mangle]` symbols named `<module>_<fun>_<arity>`; the compiler
-  discovers the dep's `mana_native:` mix metadata, cargo-builds the crate,
-  and lowers calls to this module straight to those symbols.
+  On BEAM the bodies that you write here run as ordinary Elixir. On mana the
+  package ships a Rust crate at `native/<package>/`. The crate exports
+  `#[no_mangle]` symbols named `<module>_<fun>_<arity>`. The compiler finds
+  the `mana_native:` mix metadata of the dep, builds the crate with cargo,
+  and lowers calls to this module directly to those symbols.
 
-  This macro is a documentation/marker hook — it does not generate native
-  code. Discovery is driven by the `mana_native:` keyword in the dep's
-  `mix.exs`:
+  This macro is a documentation and marker hook. It does not generate native
+  code. The `mana_native:` keyword in the `mix.exs` of the dep drives the
+  discovery:
 
       def project do
         [

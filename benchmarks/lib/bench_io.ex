@@ -1,8 +1,9 @@
 defmodule Bench.Io do
   @moduledoc """
   I/O foundation scoreboard: file round-trips and TCP loopback echo.
-  The tcp entry measures a full connect + send + exact recv + close cycle
-  (everything inside the measured fun — no cross-process socket ownership).
+  The tcp entry measures a full connect, send, exact recv, and close cycle.
+  Everything runs inside the measured fun. There is no cross-process socket
+  ownership.
   """
 
   @dir "/tmp/mana_bench_io_scratch"

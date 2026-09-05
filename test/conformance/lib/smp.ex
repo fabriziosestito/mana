@@ -1,23 +1,23 @@
 defmodule Conf.Smp do
   @moduledoc """
-  Conformance program: SMP stress — many processes exchanging allocating
-  payloads across schedulers while forcing minor collections (promotion
-  churn) and old-space growth (majors). Output is deterministic regardless
-  of scheduler count.
+  Conformance program for SMP stress. Many processes exchange allocating
+  payloads across schedulers. The traffic forces minor collections
+  (promotion churn) and old-space growth (majors). The output is
+  deterministic for any scheduler count.
   """
 
   def go do
     me = self()
 
-    # 32 workers, 20 rounds each: every round builds a fresh list (nursery
-    # churn), sends it for summation, and the reply crosses back
+    # 32 workers, 20 rounds each. Every round builds a fresh list (nursery
+    # churn) and sends it for summation. The reply crosses back.
     workers = spawn_workers(me, 32, [])
     :erlang.display(drive(workers, 20, 0))
 
-    # chain: token passes through 100 processes, each adding its index
+    # Chain: a token passes through 100 processes, and each adds its index.
     :erlang.display(chain(me, 100))
 
-    # burst: everyone sends at once; collect deterministically by index
+    # Burst: everyone sends at once. Collect deterministically by index.
     burst = spawn_burst(me, 64, [])
     :erlang.display(collect_burst(burst, 0))
   end

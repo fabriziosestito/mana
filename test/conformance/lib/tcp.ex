@@ -1,8 +1,9 @@
 defmodule Conf.Tcp do
   @moduledoc """
-  gen_tcp passive mode over loopback: listen on an ephemeral port (never
-  printed), an echo server process, exact-length recvs (TCP chunking is
-  nondeterministic — recv(S, N) is not), timeout and closed paths.
+  gen_tcp passive mode over loopback. The program listens on an ephemeral
+  port that it never prints, runs an echo server process, and does
+  exact-length recvs. TCP chunking is nondeterministic, but recv(S, N) is
+  not. It also checks the timeout and closed paths.
   """
 
   def go do
@@ -15,7 +16,7 @@ defmodule Conf.Tcp do
     server =
       spawn(fn ->
         {:ok, s} = :gen_tcp.accept(l)
-        # echo fixed script: 5 bytes, then 6 bytes, then 4-byte quit
+        # Echo a fixed script: 5 bytes, then 6 bytes, then a 4-byte quit.
         {:ok, d1} = :gen_tcp.recv(s, 5)
         :ok = :gen_tcp.send(s, d1)
         {:ok, d2} = :gen_tcp.recv(s, 6)
@@ -27,7 +28,7 @@ defmodule Conf.Tcp do
 
     {:ok, c} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}])
 
-    # peername/sockname agreement (ports never printed — only booleans)
+    # peername and sockname agreement. The ports never print, only booleans.
     {:ok, {chost, cport}} = :inet.sockname(c)
     {:ok, {phost, pport}} = :inet.peername(c)
     IO.puts(inspect({chost, phost}))
@@ -40,7 +41,7 @@ defmodule Conf.Tcp do
     IO.puts(inspect(:gen_tcp.recv(c, 3)))
     IO.puts(inspect(:gen_tcp.recv(c, 4)))
 
-    # nothing pending: recv with a timeout
+    # Nothing pending: recv with a timeout.
     IO.puts(inspect(:gen_tcp.recv(c, 1, 100)))
 
     :ok = :gen_tcp.send(c, "quit")
@@ -49,11 +50,11 @@ defmodule Conf.Tcp do
       {:server_done, n} -> IO.puts(inspect({:server_done, n}))
     end
 
-    # server closed its end: reads drain to closed
+    # The server closed its end: reads drain to closed.
     IO.puts(inspect(:gen_tcp.recv(c, 1)))
     IO.puts(inspect(:gen_tcp.close(c)))
 
-    # connect to a dead port fails fast
+    # A connect to a dead port fails fast.
     {:ok, l2} = :gen_tcp.listen(0, [])
     {:ok, dead_port} = :inet.port(l2)
     :ok = :gen_tcp.close(l2)
@@ -76,14 +77,14 @@ defmodule Conf.Tcp do
     :ok = :gen_tcp.close(l)
     IO.puts(inspect(is_pid(server)))
 
-    # active mode: {tcp, S, Data} / {tcp_closed, S} as real messages
+    # Active mode: {tcp, S, Data} and {tcp_closed, S} arrive as real messages.
     {:ok, l4} = :gen_tcp.listen(0, [:binary, {:active, false}])
     {:ok, port4} = :inet.port(l4)
 
     spawn(fn ->
       {:ok, s} = :gen_tcp.accept(l4)
       :ok = :gen_tcp.send(s, "one")
-      # wait for the go-ahead so the two messages can't coalesce
+      # Wait for the go-ahead so that the two messages cannot coalesce.
       {:ok, "go"} = :gen_tcp.recv(s, 2)
       :ok = :gen_tcp.send(s, "two")
       {:ok, "go"} = :gen_tcp.recv(s, 2)
@@ -96,7 +97,7 @@ defmodule Conf.Tcp do
       {:tcp, ^c4, data} -> IO.puts(inspect({:active_once, data}))
     end
 
-    # active once consumed: no further tcp messages until re-armed
+    # Active once is consumed: no further tcp messages arrive until re-armed.
     receive do
       {:tcp, ^c4, _} -> IO.puts("unexpected")
     after
@@ -119,7 +120,7 @@ defmodule Conf.Tcp do
     :ok = :gen_tcp.close(c4)
     :ok = :gen_tcp.close(l4)
 
-    # controlling_process: messages follow the new owner
+    # controlling_process: messages follow the new owner.
     {:ok, l5} = :gen_tcp.listen(0, [:binary, {:active, false}])
     {:ok, port5} = :inet.port(l5)
 

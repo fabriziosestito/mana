@@ -1,9 +1,9 @@
 defmodule Bench.EctoLoop do
   @moduledoc """
   Profiling vehicle for the changeset pipeline: a plain tight loop around
-  `Bench.Ecto.User.changeset/2` with no benchee machinery, so callgrind
-  profiles attribute cost to the pipeline itself. `Bench.Ecto` (benchee)
-  stays the official scoreboard.
+  `Bench.Ecto.User.changeset/2` with no benchee machinery. Callgrind
+  profiles therefore attribute the cost to the pipeline itself.
+  `Bench.Ecto` (benchee) stays the official scoreboard.
   """
   alias Bench.Ecto.User
 

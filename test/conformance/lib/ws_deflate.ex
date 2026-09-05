@@ -2,10 +2,10 @@ defmodule Conf.WsDeflate do
   @moduledoc """
   The counter LiveView driven over a permessage-deflate websocket. The
   client offers the extension, so Bandit compresses its frames (RSV1) and
-  expects compressed frames back. Exercises the streaming zlib path on the
-  websocket hot path. Printed facts are the same decoded join/diff facts
-  as Conf.Ws plus the negotiated extension and RSV1 markers — never raw
-  compressed bytes.
+  expects compressed frames back. This checks the streaming zlib path on
+  the websocket hot path. The printed facts are the same decoded join and
+  diff facts as in Conf.Ws, plus the negotiated extension and the RSV1
+  markers. Raw compressed bytes never print.
   """
 
   alias Conf.WsClient, as: C
@@ -18,7 +18,7 @@ defmodule Conf.WsDeflate do
     IO.puts(status)
     tokens = C.extract(headers, body)
 
-    # upgrade WITH a permessage-deflate offer
+    # Upgrade WITH a permessage-deflate offer.
     {sock, ws_status, ws_headers, accept_ok} =
       C.upgrade(port, tokens, ["sec-websocket-extensions: permessage-deflate\r\n"])
 

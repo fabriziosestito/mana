@@ -1,9 +1,10 @@
 defmodule Conf.Base do
   @moduledoc """
-  Elixir.Base encode/decode 64 (std + url) and 16 — natively overridden on
-  mana (Base is a compiled clause-table codec; url_encode64 alone was ~13%
-  of a Phoenix request). Pins padding / ignore-whitespace / case rules and
-  the error shapes against the BEAM oracle.
+  Elixir.Base encode and decode for base 64 (standard and url) and base 16.
+  mana overrides Base natively: Base is a compiled clause-table codec, and
+  url_encode64 alone was about 13% of a Phoenix request. This program pins
+  the padding, ignore-whitespace, and case rules and the error shapes
+  against the BEAM oracle.
   """
 
   def go do
@@ -26,7 +27,7 @@ defmodule Conf.Base do
       IO.puts(inspect(Base.decode16(Base.encode16(data), case: :mixed) == {:ok, data}))
     end
 
-    # decode64 edge matrix (both padding modes, with/without whitespace)
+    # decode64 edge matrix: both padding modes, with and without whitespace.
     inputs = [
       "YWI=", "YWI", "YW==", "YW=", "YQ==", "YQ=", "YR==", "Y", "", "YWI=x", "=", "==", "====",
       "YW I=", "YW I=\n", "YW\tI=", "\r\nYWI=", "YW\x0bI=", "YWJj", "YWJjZA==", "YWJjZA",
@@ -59,7 +60,7 @@ defmodule Conf.Base do
       )
     end
 
-    # bad arguments raise the same exception on both runtimes
+    # Bad arguments raise the same exception on both runtimes.
     for f <- [
           fn -> Base.encode64(:x) end,
           fn -> Base.encode64("a", foo: 1) end,

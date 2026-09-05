@@ -1,5 +1,5 @@
 defmodule Smoke.Phx do
-  @moduledoc "Minimal keepalive hammer for the landing page (segv repro)."
+  @moduledoc "Minimal keepalive hammer for the landing page. It reproduces a segv."
   @secret String.duplicate("mana-secret!", 6)
   @req "GET / HTTP/1.1\r\nhost: bench\r\n\r\n"
 
@@ -47,7 +47,7 @@ defmodule Smoke.Phx do
   defp read_response(c, acc) do
     case :binary.split(acc, "\r\n\r\n") do
       [head, body] ->
-        # cheap client: the bench measures the server, not a regex per response
+        # Cheap client: the bench measures the server, not a regex per response.
         read_body(c, body, content_length(head))
 
       _ ->
@@ -63,7 +63,7 @@ defmodule Smoke.Phx do
     read_body(c, buf <> more, len)
   end
 
-  # content-length from a response head without a regex (cheap client)
+  # Reads the content-length from a response head without a regex, to keep the client cheap.
   defp content_length(head) do
     head
     |> String.split("\r\n")

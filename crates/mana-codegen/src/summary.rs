@@ -1,21 +1,26 @@
-//! Per-module analysis summaries: everything `reachable_funs`, the effect
-//! fixpoints, and `action_key` consume — WITHOUT the AST. Summaries are
-//! produced by the same collectors/condensers the analysis uses on a parsed
-//! module, so a summary can never diverge from what parsing would yield;
-//! they are cached on disk keyed by (format, tool_hash, source_hash), which
-//! makes staleness impossible by construction (any source or compiler
-//! change moves the key).
+//! Per-module analysis summaries. A summary holds everything that
+//! `reachable_funs`, the effect fixpoints, and `action_key` consume, WITHOUT
+//! the AST. The same collectors and condensers that the analysis runs on a
+//! parsed module produce the summary. So a summary can never diverge from
+//! the result of a parse.
 //!
-//! Serialization is a hand-rolled length-prefixed format (no dependency,
-//! fully deterministic); any decode irregularity is treated as a miss.
+//! The disk cache keys summaries by (format, tool_hash, source_hash). Any
+//! source or compiler change moves the key. So a stale summary is impossible
+//! by construction.
+//!
+//! The serialization is a hand-rolled length-prefixed format (no dependency,
+//! fully deterministic). Any decode irregularity counts as a miss.
 
-use crate::{cond_may_gc, cond_may_raise, collect_atom_arg_pairs, collect_atoms,
-            collect_dyn_names, collect_edges, Edge};
+use crate::{
+    collect_atom_arg_pairs, collect_atoms, collect_dyn_names, collect_edges, cond_may_gc,
+    cond_may_raise, Edge,
+};
 use mana_syntax::{FunName, Module};
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
-/// Bump whenever the summary contents or encoding change; part of the key.
+/// If the summary contents or the encoding change, bump this value. It is
+/// part of the key.
 pub const SUMMARY_FORMAT: u32 = 2;
 
 const MAGIC: u32 = 0x4d41_4e53; // "MANS"
@@ -29,22 +34,22 @@ pub struct ModuleSummary {
 pub struct FunSummary {
     pub name: FunName,
     // reachable_funs inputs
-    pub atoms: Vec<String>,                  // collect_atoms (sorted)
-    pub arg_pairs: Vec<(String, String)>,    // collect_atom_arg_pairs (in order)
-    pub dyn_pairs: Vec<(String, usize)>,     // collect_dyn_names pairs (sorted)
-    pub dyn_any_names: Vec<String>,          // MFA-tuple names, any arity (sorted)
+    pub atoms: Vec<String>,               // collect_atoms (sorted)
+    pub arg_pairs: Vec<(String, String)>, // collect_atom_arg_pairs (in order)
+    pub dyn_pairs: Vec<(String, usize)>,  // collect_dyn_names pairs (sorted)
+    pub dyn_any_names: Vec<String>,       // MFA-tuple names, any arity (sorted)
     pub fun_dyn: bool,
-    pub tuple_heads: Vec<String>,            // collect_dyn_names heads (sorted)
-    pub edges: Vec<Edge>,                    // collect_edges (in order)
-    // effect condensations (cond_may_gc / cond_may_raise)
+    pub tuple_heads: Vec<String>, // collect_dyn_names heads (sorted)
+    pub edges: Vec<Edge>,         // collect_edges (in order)
+    // effect condensations (cond_may_gc, cond_may_raise)
     pub gc_base: bool,
     pub gc_deps: Vec<(String, FunName)>,
     pub raise_base: bool,
     pub raise_deps: Vec<(String, FunName)>,
 }
 
-/// Condense a parsed module. Runs the exact walkers the analysis used to
-/// run per fixpoint iteration, once per function.
+/// Condense a parsed module. This runs the exact walkers of the analysis,
+/// once per function instead of once per fixpoint iteration.
 pub fn summarize(m: &Module) -> ModuleSummary {
     let funs = m
         .definitions
@@ -58,7 +63,13 @@ pub fn summarize(m: &Module) -> ModuleSummary {
             let mut fun_dyn = false;
             let mut heads: HashSet<String> = HashSet::new();
             let mut any_names: HashSet<String> = HashSet::new();
-            collect_dyn_names(&fun.body, &mut pairs, &mut fun_dyn, &mut heads, &mut any_names);
+            collect_dyn_names(
+                &fun.body,
+                &mut pairs,
+                &mut fun_dyn,
+                &mut heads,
+                &mut any_names,
+            );
             let mut edges = Vec::new();
             let mut letrec = HashSet::new();
             collect_edges(&fun.body, &mut edges, &mut letrec);
@@ -69,7 +80,13 @@ pub fn summarize(m: &Module) -> ModuleSummary {
             let mut raise_base = false;
             let mut raise_deps = BTreeSet::new();
             let mut letrec = HashSet::new();
-            cond_may_raise(&fun.body, &m.name, &mut letrec, &mut raise_base, &mut raise_deps);
+            cond_may_raise(
+                &fun.body,
+                &m.name,
+                &mut letrec,
+                &mut raise_base,
+                &mut raise_deps,
+            );
             let mut dyn_pairs: Vec<(String, usize)> = pairs.into_iter().collect();
             dyn_pairs.sort();
             let mut dyn_any_names: Vec<String> = any_names.into_iter().collect();
@@ -99,7 +116,7 @@ pub fn summarize(m: &Module) -> ModuleSummary {
     }
 }
 
-// ---- disk cache ----
+// Disk cache
 
 impl crate::ObjCache {
     fn summary_path(&self, source_hash: &[u8; 32]) -> PathBuf {
@@ -120,7 +137,8 @@ impl crate::ObjCache {
         decode(&bytes)
     }
 
-    /// Idempotent publish (tmp + atomic rename), like the object cache.
+    /// Idempotent publish, like the object cache: write a tmp file, then an
+    /// atomic rename.
     pub fn put_summary(&self, source_hash: &[u8; 32], s: &ModuleSummary) {
         let dst = self.summary_path(source_hash);
         let Some(parent) = dst.parent() else { return };
@@ -133,7 +151,7 @@ impl crate::ObjCache {
         }
     }
 
-    /// Age-trim the summary bucket with the object cache's policy.
+    /// Age-trim the summary bucket with the policy of the object cache.
     pub(crate) fn trim_summaries(&self, cutoff: std::time::SystemTime) {
         if let Ok(buckets) = std::fs::read_dir(self.root.join("summary")) {
             for bucket in buckets.flatten() {
@@ -154,7 +172,7 @@ impl crate::ObjCache {
     }
 }
 
-// ---- encoding ----
+// Encoding
 
 fn encode(s: &ModuleSummary) -> Vec<u8> {
     let mut b = Vec::with_capacity(4096);
@@ -271,7 +289,11 @@ fn decode(b: &[u8]) -> Option<ModuleSummary> {
     if p != b.len() {
         return None;
     }
-    Some(ModuleSummary { name, exports, funs })
+    Some(ModuleSummary {
+        name,
+        exports,
+        funs,
+    })
 }
 
 fn w32(b: &mut Vec<u8>, v: u32) {

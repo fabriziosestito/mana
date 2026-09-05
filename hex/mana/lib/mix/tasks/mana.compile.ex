@@ -1,5 +1,5 @@
 defmodule Mix.Tasks.Mana.Compile do
-  @shortdoc "Compile this project to a native binary via manac"
+  @shortdoc "Compile this project to a native binary with manac"
 
   @moduledoc """
   Compile this Mix project to a native binary with the mana compiler.
@@ -7,20 +7,21 @@ defmodule Mix.Tasks.Mana.Compile do
       mix mana.compile --entry Mod.fun/0 [--out DIR] [--bin PATH]
       mix mana.compile --app [--out DIR] [--bin PATH]
 
-  The entry must be a zero-arity function; the produced binary runs it and
-  exits. Accepted entry formats: `Mod.fun/0`, `Nested.Mod.fun/0`,
-  `mod:fun/0` (Erlang-style, module taken verbatim).
+  The entry must be a zero-arity function. The binary runs this function and
+  exits. The task accepts these entry formats: `Mod.fun/0`, `Nested.Mod.fun/0`,
+  and `mod:fun/0` (Erlang style, the module name is used as written).
 
-  `--app` instead boots the project like a release: a generated
-  `Mana.AppBoot` module bakes the compile-time config and starts the
-  application dependency tree in order, then parks (see `Mana.Boot`).
+  `--app` boots the project like a release. A generated `Mana.AppBoot` module
+  bakes the compile-time config and starts the application dependency tree in
+  order. Then it parks (see `Mana.Boot`).
 
-  Current limitations (early days): modules of this project may call each
-  other and supported `:erlang` BIFs, but the Elixir/Erlang standard library
-  and Hex dependencies are not available yet.
+  The standard library and the Hex dependencies arrive through the chase
+  loop: the task pulls every module that `manac` reports as missing, dumps
+  its Core Erlang, and compiles again. A manifest records the final module
+  list, so the next build runs in one pass.
 
-  Output goes to `_mana/` by default: the extracted `.core` files (kept for
-  debugging) and the final binary `_mana/app`.
+  Output goes to `_mana/` by default. It holds the extracted `.core` files
+  (kept for debugging) and the final binary `_mana/app`.
   """
 
   use Mix.Task
@@ -31,34 +32,35 @@ defmodule Mix.Tasks.Mana.Compile do
   def run(argv) do
     {opts, _argv, _errors} = OptionParser.parse(argv, switches: @switches)
 
-    # native builds get release init semantics: plug_init_mode :runtime is a
-    # dev/code-reloading affordance that resolves plug modules through
-    # runtime-built atoms — invisible to closed-world reachability. Forcing
-    # :compile bakes plug opts (module atoms as literals) into the beams;
-    # Mix's compile-env tracking recompiles affected modules automatically.
+    # Native builds get release init semantics. plug_init_mode :runtime is a
+    # dev and code-reloading feature. It resolves plug modules through atoms
+    # built at run time. Closed-world reachability cannot see those atoms.
+    # The forced :compile mode bakes plug opts (module atoms as literals) into
+    # the beams. The compile-env tracking of Mix recompiles the affected
+    # modules.
     Application.put_env(:phoenix, :plug_init_mode, :compile)
 
-    # Apply project config once, WITHOUT compile-env validation (beams
-    # compiled with the scrub below legitimately disagree with the config
-    # files' dev-only keys), then scrub dev-only build-tool config
-    # (code_reloader etc.) so compile_env consumers bake release
-    # semantics. Mix.Task.run dedups: the compile below won't re-apply
-    # config over the scrub.
+    # Apply the project config once, WITHOUT compile-env validation. Beams
+    # compiled with the scrub below differ from the dev-only keys of the
+    # config files, and this is correct. Then scrub the dev-only build-tool
+    # config (code_reloader and similar keys), so that compile_env consumers
+    # bake release semantics. Mix.Task.run dedups: the compile below will not
+    # apply the config again over the scrub.
     Mix.Task.run("loadpaths", ["--no-validate-compile-env"])
     Mana.Boot.scrub_compile_env!()
 
-    # Mix's staleness checks verify compile_env against the CONFIG FILES,
-    # not runtime put_env — so beams compiled before these overrides keep
-    # the old semantics. A versioned marker under the build dir forces one
-    # full recompile per build dir whenever the override set changes.
+    # The staleness checks of Mix compare compile_env against the CONFIG
+    # FILES, not against put_env at run time. So beams compiled before these
+    # overrides keep the old semantics. A versioned marker under the build dir
+    # forces one full recompile per build dir when the override set changes.
     #
-    # The scrub above is applied before every compile, so any module Mix
-    # DOES recompile here bakes release semantics. The hazard is a module
-    # compiled earlier WITHOUT the scrub (a plain `mix compile` / `mix
-    # phx.server` in dev — exactly the browser-demo workflow) that Mix now
-    # considers up to date. Detect that by comparing the marker's mtime
-    # against the newest project beam: a beam newer than the marker was
-    # compiled outside this task (unscrubbed), so force a full recompile.
+    # The scrub above runs before every compile. So any module that Mix DOES
+    # recompile here bakes release semantics. The hazard is a module compiled
+    # earlier WITHOUT the scrub, which Mix now considers up to date. A plain
+    # `mix compile` or `mix phx.server` in dev does this. This is the
+    # browser-demo workflow. To detect this case, compare the mtime of the
+    # marker against the newest project beam. A beam newer than the marker was
+    # compiled outside this task (unscrubbed). Then force a full recompile.
     marker = Path.join(Mix.Project.build_path(), "mana_init_mode")
     stamp = "plug_init_mode=compile scrub=v1"
 
@@ -76,16 +78,16 @@ defmodule Mix.Tasks.Mana.Compile do
     out = Path.expand(opts[:out] || "_mana")
     File.mkdir_p!(out)
 
-    # Dump every module of the project; manac compiles only what the entry
-    # reaches (and only errors on parse failures of modules it needs).
+    # Dump every module of the project. manac compiles only what the entry
+    # reaches, and reports parse errors only for the modules that it needs.
     beams = Path.wildcard(Path.join(Mix.Project.compile_path(), "*.beam"))
 
     if beams == [] do
       Mix.raise("no compiled modules under #{Mix.Project.compile_path()}")
     end
 
-    # --app: release-style boot — generate Mana.AppBoot (baked config +
-    # ordered application starts) and make it the entry
+    # --app is a release-style boot. Generate Mana.AppBoot (baked config plus
+    # ordered application starts) and make it the entry.
     {mod, fun, arity, beams} =
       if opts[:app] do
         boot_beam = Mana.Boot.generate!(out)
@@ -108,9 +110,10 @@ defmodule Mix.Tasks.Mana.Compile do
         core
       end
 
-    # application-own modules keep every export (release semantics):
-    # the project's modules plus any PATH dependency (local apps wired by
-    # config atoms / template-name dispatch). Hex deps stay pruned.
+    # Modules that belong to the application keep every export (release
+    # semantics). These are the modules of the project plus any PATH
+    # dependency (local apps wired by config atoms or template-name
+    # dispatch). Hex deps stay pruned.
     path_dep_mods =
       for {dep_app, dep_path} <- Mix.Project.deps_paths(),
           not String.starts_with?(Path.expand(dep_path), Path.expand(Mix.Project.deps_path())),
@@ -132,19 +135,21 @@ defmodule Mix.Tasks.Mana.Compile do
     manac = Mana.compiler_path(bin: opts[:bin])
     app = Path.join(out, "app")
 
-    # discover deps that ship native/ crates (mana_native: metadata),
-    # cargo-build them, and produce the manac native-manifest + --native-obj
-    # link inputs. Native modules are cut — the closure BFS must skip them.
+    # Find the deps that ship native/ crates (mana_native: metadata) and build
+    # them with cargo. Then produce the manac native manifest plus the
+    # --native-obj link inputs. Native modules are cut. The closure walk must
+    # skip them.
     {native_args, native_mods} = build_native_deps!(out)
 
-    # runtime-implemented modules the closure BFS must never follow —
-    # single source of truth lives in manac
+    # Modules that the runtime implements. The closure walk must never follow
+    # them. manac is the single source of truth for this list.
     {cut_out, 0} = System.cmd(manac, ["--print-bif-modules"])
     cut = MapSet.union(MapSet.new(String.split(cut_out, "\n", trim: true)), native_mods)
 
-    # warm start: the manifest memoizes the last successful build's full
-    # core list, so a rebuild starts complete and compiles in one round.
-    # The chase fallback still finds anything new via locate_and_dump.
+    # Warm start: the manifest memoizes the full core list of the last
+    # successful build. So a rebuild starts complete and compiles in one
+    # round. The chase fallback still finds anything new through
+    # locate_and_dump.
     have = MapSet.new(cores, &core_module/1)
 
     {cores, have} =
@@ -161,9 +166,9 @@ defmodule Mix.Tasks.Mana.Compile do
     compile_loop(manac, mod, fun, arity, app, cores, out, MapSet.new(), 400, seed_args, cut, have, native_args)
   end
 
-  # Walk deps for `mana_native:` metadata; cargo-build each native crate;
-  # write the manac native-manifest and collect --native-obj static libs.
-  # Returns {manac_native_args, native_module_set}.
+  # Walk the deps for `mana_native:` metadata. Build each native crate with
+  # cargo. Write the manac native manifest and collect the --native-obj static
+  # libs. Returns {manac_native_args, native_module_set}.
   defp build_native_deps!(out) do
     entries =
       for {dep_app, dep_path} <- Mix.Project.deps_paths(),
@@ -181,8 +186,8 @@ defmodule Mix.Tasks.Mana.Compile do
 
           fn_lines =
             for {fun, ar} <- native_exports(mod) do
-              # conservative default effects: may_gc + may_raise are always
-              # safe (a valid term never equals the exception sentinel)
+              # Conservative default effects: may_gc and may_raise are always
+              # safe. A valid term never equals the exception sentinel.
               "#{mod} #{fun} #{ar} #{mod}_#{fun}_#{ar} 1 1"
             end
 
@@ -245,8 +250,8 @@ defmodule Mix.Tasks.Mana.Compile do
     lib
   end
 
-  # The native functions to bind = the stub module's exports minus the
-  # BEAM/Elixir-generated ones. Symbol convention: <module>_<fun>_<arity>.
+  # The native functions to bind are the exports of the stub module minus the
+  # ones that BEAM and Elixir generate. Symbol convention: <module>_<fun>_<arity>.
   defp native_exports(mod) do
     m = String.to_atom(mod)
     Code.ensure_loaded(m)
@@ -258,11 +263,12 @@ defmodule Mix.Tasks.Mana.Compile do
     end)
   end
 
-  # Reachability-driven stdlib compilation: run manac; when it reports a
-  # missing module that we can locate on the code path (Elixir stdlib, OTP
-  # stdlib/kernel, deps — anything loadable), dump its Core Erlang — AND its
-  # whole static import closure, so one round absorbs the whole subgraph —
-  # into the cache and retry. Only modules the entry reaches get pulled in.
+  # Reachability-driven stdlib compilation. Run manac. When it reports a
+  # missing module that exists on the code path (Elixir stdlib, OTP stdlib
+  # and kernel, deps, anything loadable), dump its Core Erlang into the cache
+  # and retry. The dump includes the whole static import closure of the
+  # module, so that one round absorbs the whole subgraph. Only modules that
+  # the entry reaches are pulled in.
   defp compile_loop(manac, mod, fun, arity, app, cores, out, tried, fuel, seed_args, cut, have, native_args) do
     args = ["--entry", "#{mod}:#{fun}/#{arity}", "-o", app] ++ native_args ++ seed_args ++ cores
     t0 = System.monotonic_time(:millisecond)
@@ -280,9 +286,9 @@ defmodule Mix.Tasks.Mana.Compile do
 
     cond do
       status == 0 ->
-        # even a successful build may name dynamic-dispatch candidates
-        # (consolidated protocol impls) it could not see; pull the ones a
-        # beam exists for and rebuild
+        # Even a successful build can name dynamic-dispatch candidates
+        # (consolidated protocol impls) that it did not see. Pull the ones
+        # that have a beam and rebuild.
         candidates =
           (Regex.scan(~r/dynamic module candidate '([^']+)'/, output) ++
              Regex.scan(~r/module '([^']+)' \(required by .*\) is not among/, output))
@@ -293,10 +299,10 @@ defmodule Mix.Tasks.Mana.Compile do
         {pulled, tried, have} = pull_all(candidates, out, cut, tried, have, " (dynamic)")
 
         if pulled == [] or fuel == 0 do
-          # candidate notes are driver protocol (consumed by the regexes
-          # above), and unresolvable missing-module reports describe dead
-          # call sites (they abort only if ever executed) — summarize both
-          # instead of dumping them on every successful build
+          # Candidate notes are driver protocol. The regexes above consume
+          # them. Missing-module reports that no pull can resolve describe
+          # dead call sites. Those abort only if they ever run. Summarize both
+          # instead of a full dump on every successful build.
           {missing_lines, rest} =
             output
             |> String.split("\n")
@@ -342,7 +348,7 @@ defmodule Mix.Tasks.Mana.Compile do
 
       fuel == 0 ->
         IO.write(output)
-        Mix.raise("manac failed (exit #{status}); dependency chase gave up")
+        Mix.raise("manac failed (exit #{status}). The dependency chase gave up.")
 
       (missing =
          missing_modules(output)
@@ -351,7 +357,7 @@ defmodule Mix.Tasks.Mana.Compile do
 
         if pulled == [] do
           IO.write(output)
-          Mix.raise("manac failed (exit #{status}) — see output above")
+          Mix.raise("manac failed (exit #{status}). See the output above.")
         end
 
         compile_loop(
@@ -376,8 +382,8 @@ defmodule Mix.Tasks.Mana.Compile do
     end
   end
 
-  # Pull each module's core plus its whole static import closure (beam
-  # ImpT chunks) — one chase round absorbs the entire subgraph instead of
+  # Pull the core of each module plus its whole static import closure (beam
+  # ImpT chunks). One chase round then absorbs the whole subgraph instead of
   # one dependency layer per round.
   defp pull_all(mods, out, cut, tried, have, tag) do
     expanded =
@@ -411,8 +417,9 @@ defmodule Mix.Tasks.Mana.Compile do
   defp locate_and_dump(module, out) do
     case locate_beam(module) do
       {:ok, beam} ->
-        # toolchain beams (outside this project's build) → shared cache;
-        # project-local ones (consolidated protocols etc.) → out dir
+        # Toolchain beams (outside the build of this project) go to the shared
+        # cache. Project-local beams (consolidated protocols and similar) go
+        # to the out dir.
         cache =
           if String.starts_with?(beam, Mix.Project.build_path()) do
             Path.join(out, "core-cache")
@@ -435,10 +442,10 @@ defmodule Mix.Tasks.Mana.Compile do
       beam_path when is_list(beam_path) ->
         beam = List.to_string(beam_path)
 
-        # build-tool applications never belong in a runtime binary; their
+        # Build-tool applications never belong in a runtime binary. Their
         # protocol impls (Collectable.Mix.Shell, ...) stay unimplemented.
         # eex is NOT one of them: compiled EEx templates call EEx.Engine
-        # at runtime (Plug.Debugger error pages).
+        # at run time (Plug.Debugger error pages).
         if beam =~ ~r{/(mix|ex_unit|iex)(-[\d.]+)?/ebin/} do
           :error
         else
@@ -450,7 +457,8 @@ defmodule Mix.Tasks.Mana.Compile do
     end
   end
 
-  # core dumps are pure functions of the beam: skip when the core is newer
+  # Core dumps are pure functions of the beam. Skip the dump when the core is
+  # newer.
   defp dump_if_stale(beam, core) do
     fresh? =
       case {File.stat(core, time: :posix), File.stat(beam, time: :posix)} do
@@ -463,9 +471,10 @@ defmodule Mix.Tasks.Mana.Compile do
 
   defp core_module(core), do: Path.basename(core, ".core")
 
-  # out/manifest: the last successful build's full core list, so a warm
-  # rebuild starts complete and compiles in one round. Keyed to the
-  # toolchain — core dumps are toolchain-version functions of the beams.
+  # out/manifest holds the full core list of the last successful build. So a
+  # warm rebuild starts complete and compiles in one round. The header is
+  # keyed to the toolchain. Core dumps are toolchain-version functions of the
+  # beams.
   defp manifest_header, do: "mana-manifest v1 #{System.version()}-otp#{System.otp_release()}"
 
   defp read_manifest(out) do
@@ -490,11 +499,11 @@ defmodule Mix.Tasks.Mana.Compile do
     )
   end
 
-  # <user cache>/mana/cores/<elixir>-otp<otp>: core dumps are pure
-  # functions of the beam, so one cache per toolchain serves every project.
-  # :filename.basedir follows each OS's convention (XDG on Linux,
-  # ~/Library/Caches on macOS, Local AppData on Windows); MANA_CACHE_DIR
-  # overrides, and manac's object cache honors the same variable.
+  # <user cache>/mana/cores/<elixir>-otp<otp>. Core dumps are pure functions
+  # of the beam, so one cache per toolchain serves every project.
+  # :filename.basedir obeys the convention of each OS (XDG on Linux,
+  # ~/Library/Caches on macOS, Local AppData on Windows). MANA_CACHE_DIR
+  # overrides the base. The object cache of manac reads the same variable.
   defp shared_cache_dir do
     base =
       case System.get_env("MANA_CACHE_DIR") do
@@ -505,10 +514,10 @@ defmodule Mix.Tasks.Mana.Compile do
     Path.join([base, "cores", "#{System.version()}-otp#{System.otp_release()}"])
   end
 
-  # True when the marker is at least as new as every compiled beam — i.e.
-  # no plain (unscrubbed) compile has happened since the last --app build
-  # wrote the marker. A newer beam means a dev compile poisoned the build
-  # dir, so we must force a scrubbed recompile.
+  # True when the marker is at least as new as every compiled beam. That is,
+  # no plain (unscrubbed) compile ran after the last --app build wrote the
+  # marker. A newer beam means that a dev compile poisoned the build dir. Then
+  # the task must force a scrubbed recompile.
   defp marker_fresh?(marker) do
     case File.stat(marker, time: :posix) do
       {:ok, %{mtime: m}} ->

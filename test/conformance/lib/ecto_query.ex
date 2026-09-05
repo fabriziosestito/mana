@@ -11,16 +11,17 @@ end
 
 defmodule Conf.EctoQuery do
   @moduledoc """
-  Ecto.Query building and inspection, no database: literal-source queries,
-  runtime composition, schema sources, joins, dynamic/2 and subquery/2 —
-  all rendered through inspect/1 (proven by Conf.Inspect).
+  Ecto.Query building and inspection without a database. The program checks
+  literal-source queries, runtime composition, schema sources, joins,
+  dynamic/2, and subquery/2. All queries render through inspect/1, which
+  Conf.Inspect proves.
   """
   import Ecto.Query
 
   def go do
     min_age = 18
 
-    # literal source: folded at compile time, runtime = struct allocation
+    # Literal source: folded at compile time. The runtime only allocates the struct.
     q1 =
       from u in "users",
         where: u.age > ^min_age and u.active,
@@ -28,11 +29,11 @@ defmodule Conf.EctoQuery do
 
     IO.inspect(q1)
 
-    # runtime composition (Builder.*.apply path via Ecto.Queryable)
+    # Runtime composition: the Builder.*.apply path through Ecto.Queryable.
     q2 = from q in q1, order_by: q.name, limit: 10
     IO.inspect(q2)
 
-    # piped composition + or_where
+    # piped composition and or_where
     q3 =
       "users"
       |> where([u], u.age >= 21)
@@ -45,7 +46,7 @@ defmodule Conf.EctoQuery do
     q4 = from u in Conf.EctoQuery.User, where: u.active, select: u.name
     IO.inspect(q4)
 
-    # joins, group_by/having, distinct, offset
+    # joins, group_by and having, distinct, offset
     q5 =
       from u in "users",
         join: p in "posts",
@@ -71,11 +72,11 @@ defmodule Conf.EctoQuery do
     q8 = from u in "users", where: fragment("lower(?)", u.name) == ^"ada", select: u.id
     IO.inspect(q8)
 
-    # select_merge + update-style exprs on a composed query
+    # select_merge and update-style expressions on a composed query
     q9 = q4 |> select_merge([u], %{age: u.age}) |> limit(3)
     IO.inspect(q9)
 
-    # prefix, as/named bindings
+    # prefix, and named bindings with as
     q10 =
       from u in "users",
         as: :user,
@@ -85,7 +86,7 @@ defmodule Conf.EctoQuery do
 
     IO.inspect(q10)
 
-    # runtime schema atom through Ecto.Queryable.Atom (code:is_loaded path)
+    # A runtime schema atom through Ecto.Queryable.Atom (the code:is_loaded path).
     q11 = Conf.EctoQuery.User |> where([u], u.age > 5) |> select([u], u.id)
     IO.inspect(q11)
 

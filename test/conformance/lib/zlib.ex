@@ -1,14 +1,14 @@
 defmodule Conf.Zlib do
   @moduledoc """
-  zlib streaming + one-shots against BEAM. Compressed *output* can never
-  byte-match BEAM (miniz_oxide != zlib), so this prints only deterministic
-  facts: fixed blobs (generated once from real zlib) inflated back to
-  their plaintext, and roundtrip / structural booleans. Never compressed
-  bytes or sizes.
+  zlib streaming and one-shots against BEAM. Compressed *output* can never
+  byte-match BEAM, because miniz_oxide is not zlib. This program prints
+  only deterministic facts: fixed blobs (generated once from real zlib)
+  inflated back to their plaintext, and roundtrip and structural booleans.
+  Compressed bytes or sizes never print.
   """
 
-  # fixed reference blobs produced by Erlang's :zlib — inflation is
-  # deterministic, so decoding these is the byte-identical gate.
+  # Fixed reference blobs produced by the Erlang :zlib. Inflation is
+  # deterministic, so the decode of these blobs is the byte-identical gate.
   @gz Base.decode16!(
         "1f8b08000000000000030bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb7101006acc50eb2d000000",
         case: :lower
@@ -20,12 +20,12 @@ defmodule Conf.Zlib do
        )
 
   def go do
-    # 1. fixed-blob inflation (deterministic byte gate)
+    # 1. Fixed-blob inflation (the deterministic byte gate).
     IO.puts(:zlib.gunzip(@gz))
     IO.puts(:zlib.uncompress(@zc))
     IO.puts(raw_inflate(@raw))
 
-    # 2. roundtrips (booleans)
+    # 2. Roundtrips (booleans).
     msg = "The quick brown fox jumps over the lazy dog.\n"
     big = String.duplicate("mana loves phoenix liveview! ", 50)
     IO.puts(inspect(:zlib.gunzip(:zlib.gzip(msg)) == msg))
@@ -33,7 +33,7 @@ defmodule Conf.Zlib do
     IO.puts(inspect(:zlib.unzip(:zlib.zip(big)) == big))
     IO.puts(inspect(stream_roundtrip(big) == big))
 
-    # 3. structural (booleans)
+    # 3. Structural facts (booleans).
     IO.puts(inspect(byte_size(:zlib.gzip(big)) < byte_size(big)))
     IO.puts(inspect(sync_tail() == <<0, 0, 255, 255>>))
     IO.puts(inspect(reset_reuse() == {msg, msg}))
@@ -42,7 +42,7 @@ defmodule Conf.Zlib do
     :ok
   end
 
-  # raw (headerless) inflate of a finished deflate stream via safeInflate
+  # Raw (headerless) inflate of a finished deflate stream through safeInflate.
   defp raw_inflate(data) do
     z = :zlib.open()
     :zlib.inflateInit(z, -15)
@@ -58,8 +58,8 @@ defmodule Conf.Zlib do
     end
   end
 
-  # deflate (raw, sync flush) then inflate back — symmetric on either
-  # runtime even though the compressed bytes differ from BEAM's
+  # Deflate (raw, sync flush), then inflate back. The roundtrip is symmetric
+  # on either runtime even though the compressed bytes differ from BEAM.
   defp stream_roundtrip(data) do
     zd = :zlib.open()
     :zlib.deflateInit(zd, :default, :deflated, -15, 8, :default)
@@ -73,7 +73,7 @@ defmodule Conf.Zlib do
     out
   end
 
-  # a sync-flushed empty deflate ends with the 00 00 FF FF marker
+  # A sync-flushed empty deflate ends with the 00 00 FF FF marker.
   defp sync_tail() do
     z = :zlib.open()
     :zlib.deflateInit(z, :default, :deflated, -15, 8, :default)
@@ -82,7 +82,7 @@ defmodule Conf.Zlib do
     binary_part(out, byte_size(out) - 4, 4)
   end
 
-  # deflateReset lets one stream compress two independent messages
+  # deflateReset lets one stream compress two independent messages.
   defp reset_reuse() do
     m = "The quick brown fox jumps over the lazy dog.\n"
     z = :zlib.open()

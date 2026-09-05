@@ -1,8 +1,8 @@
 defmodule Bench.Ws do
   @moduledoc """
-  Phoenix LiveView over a websocket, measured with a raw gen_tcp client:
-  a full mount+join per connection, and the interactive event round-trip
-  (phx-click -> diff reply) on a kept-alive socket.
+  Phoenix LiveView over a websocket, measured with a raw gen_tcp client.
+  It measures a full mount and join per connection, and the interactive
+  event round-trip (phx-click to diff reply) on a kept-alive socket.
   """
 
   @secret String.duplicate("mana-secret!", 6)
@@ -14,7 +14,7 @@ defmodule Bench.Ws do
     bench(port)
   end
 
-  @doc "Boot the Phoenix app on a free port with the runtime-selected adapter/JSON; returns the port."
+  @doc "Boots the Phoenix app on a free port with the runtime-selected adapter and JSON library. Returns the port."
   def boot do
     :logger.remove_handler(:default)
     Application.put_env(:plug, :validate_header_keys_during_test, false)
@@ -58,7 +58,7 @@ defmodule Bench.Ws do
     :ok
   end
 
-  @doc "Dead-render /counter, upgrade, phx_join; returns {socket, topic}."
+  @doc "Dead-renders /counter, upgrades, and sends phx_join. Returns {socket, topic}."
   def join(port) do
     {headers, body} = get(port, "/counter")
     tokens = extract(headers, body)
@@ -118,9 +118,9 @@ defmodule Bench.Ws do
     c
   end
 
-  # The client's own JSON work must not dominate the measurement: use the
-  # runtime-selected library (native serde natively, Jason on BEAM) so the
-  # client costs about the same on both runtimes.
+  # The own JSON work of the client must not dominate the measurement. Use
+  # the runtime-selected library (native serde on the native binary, Jason
+  # on BEAM) so that the client costs about the same on both runtimes.
   defp json, do: Bench.Env.json_library()
 
   defp push(c, join_ref, ref, topic, event, payload) do

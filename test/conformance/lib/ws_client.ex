@@ -1,27 +1,27 @@
 defmodule Conf.WsClient do
   @moduledoc """
-  Pure-Elixir websocket client for driving a Phoenix LiveView over a raw
-  :gen_tcp socket, shared by the WS conformance programs. Everything is
-  deterministic on purpose: fixed Sec-WebSocket-Key, fixed all-zero mask
-  key (legal per RFC 6455 — masked payload == plain payload), and replies
-  are Jason-decoded before printing so JSON key order never leaks into
-  the byte-diff.
+  Pure-Elixir websocket client that drives a Phoenix LiveView over a raw
+  :gen_tcp socket. The WS conformance programs share it. Everything is
+  deterministic on purpose. The Sec-WebSocket-Key is fixed. The mask key is
+  a fixed all-zero key, which RFC 6455 allows, so the masked payload equals
+  the plain payload. Replies are Jason-decoded before they print, so the
+  JSON key order never leaks into the byte-diff.
   """
 
   @secret String.duplicate("mana-secret!", 6)
   @ws_key "AQIDBAUGBwgJCgsMDQ4PEA=="
   @ws_guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-  # Same closed-world boot as Conf.Phx: seed the endpoint env and start
-  # the application trees explicitly (the BEAM oracle also runs without
-  # Mix config).
+  # The same closed-world boot as Conf.Phx: seed the endpoint env and start
+  # the application trees explicitly. The BEAM oracle also runs without
+  # Mix config.
   def boot do
     if System.get_env("PHX_KEEP_LOGGER") == nil, do: :logger.remove_handler(:default)
 
     Application.put_env(:plug, :validate_header_keys_during_test, false)
-    # native JSON on the Phoenix socket serializer path: ManaJSON (serde) on
-    # the native binary, Jason on the BEAM oracle (ManaJSON can't run there).
-    # Proves ManaJSON is a drop-in for the LiveView serializer.
+    # Native JSON on the Phoenix socket serializer path: ManaJSON (serde) on
+    # the native binary, Jason on the BEAM oracle, where ManaJSON cannot run.
+    # This proves that ManaJSON is a drop-in for the LiveView serializer.
     Application.put_env(:phoenix, :json_library, Conf.JSON.lib())
 
     Application.put_env(:phx_app, PhxAppWeb.Endpoint,
@@ -37,10 +37,10 @@ defmodule Conf.WsClient do
     )
 
     {:ok, _} = Plug.Application.start(:normal, [])
-    # LiveView signs its session/static tokens via Plug.Crypto.sign, whose
-    # key cache defaults to the Plug.Crypto.Keys ETS table — a different
-    # table from Plug.Keys (which Plug.Session uses). Its owning app is
-    # never started in the closed world, so start it explicitly.
+    # LiveView signs its session and static tokens with Plug.Crypto.sign.
+    # Its key cache defaults to the Plug.Crypto.Keys ETS table, which is a
+    # different table from Plug.Keys (the one that Plug.Session uses). The
+    # app that owns it never starts in the closed world, so start it here.
     {:ok, _} = Plug.Crypto.Application.start(:normal, [])
     {:ok, _} = Phoenix.PubSub.Application.start(:normal, [])
     {:ok, _} = PhxApp.Application.start(:normal, [])
@@ -48,7 +48,7 @@ defmodule Conf.WsClient do
     port
   end
 
-  @doc "GET a page over a throwaway connection: {status, headers, body}."
+  @doc "GET a page over a throwaway connection. Returns {status, headers, body}."
   def get(port, path) do
     {:ok, c} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}])
     :ok = :gen_tcp.send(c, "GET #{path} HTTP/1.1\r\nhost: localhost:#{port}\r\n\r\n")
@@ -60,8 +60,9 @@ defmodule Conf.WsClient do
   end
 
   @doc """
-  Pull the LiveView bootstrap data out of a dead-rendered page: csrf
-  token, session cookie, main element id and phx session/static tokens.
+  Pulls the LiveView bootstrap data out of a dead-rendered page. The data
+  is the csrf token, the session cookie, the main element id, and the phx
+  session and static tokens.
   """
   def extract(headers, body) do
     [_, csrf] = Regex.run(~r/name="csrf-token" content="([^"]+)"/, body)
@@ -80,9 +81,10 @@ defmodule Conf.WsClient do
   end
 
   @doc """
-  Open a socket and perform the websocket upgrade on /live/websocket.
+  Opens a socket and performs the websocket upgrade on /live/websocket.
   Returns {socket, resp_headers, accept_ok?}. `extra_headers` is an
-  iolist appended to the request (e.g. an extensions offer).
+  iolist that the function appends to the request, for example an
+  extensions offer.
   """
   def upgrade(port, tokens, extra_headers \\ []) do
     {:ok, c} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}])
@@ -108,9 +110,9 @@ defmodule Conf.WsClient do
     {c, status, headers, accept_ok}
   end
 
-  # -- frame codec (client side; server frames arrive unmasked) --
+  # Frame codec, client side. Server frames arrive unmasked.
 
-  @doc "Send a masked text frame with an all-zero mask key."
+  @doc "Sends a masked text frame with an all-zero mask key."
   def send_text(c, payload), do: send_frame(c, 1, payload)
 
   def send_close(c), do: send_frame(c, 8, <<1000::16>>)
@@ -130,9 +132,10 @@ defmodule Conf.WsClient do
   end
 
   @doc """
-  Receive one complete data frame: {opcode, rsv1, payload, rest}. Pings
-  are answered and skipped. Fragmented messages are reassembled; rsv1 is
-  taken from the first frame (permessage-deflate marks the message there).
+  Receives one complete data frame. Returns {opcode, rsv1, payload, rest}.
+  Pings are answered and skipped. Fragmented messages are reassembled.
+  rsv1 comes from the first frame, because permessage-deflate marks the
+  message there.
   """
   def recv_frame(c, buf \\ <<>>) do
     {fin, rsv1, opcode, payload, rest} = read_one(c, buf)
@@ -190,26 +193,26 @@ defmodule Conf.WsClient do
     need(c, buf <> more, n)
   end
 
-  # -- Phoenix V2 serializer over text frames --
+  # Phoenix V2 serializer over text frames.
 
-  @doc "Send a V2 message [join_ref, ref, topic, event, payload]."
+  @doc "Sends a V2 message [join_ref, ref, topic, event, payload]."
   def push(c, join_ref, ref, topic, event, payload) do
     send_text(c, Jason.encode!([join_ref, ref, topic, event, payload]))
   end
 
-  @doc "Receive and decode one V2 text message."
+  @doc "Receives and decodes one V2 text message."
   def recv_msg(c, buf \\ <<>>) do
     {opcode, _rsv1, payload, rest} = recv_frame(c, buf)
     1 = opcode
     {Jason.decode!(payload), rest}
   end
 
-  # -- permessage-deflate (RFC 7692) --
+  # permessage-deflate (RFC 7692).
 
   @doc """
-  A pair of raw (headerless, window 15) zlib streams with context
-  takeover, matching Bandit's default negotiation: one to inflate
-  server frames, one to deflate client frames.
+  A pair of raw zlib streams (headerless, window 15) with context
+  takeover. This matches the default negotiation of Bandit. One stream
+  inflates server frames, and one deflates client frames.
   """
   def deflate_ctx do
     zi = :zlib.open()
@@ -219,16 +222,16 @@ defmodule Conf.WsClient do
     %{inflate: zi, deflate: zd}
   end
 
-  @doc "Send a compressed V2 message: deflate + strip tail + RSV1 set."
+  @doc "Sends a compressed V2 message: deflate, strip the tail, and set RSV1."
   def push_deflate(c, ctx, join_ref, ref, topic, event, payload) do
     json = Jason.encode!([join_ref, ref, topic, event, payload])
     comp = IO.iodata_to_binary(:zlib.deflate(ctx.deflate, json, :sync))
-    # drop the trailing 00 00 FF FF sync marker (RFC 7692 §7.2.1)
+    # Drop the trailing 00 00 FF FF sync marker (RFC 7692 §7.2.1).
     body = binary_part(comp, 0, byte_size(comp) - 4)
     send_frame_rsv1(c, 1, body)
   end
 
-  @doc "Receive and decode one V2 message, inflating if RSV1 is set."
+  @doc "Receives and decodes one V2 message. Inflates it if RSV1 is set."
   def recv_msg_deflate(c, ctx, buf \\ <<>>) do
     {opcode, rsv1, payload, rest} = recv_frame(c, buf)
     1 = opcode
@@ -260,12 +263,12 @@ defmodule Conf.WsClient do
         true -> <<1::1, 127::7, len::64>>
       end
 
-    # fin=1, rsv1=1 (compressed), rsv2=rsv3=0
+    # fin=1, rsv1=1 (compressed), rsv2=rsv3=0.
     frame = [<<1::1, 1::1, 0::2, opcode::4>>, len_part, <<0, 0, 0, 0>>, payload]
     :ok = :gen_tcp.send(c, frame)
   end
 
-  @doc "Join the LiveView channel; returns {topic, reply_payload, rest}."
+  @doc "Joins the LiveView channel. Returns {topic, reply_payload, rest}."
   def join(c, port, path, tokens, join_ref) do
     topic = "lv:" <> tokens.id
 
@@ -281,7 +284,7 @@ defmodule Conf.WsClient do
     {topic, reply, rest}
   end
 
-  # -- HTTP response head parsing (shared with the upgrade) --
+  # HTTP response head parsing, shared with the upgrade.
 
   defp read_response_head(c), do: read_response_head(c, "")
 
