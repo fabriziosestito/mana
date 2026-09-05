@@ -1,10 +1,11 @@
 defmodule Conf.Fib do
   @moduledoc """
-  Conformance program: recursion, arithmetic, tuples, lists, comparisons.
+  Conformance program for recursion, arithmetic, tuples, lists, and
+  comparisons.
 
   Every conformance program is a `Conf.*` module with a `go/0` that prints
-  via `:erlang.display/1`. The harness runs it on BEAM and as a mana native
-  binary and asserts the outputs are identical.
+  with `:erlang.display/1`. The harness runs it on BEAM and as a mana native
+  binary and asserts that the outputs are identical.
   """
 
   def go do

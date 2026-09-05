@@ -30,11 +30,12 @@ end
 
 defmodule Conf.Http do
   @moduledoc """
-  Bandit + Plug compiled from hex, serving HTTP/1.1 over our gen_tcp —
-  exercised with a raw socket client. Printed: status line, deterministic
-  headers (content-type/length, server — same bandit version on both
-  runtimes), body. Never the date header. Includes keep-alive (two
-  requests, one connection), POST body, 404, connection: close.
+  Bandit and Plug compiled from hex, with HTTP/1.1 served over our gen_tcp.
+  A raw socket client drives the server. The program prints the status
+  line, the deterministic headers (content-type, content-length, and
+  server, because both runtimes use the same bandit version), and the body.
+  It never prints the date header. It covers keep-alive (two requests on
+  one connection), a POST body, 404, and connection: close.
   """
 
   def go do
@@ -77,7 +78,7 @@ defmodule Conf.Http do
     IO.puts(inspect(:gen_tcp.recv(c2, 1, 200)))
     :ok = :gen_tcp.close(c2)
 
-    # query params + 404
+    # query params and 404
     {:ok, c3} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, {:active, false}])
     :ok = :gen_tcp.send(c3, "GET /params?b=2&a=1 HTTP/1.1\r\nhost: t\r\n\r\n")
     print_response(c3)
@@ -89,8 +90,9 @@ defmodule Conf.Http do
     :ok
   end
 
-  # read status line + headers (until CRLFCRLF), then content-length body;
-  # print status line, sorted deterministic headers, body
+  # Reads the status line and the headers (until CRLFCRLF), then the
+  # content-length body. Prints the status line, the sorted deterministic
+  # headers, and the body.
   defp print_response(sock) do
     {head, leftover} = read_head(sock, "")
     [status | header_lines] = String.split(head, "\r\n", trim: true)

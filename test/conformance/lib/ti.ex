@@ -10,9 +10,10 @@ end
 
 defmodule Conf.Ti do
   @moduledoc """
-  ThousandIsland compiled from hex, serving a real echo socket: acceptor
-  pool supervision tree, handler GenServers, active :once ↔ passive recv
-  interleave, getstat teardown. Exact-length recvs only.
+  ThousandIsland compiled from hex, with a real echo socket. The program
+  covers the acceptor pool supervision tree, the handler GenServers, the
+  interleave of active :once and passive recv, and the getstat teardown.
+  It does exact-length recvs only.
   """
 
   def go do

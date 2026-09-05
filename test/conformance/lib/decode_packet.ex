@@ -1,8 +1,9 @@
 defmodule Conf.DecodePacket do
   @moduledoc """
-  Pins :erlang.decode_packet(:http_bin | :httph_bin) shapes against BEAM
-  before Bandit ever runs on them: request/response lines, URI forms,
-  known/unknown headers, folding, errors, and `more` continuations.
+  Pins the :erlang.decode_packet(:http_bin | :httph_bin) shapes against
+  BEAM before Bandit runs on them. The program checks request and response
+  lines, URI forms, known and unknown headers, folding, errors, and `more`
+  continuations.
   """
 
   def go do
@@ -22,7 +23,7 @@ defmodule Conf.DecodePacket do
     d.(:http_bin, "HTTP/1.1 200 OK\r\nrest")
     d.(:http_bin, "HTTP/1.0 404 Not Found\r\n")
 
-    # incomplete / errors
+    # incomplete input and errors
     d.(:http_bin, "GET / HTT")
     d.(:http_bin, "garbage line\r\nnext")
     d.(:http_bin, "\r\n")

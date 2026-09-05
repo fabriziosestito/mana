@@ -1,12 +1,13 @@
 defmodule Conf.Float do
   @moduledoc """
-  Conformance program: floats — literals, mixed arithmetic, `/`, :math,
-  conversions, comparisons/sorting, display parity, and floats surviving
-  GC/messages. Values chosen to avoid platform-dependent last-ulp noise.
+  Conformance program for floats. It checks literals, mixed arithmetic,
+  `/`, :math, conversions, comparisons and sorting, display parity, and
+  floats that survive GC and messages. The values avoid platform-dependent
+  last-ulp noise.
   """
 
   def go do
-    # literals + display parity
+    # literals and display parity
     :erlang.display(1.0)
     :erlang.display(-1.5)
     :erlang.display(0.1)
@@ -16,7 +17,7 @@ defmodule Conf.Float do
     :erlang.display(123456.789)
     :erlang.display(3.0e-3)
 
-    # arithmetic: int/int via /, mixed, float/float
+    # arithmetic: int/int through /, mixed, float/float
     a = n(7)
     b = n(2)
     :erlang.display(a / b)
@@ -53,7 +54,7 @@ defmodule Conf.Float do
     :erlang.display(:math.exp(0.0))
     :erlang.display(:math.floor(2.5))
 
-    # comparisons and term order (== coerces, =:= does not)
+    # Comparisons and term order. == coerces, and =:= does not.
     :erlang.display(1 == 1.0)
     :erlang.display(1 === 1.0)
     :erlang.display(1.5 < 2)
@@ -84,7 +85,7 @@ defmodule Conf.Float do
       {:f, x, [y, z]} -> :erlang.display(x + y + z)
     end
 
-    # Enum over floats (stdlib paths that were int-only before)
+    # Enum over floats: stdlib paths that were int-only before.
     :erlang.display(Enum.sum([1.5, 2.5, 3.0]))
     :erlang.display(Enum.max([1.5, 2, 0.5]))
     IO.puts("avg: #{Enum.sum(1..10) / 10}")
@@ -108,7 +109,7 @@ defmodule Conf.Float do
     end
   end
 
-  # float accumulation across many minor GCs
+  # Float accumulation across many minor GCs.
   defp churn(0, acc), do: Float.round(acc, 6)
 
   defp churn(i, acc) do

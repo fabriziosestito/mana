@@ -1,12 +1,13 @@
 defmodule Conf.Links do
   @moduledoc """
-  Conformance program: links, monitors, exit signals. Uses exit/1 reasons,
-  normal exits, and kill — the paths whose reasons match BEAM exactly
-  (error-class reasons carry stacktraces we don't build yet).
+  Conformance program for links, monitors, and exit signals. It uses exit/1
+  reasons, normal exits, and kill. Those are the paths whose reasons match
+  BEAM exactly. Error-class reasons carry stacktraces that we do not build
+  yet.
   """
 
   def go do
-    # trap_exit: linked child's exit/1 reason arrives as a message
+    # trap_exit: the exit/1 reason of a linked child arrives as a message.
     :erlang.process_flag(:trap_exit, true)
     pid = :erlang.spawn_link(fn -> exit(:custom_reason) end)
 
@@ -14,21 +15,21 @@ defmodule Conf.Links do
       {:EXIT, ^pid, reason} -> :erlang.display({:trapped, reason})
     end
 
-    # normal exit of a linked child: trapping still sees it
+    # Normal exit of a linked child: a trapping process still sees it.
     pid2 = :erlang.spawn_link(fn -> :ok end)
 
     receive do
       {:EXIT, ^pid2, reason} -> :erlang.display({:normal_exit, reason})
     end
 
-    # monitor: DOWN on child completion
+    # Monitor: DOWN arrives when the child completes.
     {pid3, ref3} = :erlang.spawn_monitor(fn -> :done end)
 
     receive do
       {:DOWN, ^ref3, :process, ^pid3, reason} -> :erlang.display({:down, reason})
     end
 
-    # monitoring a dead process: immediate noproc
+    # A monitor on a dead process: immediate noproc.
     dead = :erlang.spawn(fn -> :gone end)
     wait_dead()
     ref4 = :erlang.monitor(:process, dead)
@@ -37,7 +38,7 @@ defmodule Conf.Links do
       {:DOWN, ^ref4, :process, ^dead, reason} -> :erlang.display({:noproc_down, reason})
     end
 
-    # demonitor: no DOWN arrives
+    # demonitor: no DOWN arrives.
     {_pid5, ref5} = :erlang.spawn_monitor(fn -> receive do: (:go -> :ok) end)
     :erlang.demonitor(ref5)
 
@@ -47,7 +48,7 @@ defmodule Conf.Links do
       50 -> :erlang.display(:demonitor_ok)
     end
 
-    # exit/2 kill: untrappable in the target, reason becomes killed
+    # exit/2 with kill: the target cannot trap it, and the reason becomes killed.
     {victim, vref} = :erlang.spawn_monitor(fn -> waiter() end)
     :erlang.exit(victim, :kill)
 
@@ -55,8 +56,8 @@ defmodule Conf.Links do
       {:DOWN, ^vref, :process, ^victim, reason} -> :erlang.display({:killed, reason})
     end
 
-    # exit signal cascade: A links B; B dies abnormally; A (not trapping)
-    # dies too; we monitor A to observe it
+    # Exit signal cascade: A links B. B dies abnormally. A does not trap, so
+    # A dies too. We monitor A to observe it.
     me = self()
 
     a =
@@ -77,7 +78,7 @@ defmodule Conf.Links do
       {:DOWN, ^aref, :process, ^a, reason} -> :erlang.display({:cascaded, reason})
     end
 
-    # unlink: child death no longer affects us (we stopped trapping)
+    # unlink: the death of the child no longer affects us. We stopped trapping.
     :erlang.process_flag(:trap_exit, false)
     safe = :erlang.spawn_link(fn -> receive do: (:die -> exit(:whatever)) end)
     :erlang.unlink(safe)

@@ -1,8 +1,9 @@
 defmodule Conf.File do
   @moduledoc """
-  Real filesystem I/O through Elixir's File module and :file directly.
-  Runs inside a program-created scratch dir; every printed value is
-  deterministic (list_dir output sorted; stat printed as size/type only).
+  Real filesystem I/O through the Elixir File module and :file directly.
+  The program runs inside a scratch dir that it creates. Every printed
+  value is deterministic: list_dir output is sorted, and stat prints as
+  size and type only.
   """
 
   @dir "/tmp/mana_conf_file_scratch"
@@ -17,7 +18,7 @@ defmodule Conf.File do
     IO.puts(inspect(File.read(p)))
     IO.puts(inspect(File.read!(p) == "hello mana\n"))
 
-    # append via write_file/3
+    # append with write_file/3
     IO.puts(inspect(:file.write_file(p, "more\n", [:append])))
     IO.puts(inspect(File.read!(p)))
 
@@ -25,7 +26,7 @@ defmodule Conf.File do
     IO.puts(inspect(File.read(Path.join(@dir, "nope"))))
     IO.puts(inspect(:file.delete(Path.join(@dir, "nope"))))
 
-    # exists?/dir?/stat
+    # exists?, dir?, and stat
     IO.puts(inspect(File.exists?(p)))
     IO.puts(inspect(File.dir?(@dir)))
     IO.puts(inspect(File.exists?(Path.join(@dir, "nope"))))
@@ -36,7 +37,7 @@ defmodule Conf.File do
     IO.puts(inspect(elem(raw, 1)))
     IO.puts(inspect(is_integer(elem(raw, 4))))
 
-    # dirs and listing (sorted — readdir order is fs-dependent)
+    # Dirs and listing. The listing is sorted because readdir order depends on the fs.
     File.mkdir!(Path.join(@dir, "sub"))
     File.write!(Path.join(@dir, "b.txt"), "b")
     File.write!(Path.join([@dir, "sub", "c.txt"]), "c")
@@ -44,13 +45,13 @@ defmodule Conf.File do
     IO.puts(inspect(Enum.sort(File.ls!(Path.join(@dir, "sub")))))
     IO.puts(inspect(File.ls(Path.join(@dir, "nope"))))
 
-    # rename / copy
+    # rename and copy
     IO.puts(inspect(File.rename(Path.join(@dir, "b.txt"), Path.join(@dir, "b2.txt"))))
     IO.puts(inspect(File.exists?(Path.join(@dir, "b.txt"))))
     IO.puts(inspect(:file.copy(p, Path.join(@dir, "a2.txt"))))
     IO.puts(inspect(File.read!(Path.join(@dir, "a2.txt")) == File.read!(p)))
 
-    # handle-based :file — open/read/position/write/close
+    # handle-based :file: open, read, position, write, close
     {:ok, fd} = :file.open(String.to_charlist(p), [:read, :binary])
     IO.puts(inspect(:file.read(fd, 5)))
     IO.puts(inspect(:file.position(fd, 0)))

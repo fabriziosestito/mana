@@ -18,9 +18,9 @@ end
 
 defmodule Bench.Ecto do
   @moduledoc """
-  The changeset pipeline — the milestone scoreboard entry: warm BEAM runs
-  this at ~1.7µs/iter. The target is beating it. Query build+inspect
-  records the Ecto.Query milestone's starting number.
+  The changeset pipeline, the milestone scoreboard entry. Warm BEAM runs
+  this at about 1.7µs/iter. The target is to beat it. The query build and
+  inspect entry records the starting number of the Ecto.Query milestone.
   """
   import Ecto.Query
   alias Bench.Ecto.User

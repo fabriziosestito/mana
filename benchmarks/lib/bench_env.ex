@@ -1,8 +1,8 @@
 defmodule Bench.Env do
   @moduledoc """
-  Runtime picks for the benchmark drivers. The same beam runs natively and on
-  BEAM, so native-only packages are selected by probing their bindings at
-  runtime rather than by compile-time config.
+  Runtime picks for the benchmark drivers. The same beam runs natively and
+  on BEAM. Native-only packages are therefore selected by a runtime probe
+  of their bindings, not by compile-time config.
   """
 
   @doc "JSON library: ManaJSON on the native binary (serde), Jason on BEAM."
@@ -13,12 +13,12 @@ defmodule Bench.Env do
     end
   end
 
-  @doc "Phoenix endpoint adapter: ManaHTTP natively when available, else Bandit."
+  @doc "Phoenix endpoint adapter: ManaHTTP on the native binary when available, else Bandit."
   def http_adapter do
     if native_http?(), do: ManaHTTP.PhoenixAdapter, else: Bandit.PhoenixAdapter
   end
 
-  @doc "True when the mana_http native binding is present (native binary)."
+  @doc "True when the mana_http native binding is present, that is, on the native binary."
   def native_http? do
     Code.ensure_loaded?(:mana_http_native) and
       function_exported?(:mana_http_native, :probe, 0) and

@@ -1,17 +1,18 @@
 defmodule ConformanceTest do
   @moduledoc """
-  BEAM is the oracle: every `Conf.*` module under lib/ with a `go/0` is run
-  once on BEAM (as a separate OS process — `:erlang.display/1` bypasses the
-  group leader, so `capture_io` can't see it) and once as a mana-compiled
-  native binary. The two stdouts must match. No golden files.
+  BEAM is the oracle. Every `Conf.*` module under lib/ with a `go/0` runs
+  once on BEAM and once as a mana-compiled native binary. The BEAM run is a
+  separate OS process, because `:erlang.display/1` bypasses the group
+  leader and `capture_io` cannot see it. The two stdouts must match. There
+  are no golden files.
   """
 
   use ExUnit.Case, async: false
 
-  # stdlib programs chase and compile ~200 beams on a cold cache
+  # The stdlib programs chase and compile about 200 beams on a cold cache.
   @moduletag timeout: 900_000
 
-  # Discover Conf.* modules at compile time; lib/ is compiled before tests.
+  # Discover the Conf.* modules at compile time. lib/ compiles before the tests.
   programs =
     Mix.Project.compile_path()
     |> Path.join("Elixir.Conf.*.beam")
@@ -33,22 +34,22 @@ defmodule ConformanceTest do
     test "#{mod_str} native output matches BEAM" do
       mod_str = @mod_str
 
-      # subject: compile with mana and run the native binary. The out dir
-      # (and its core-cache of dumped stdlib beams, mtime-keyed) survives
-      # across runs — a cold stdlib chase costs minutes, a warm one is a
-      # single manac invocation. Only the binary must be fresh.
+      # Subject: compile with mana and run the native binary. The out dir
+      # survives across runs, together with its core-cache of dumped stdlib
+      # beams (mtime-keyed). A cold stdlib chase costs minutes. A warm one
+      # is a single manac invocation. Only the binary must be fresh.
       out_dir = Path.join(System.tmp_dir!(), "mana_conf_#{mod_str}")
       File.rm(Path.join(out_dir, "app"))
-      # rerun, not run: run/1 caches per task name and would no-op for the
-      # second program in the suite
+      # rerun, not run: run/1 caches per task name and will no-op for the
+      # second program in the suite.
       Mix.Task.rerun("mana.compile", ["--entry", "#{mod_str}.go/0", "--out", out_dir])
       app = Path.join(out_dir, "app")
       assert File.exists?(app), "manac did not produce #{app}"
-      # stdout only — both sides may emit crash reports on stderr
+      # stdout only. Both sides can emit crash reports on stderr.
       {native, status} = System.cmd(app, [])
       assert status == 0, "native #{mod_str} crashed (exit #{status}):\n#{native}"
 
-      # oracle: same module, fresh BEAM OS process (all dep ebins on path)
+      # Oracle: the same module in a fresh BEAM OS process, with all dep ebins on the path.
       pa_args =
         Path.wildcard(Path.join(Mix.Project.build_path(), "lib/*/ebin"))
         |> Enum.flat_map(&["-pa", &1])
@@ -69,9 +70,9 @@ defmodule ConformanceTest do
   end
 
   # Release-style boot gate: `mix mana.compile --app` on the scaffolded
-  # Phoenix app; the SAME generated Mana.AppBoot module boots the app on
-  # both runtimes (native binary vs plain `elixir -pa` — no Mix on either
-  # side), and the served landing page facts must agree.
+  # Phoenix app. The SAME generated Mana.AppBoot module boots the app on
+  # both runtimes (the native binary and a plain `elixir -pa`, with no Mix
+  # on either side). The served landing page facts must agree.
   describe "release-style application boot" do
     @tag timeout: 900_000
     test "phx_app --app serves the landing page identically on both runtimes" do

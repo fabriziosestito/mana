@@ -10,14 +10,14 @@ end
 
 defmodule Conf.Sup do
   @moduledoc """
-  Supervision actually running (the cores compiled long ago but never
-  executed): Supervisor restart-on-crash, DynamicSupervisor.start_child,
-  Task.start_link and Task.async/await.
+  Conformance program for supervision. It checks Supervisor restart on
+  crash, DynamicSupervisor.start_child, Task.start_link, and Task.async/await.
   """
 
   def go do
-    # BEAM prints crash reports to stdout via the default logger handler;
-    # remove it so both runtimes stay silent (our :logger cut no-ops)
+    # BEAM prints crash reports to stdout through the default logger
+    # handler. Remove it so that both runtimes stay silent. Our :logger cut
+    # is a no-op.
     :logger.remove_handler(:default)
     parent = self()
 
@@ -33,7 +33,7 @@ defmodule Conf.Sup do
     IO.puts(inspect(GenServer.call(:w1, :ping)))
     IO.puts(inspect(Enum.sort(Map.to_list(Supervisor.count_children(sup)))))
 
-    # crash the worker; the supervisor restarts it under the same name
+    # Crash the worker. The supervisor restarts it under the same name.
     pid1 = Process.whereis(:w1)
 
     try do

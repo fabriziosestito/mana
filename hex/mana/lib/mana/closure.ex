@@ -1,22 +1,24 @@
 defmodule Mana.Closure do
   @moduledoc """
-  Static dependency closure from beam import tables (the `ImpT` chunk):
-  the set of modules transitively imported by the given beams. Reading the
-  chunk table costs about a millisecond per beam — no debug_info decode.
+  Static dependency closure from the beam import tables (the `ImpT` chunk).
+  The closure is the set of modules that the given beams import, directly or
+  through other modules. A read of the chunk table costs about one
+  millisecond per beam. No debug_info decode is needed.
 
-  Dynamic dispatch (apply/3, protocol impl tables, child specs) is
-  invisible to import tables; the compile chase loop discovers those as
-  before. Runtime-cut modules (`manac --print-bif-modules`) and build-tool
-  beams are never followed.
+  Import tables do not show dynamic dispatch (apply/3, protocol impl tables,
+  child specs). The compile chase loop finds those modules. Runtime-cut
+  modules (`manac --print-bif-modules`) and build-tool beams are never
+  followed.
   """
 
-  # eex stays pullable: compiled EEx templates call EEx.Engine at runtime
+  # eex stays pullable: compiled EEx templates call EEx.Engine at run time.
   @build_tool_re ~r{/(mix|ex_unit|iex)(-[\d.]+)?/ebin/}
 
   @doc """
-  BFS the import closure of `seed_beams` (paths). Returns a MapSet of
-  module-name strings that have locatable, non-build-tool beams. `cut` is
-  a MapSet of module-name strings to never follow.
+  Breadth-first walk of the import closure of `seed_beams` (paths). Returns a
+  MapSet of module-name strings that have beams that `:code.which/1` finds
+  and that are not build-tool beams. `cut` is a MapSet of module-name strings
+  that the walk never follows.
   """
   def modules(seed_beams, cut) do
     walk(seed_beams, cut, MapSet.new(), MapSet.new())
@@ -45,7 +47,7 @@ defmodule Mana.Closure do
               {[b | bs], MapSet.put(fd, ms)}
             end
 
-          # :preloaded / :cover_compiled / :non_existing
+          # :preloaded, :cover_compiled, or :non_existing
           _ ->
             {bs, fd}
         end

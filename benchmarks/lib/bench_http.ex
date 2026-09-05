@@ -7,9 +7,10 @@ end
 
 defmodule Bench.Http do
   @moduledoc """
-  Compiled Bandit serving HTTP/1.1, measured with a raw gen_tcp client:
-  full connect+GET+close cycles and keep-alive GETs on one connection.
-  This is the compiled-Bandit datapoint for the native-server discussion.
+  Compiled Bandit that serves HTTP/1.1, measured with a raw gen_tcp client.
+  It measures full connect, GET, and close cycles, and keep-alive GETs on
+  one connection. This is the compiled-Bandit datapoint for the
+  native-server discussion.
   """
 
   @req "GET / HTTP/1.1\r\nhost: bench\r\n\r\n"
@@ -58,7 +59,7 @@ defmodule Bench.Http do
     :ok
   end
 
-  # read until we have headers + the 11-byte body ("hello world")
+  # Reads until the headers and the 11-byte body ("hello world") arrived.
   defp read_response(c, acc) do
     case :binary.split(acc, "\r\n\r\n") do
       [_head, body] when byte_size(body) >= 11 ->

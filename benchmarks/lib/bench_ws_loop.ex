@@ -1,12 +1,13 @@
 defmodule Bench.WsLoop do
   @moduledoc """
-  Profiling vehicle for the LiveView event round-trip: boot, join once, then a
-  plain tight loop of phx-click round-trips with no benchee machinery, so
-  callgrind attributes cost to the server path (transport + channel + diff +
-  serializer). `Bench.Ws` (benchee) stays the official scoreboard.
+  Profiling vehicle for the LiveView event round-trip. It boots, joins
+  once, then runs a plain tight loop of phx-click round-trips with no
+  benchee machinery. Callgrind therefore attributes the cost to the server
+  path (transport, channel, diff, and serializer). `Bench.Ws` (benchee)
+  stays the official scoreboard.
 
-  Note the client side (Jason encode/decode + frame codec in this process)
-  shows up in the profile too — read the attribution per module.
+  The client side (Jason encode and decode, and the frame codec in this
+  process) shows up in the profile too. Read the attribution per module.
   """
 
   @iters 5_000

@@ -1,10 +1,10 @@
 defmodule Conf.Phx do
   @moduledoc """
-  A scaffolded `mix phx.new` app (examples/phoenix/phx_app) serving its
-  landing page natively. Config files are never executed at runtime
-  (closed world): the endpoint env is seeded here, identically on both
-  runtimes (the BEAM oracle also runs without Mix config). The CSRF token
-  and session cookie are random — only stable response facts are printed.
+  A scaffolded `mix phx.new` app (examples/phoenix/phx_app) that serves its
+  landing page natively. Config files never run at runtime (closed world).
+  This program seeds the endpoint env, identically on both runtimes. The
+  BEAM oracle also runs without Mix config. The CSRF token and the session
+  cookie are random, so only stable response facts print.
   """
 
   @secret String.duplicate("mana-secret!", 6)
@@ -12,9 +12,9 @@ defmodule Conf.Phx do
   def go do
     if System.get_env("PHX_KEEP_LOGGER") == nil, do: :logger.remove_handler(:default)
 
-    # .app-resource env defaults are never loaded in the closed world
-    # (nor by the oracle's bare `elixir -pa` run) — seed what the request
-    # path fetches
+    # The .app-resource env defaults never load in the closed world, and
+    # the bare `elixir -pa` run of the oracle does not load them either.
+    # Seed what the request path fetches.
     Application.put_env(:plug, :validate_header_keys_during_test, false)
 
     Application.put_env(:phx_app, PhxAppWeb.Endpoint,
@@ -28,9 +28,9 @@ defmodule Conf.Phx do
       ]
     )
 
-    # closed world: application trees are started explicitly (the BEAM
-    # oracle also runs without Mix's app boot). phoenix_pubsub's app is
-    # :pg.start_link(Phoenix.PubSub).
+    # Closed world: the program starts the application trees explicitly.
+    # The BEAM oracle also runs without the Mix app boot. The phoenix_pubsub
+    # app is :pg.start_link(Phoenix.PubSub).
     {:ok, _} = Plug.Application.start(:normal, [])
     {:ok, _} = Phoenix.PubSub.Application.start(:normal, [])
     {:ok, _} = PhxApp.Application.start(:normal, [])

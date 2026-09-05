@@ -1,19 +1,19 @@
 defmodule ManaJSON do
   @moduledoc """
-  JSON library shim for apps compiled with mana. Implements the small
-  subset of the Jason API that Phoenix and Plug.Parsers call —
-  `encode!/1`, `encode_to_iodata!/1`, `decode!/1` (plus non-raising
-  `encode/1` / `decode/1`) — by forwarding to `:mana_json_native`.
+  JSON library shim for apps that mana compiles. This module implements the
+  small subset of the Jason API that Phoenix and Plug.Parsers call:
+  `encode!/1`, `encode_to_iodata!/1`, `decode!/1`, and the non-raising
+  `encode/1` and `decode/1`. Each function forwards to `:mana_json_native`.
 
-  Wire it up as Phoenix's `:json_library`, only under the mana build:
+  Set this module as the `:json_library` of Phoenix, only under the mana build:
 
       config :phoenix, :json_library,
         if(config_env() == :mana, do: ManaJSON, else: Jason)
 
-  When the app is compiled with mana, the build binds `:mana_json_native`'s
-  functions to the native BIFs shipped in this package's `native/mana_json/`
-  crate. On BEAM this module is not used (the package is `only: [:mana]` and
-  Phoenix uses Jason directly); the `:mana_json_native` stub only returns
+  When mana compiles the app, the build binds the functions of
+  `:mana_json_native` to the native BIFs in the `native/mana_json/` crate of
+  this package. On BEAM this module is not used. The package is `only: [:mana]`
+  and Phoenix uses Jason directly. The `:mana_json_native` stub only returns
   `{:error, :not_supported_on_beam}` as a loud safety net.
   """
 

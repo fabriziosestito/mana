@@ -1,11 +1,11 @@
 defmodule Bench.Json do
   @moduledoc """
-  Native JSON (ManaJSON, backed by serde_json) vs compiled-from-source
-  Jason, on a LiveView-diff-shaped payload and a larger nested one.
+  Native JSON (ManaJSON, backed by serde_json) against Jason compiled from
+  source, on a LiveView-diff-shaped payload and a larger nested one.
 
-  ManaJSON can only run in a mana-compiled binary (on BEAM the stub errors),
-  so the ManaJSON arms are included only when native. On BEAM the bench runs
-  the Jason arms alone.
+  ManaJSON can only run in a mana-compiled binary. On BEAM the stub returns
+  an error. The ManaJSON arms therefore run only on the native binary. On
+  BEAM the bench runs the Jason arms alone.
   """
 
   @diff %{"0" => "1", "p" => %{"0" => ["<div>\n  <h1>Count: <span>", "</span></h1>"]}, "r" => 1, "s" => 0}
@@ -16,7 +16,7 @@ defmodule Bench.Json do
              {"key#{i}",
               %{"n" => i, "f" => i * 1.5, "list" => Enum.to_list(1..10), "s" => "value #{i}"}}
 
-  # ManaJSON runs only on the native binary (serde); on BEAM the stub errors.
+  # ManaJSON runs only on the native binary (serde). On BEAM the stub returns an error.
   defp mana? do
     case :mana_json_native.encode(%{}) do
       {:ok, _} -> true

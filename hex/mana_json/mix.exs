@@ -9,10 +9,10 @@ defmodule ManaJSON.MixProject do
       version: @version,
       elixir: "~> 1.15",
       deps: deps(),
-      # Native crate shipped under native/mana_json/. The mana builder
-      # (mix mana.compile) discovers this, cargo-builds the crate, and binds
-      # :mana_json_native's functions to its symbols. On BEAM this key is
-      # ignored and the lib/ stubs (Jason-backed) run instead.
+      # The native crate is under native/mana_json/. The mana builder
+      # (mix mana.compile) finds this key, builds the crate with cargo, and
+      # binds the functions of :mana_json_native to its symbols. On BEAM this
+      # key is ignored and the stubs under lib/ run instead.
       mana_native: [
         packages: [
           {:mana_json, [module: "mana_json_native"]}
@@ -30,9 +30,9 @@ defmodule ManaJSON.MixProject do
   end
 
   defp deps do
-    # No deps: the package ships the native crate under native/mana_json/ and
-    # a pure BEAM stub. It never references Jason — the host app selects Jason
-    # vs ManaJSON in its own config (config_env() == :mana).
+    # No deps. The package ships the native crate under native/mana_json/ and
+    # a pure BEAM stub. It never references Jason. The host app selects Jason
+    # or ManaJSON in its own config (config_env() == :mana).
     []
   end
 end

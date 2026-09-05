@@ -1,9 +1,10 @@
 defmodule Bench.Zlib do
   @moduledoc """
-  DEFLATE throughput vs warm BEAM: gzip of a representative HTML body and
-  a streaming raw deflate + inflate roundtrip (the permessage-deflate
-  shape). Compressed bytes differ from BEAM (miniz_oxide vs zlib); this
-  measures wall time on our workload, the second dependency-policy gate.
+  DEFLATE throughput against warm BEAM: gzip of a representative HTML body,
+  and a streaming raw deflate and inflate roundtrip (the permessage-deflate
+  shape). The compressed bytes differ from BEAM, because miniz_oxide is not
+  zlib. This measures wall time on our workload. It is the second
+  dependency-policy gate.
   """
 
   @html String.duplicate(

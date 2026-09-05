@@ -1,7 +1,8 @@
 defmodule Conf.Funs do
   @moduledoc """
-  Conformance program: closures — anonymous funs, captures, funs as
-  arguments, fun references (`&f/1`), and closures returning closures.
+  Conformance program for closures. It checks anonymous funs, captures,
+  funs as arguments, fun references (`&f/1`), and closures that return
+  closures.
   """
 
   def go do

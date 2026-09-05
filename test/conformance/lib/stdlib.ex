@@ -1,13 +1,13 @@
 defmodule Conf.Stdlib do
   @moduledoc """
-  THE stdlib gate (plan S5): real Elixir stdlib — IO.puts, Enum over lists
-  and ranges, String basics — compiled from the Elixir/OTP beams and
-  matching BEAM byte-for-byte on stdout.
+  THE stdlib gate (plan S5): the real Elixir stdlib compiled from the Elixir
+  and OTP beams. It covers IO.puts, Enum over lists and ranges, and String
+  basics. The stdout must match BEAM byte for byte.
   """
 
   def go do
-    # IO.puts: literals, computed strings, interpolation (String.Chars
-    # protocol dispatch on integers and binaries)
+    # IO.puts: literals, computed strings, and interpolation. Interpolation
+    # dispatches the String.Chars protocol on integers and binaries.
     IO.puts("hello from mana")
     IO.puts("con" <> "cat" <> "enation")
     n = Enum.sum(1..100)

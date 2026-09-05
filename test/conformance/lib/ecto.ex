@@ -23,10 +23,11 @@ end
 
 defmodule Conf.Ecto do
   @moduledoc """
-  Conformance program: Ecto's pure layer compiled from hex beams —
-  embedded schema, changeset cast/validate (happy and bad paths),
-  apply_changes, traverse_errors, and Ecto.Type casts. Maps printed via
-  sorted views (flatmap display order is implementation-defined).
+  Conformance program for the pure layer of Ecto, compiled from hex beams.
+  It checks an embedded schema, changeset cast and validate (happy and bad
+  paths), apply_changes, traverse_errors, and Ecto.Type casts. Maps print
+  through sorted views because the flatmap display order is
+  implementation-defined.
   """
   import Ecto.Changeset
   alias Conf.Ecto.User
@@ -41,7 +42,7 @@ defmodule Conf.Ecto do
     u = apply_changes(cs)
     :erlang.display({u.name, u.email, u.age, u.score, u.active})
 
-    # string keys vs atom keys, defaults, partial updates
+    # string keys against atom keys, defaults, partial updates
     cs2 = User.changeset(u, %{"age" => 37})
     :erlang.display({cs2.valid?, Enum.sort(Map.to_list(cs2.changes))})
 
@@ -66,7 +67,7 @@ defmodule Conf.Ecto do
 
     dump_kw(:msgs, Enum.sort(Map.to_list(msgs)))
 
-    # more validators / change tracking
+    # more validators and change tracking
     cs5 =
       %User{}
       |> cast(%{"name" => "Eve", "email" => "e@f.g"}, [:name, :email])
@@ -86,7 +87,7 @@ defmodule Conf.Ecto do
     :erlang.display(Ecto.Type.cast(:boolean, "0"))
     :erlang.display(Ecto.Type.cast(:string, "hi"))
     :erlang.display(Ecto.Type.cast({:array, :integer}, ["1", 2]))
-    # decimals are structs (maps): display sorted (flatmap-order rule)
+    # Decimals are structs (maps). Display them sorted because of the flatmap-order rule.
     {:ok, d1} = Ecto.Type.cast(:decimal, "1.5")
     :erlang.display({:ok, Enum.sort(Map.to_list(d1))})
     {:ok, d2} = Ecto.Type.cast(:decimal, 7)
@@ -94,12 +95,12 @@ defmodule Conf.Ecto do
     :erlang.display(Ecto.Type.dump(:integer, 5))
     :erlang.display(Ecto.Type.load(:boolean, true))
 
-    # decimal arithmetic (small coefficients — bignum ceiling documented)
+    # Decimal arithmetic with small coefficients. The bignum ceiling is documented.
     d = Decimal.add(Decimal.new("1.25"), Decimal.new("2.5"))
     :erlang.display(Decimal.to_string(d))
     :erlang.display(Decimal.compare(Decimal.new("2.0"), Decimal.new(2)))
 
-    # changesets under load (GC churn through the whole pipeline)
+    # Changesets under load: GC churn through the whole pipeline.
     :erlang.display(churn(200, 0))
 
     :erlang.display(:ecto_gate_done)

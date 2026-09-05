@@ -1,8 +1,9 @@
 defmodule Conf.Regex do
   @moduledoc """
-  Conformance program: Regex through the :re cut (Rust regex crate;
-  version mismatch forces recompilation from source). No backreferences
-  or lookaround — crate limitation, avoided here by construction.
+  Conformance program for Regex through the :re cut. The cut uses the Rust
+  regex crate, and a version mismatch forces recompilation from source. The
+  crate has no backreferences or lookaround, so this program avoids them by
+  construction.
   """
 
   def go do
@@ -23,7 +24,7 @@ defmodule Conf.Regex do
     :erlang.display(Regex.scan(~r/(\w)(\d)/, "a1 b2"))
     :erlang.display(Regex.scan(~r/x/, "none"))
 
-    # replace / split
+    # replace and split
     :erlang.display(Regex.replace(~r/\d+/, "a1 b22", "N"))
     :erlang.display(Regex.replace(~r/(a)(b)/, "ab ab", "\\2\\1"))
     :erlang.display(Regex.split(~r/,\s*/, "a, b,c"))
@@ -35,11 +36,11 @@ defmodule Conf.Regex do
     :erlang.display(Regex.named_captures(nr, "on 2024-05 we"))
     :erlang.display(Regex.run(nr, "2024-05", capture: [:month]))
 
-    # anchors / classes (validate_format shapes)
+    # anchors and classes (validate_format shapes)
     :erlang.display(Regex.match?(~r/^[a-z0-9._%+-]+@[a-z0-9.-]+$/, "me@example.com"))
     :erlang.display(Regex.match?(~r/^[a-z0-9._%+-]+@[a-z0-9.-]+$/, "not an email"))
 
-    # compile from string + error path
+    # compile from a string, and the error path
     {:ok, rc} = Regex.compile("^ab+c")
     :erlang.display(Regex.match?(rc, "abbbc"))
     :erlang.display(match?({:error, _}, Regex.compile("(unclosed")))
@@ -48,7 +49,7 @@ defmodule Conf.Regex do
     :erlang.display(Regex.match?(~r/héllo/u, "well héllo"))
     :erlang.display(Regex.scan(~r/./u, "héo"))
 
-    # under load (interning + GC)
+    # under load (interning and GC)
     :erlang.display(churn(200, 0))
   end
 

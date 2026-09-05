@@ -1,17 +1,18 @@
-//! Native JSON for apps compiled with mana — the `native/` crate of the
-//! `mana_json` hex package. Two BIFs back `ManaJSON`:
-//! `mana_json_native:encode/1` and `decode/1`, term <-> JSON via serde_json.
+//! Native JSON for apps that mana compiles. This is the `native/` crate of
+//! the `mana_json` hex package. Two BIFs back `ManaJSON`:
+//! `mana_json_native:encode/1` and `decode/1`. They convert between terms
+//! and JSON with serde_json.
 //!
 //! Term <-> JSON correspondence:
-//!   - atom :nil / :null  -> JSON null ; JSON null -> :nil on decode
+//!   - atom :nil / :null  -> JSON null. JSON null -> :nil on decode.
 //!   - :true / :false     -> JSON booleans
 //!   - other atoms        -> their name as a JSON string
-//!   - integer / float    -> JSON number (decode: i64, else float; encode
-//!                           preserves bignums exactly)
+//!   - integer / float    -> JSON number. Decode gives i64, else float.
+//!                           Encode keeps bignums exact.
 //!   - binary             -> JSON string (UTF-8)
-//!   - proper list / nil  -> JSON array (improper list -> {:error, ...})
-//!   - map                -> JSON object; keys must be atom/binary/integer;
-//!                           object keys decode to binaries
+//!   - proper list / nil  -> JSON array. An improper list -> {:error, ...}.
+//!   - map                -> JSON object. Keys must be atom, binary, or
+//!                           integer. Object keys decode to binaries.
 //!   - tuple              -> {:error, :unsupported}
 
 use mana_native::{Env, ProcCtx, Term, H};
@@ -19,9 +20,10 @@ use serde_json::Value;
 
 #[no_mangle]
 pub extern "C" fn mana_json_native_encode_1(ctx: *mut ProcCtx, term: u64) -> u64 {
-    // walk the term straight into a byte buffer — no serde_json::Value tree,
-    // no second serialization pass. Read-only over the process heap: no mana
-    // allocation until the result is built below.
+    // The walk writes the term straight into a byte buffer. There is no
+    // serde_json::Value tree and no second serialization pass. The walk is
+    // read-only over the process heap. No mana allocation happens until the
+    // result is built below.
     let mut out = Vec::new();
     if let Err(reason) = encode_term(Term(term), &mut out) {
         return build_error(ctx, reason);
@@ -35,8 +37,9 @@ pub extern "C" fn mana_json_native_encode_1(ctx: *mut ProcCtx, term: u64) -> u64
 
 #[no_mangle]
 pub extern "C" fn mana_json_native_decode_1(ctx: *mut ProcCtx, input: u64) -> u64 {
-    // borrows the process heap; serde parses into a Rust-heap Value with no
-    // mana allocation, so the borrow stays valid until we start building
+    // The slice borrows the process heap. serde parses into a Value on the
+    // Rust heap with no mana allocation. The borrow stays valid until the
+    // result build starts.
     let bytes = match Term(input).binary_bytes() {
         Some(b) => b,
         None => return build_error(ctx, b"badarg"),
@@ -60,7 +63,8 @@ fn build_error(ctx: *mut ProcCtx, reason: &[u8]) -> u64 {
     env.get(t)
 }
 
-// -- term -> JSON bytes (read-only walk; no mana allocation, no Value tree) --
+// Term -> JSON bytes. The walk is read-only. It makes no mana allocation and
+// no Value tree.
 
 fn encode_term(t: Term, out: &mut Vec<u8>) -> Result<(), &'static [u8]> {
     if t.is_nil() {
@@ -76,8 +80,9 @@ fn encode_term(t: Term, out: &mut Vec<u8>) -> Result<(), &'static [u8]> {
         if !f.is_finite() {
             return Err(b"non_finite_float");
         }
-        // ryu = serde_json's own float formatter: shortest round-trip, always
-        // with a '.' or exponent so decode reads it back as a float.
+        // ryu is the float formatter of serde_json. It gives the shortest
+        // round-trip form. The output always has a '.' or an exponent, so
+        // decode reads it back as a float.
         let mut buf = ryu::Buffer::new();
         out.extend_from_slice(buf.format(f).as_bytes());
         return Ok(());
@@ -133,7 +138,7 @@ fn encode_term(t: Term, out: &mut Vec<u8>) -> Result<(), &'static [u8]> {
     Err(b"unsupported")
 }
 
-/// Any integer term -> its decimal digits, preserving bignums exactly.
+/// Write any integer term as its decimal digits. Bignums stay exact.
 fn write_int(t: Term, out: &mut Vec<u8>) {
     let mut buf = [0u8; 64];
     let n = t.int_decimal(&mut buf).unwrap();
@@ -146,8 +151,9 @@ fn write_int(t: Term, out: &mut Vec<u8>) {
     }
 }
 
-/// A map key -> a JSON string. Keys must be atom / binary / integer (integer
-/// keys become their decimal as a string); anything else is a bad key.
+/// Write a map key as a JSON string. A key must be an atom, a binary, or an
+/// integer. An integer key becomes its decimal digits as a string. Any other
+/// key is a bad key.
 fn write_key(k: Term, out: &mut Vec<u8>) -> Result<(), &'static [u8]> {
     if k.is_atom() {
         write_json_string(k.atom_name(), out);
@@ -163,8 +169,9 @@ fn write_key(k: Term, out: &mut Vec<u8>) -> Result<(), &'static [u8]> {
     Ok(())
 }
 
-/// Emit a JSON string for arbitrary bytes. Valid UTF-8 is escaped in place;
-/// invalid UTF-8 is lossily replaced (U+FFFD), matching the old Value path.
+/// Write a JSON string for arbitrary bytes. Valid UTF-8 is escaped in place.
+/// Invalid UTF-8 sequences are replaced with U+FFFD. This replacement is
+/// lossy.
 fn write_json_string(bytes: &[u8], out: &mut Vec<u8>) {
     match std::str::from_utf8(bytes) {
         Ok(s) => escape_str(s.as_bytes(), out),
@@ -175,9 +182,10 @@ fn write_json_string(bytes: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// serde_json's default string escaping: escape `"`, `\`, and the C0 control
-/// characters (short escapes for \b \t \n \f \r, else \u00XX). Non-ASCII and
-/// `/` are passed through unescaped.
+/// The default string escaping of serde_json. The function escapes `"`, `\`,
+/// and the C0 control characters. It uses the short escapes \b \t \n \f \r
+/// where they exist, and \u00XX otherwise. Non-ASCII bytes and `/` pass
+/// through without an escape.
 fn escape_str(bytes: &[u8], out: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push(b'"');
@@ -215,15 +223,16 @@ fn value_to_term(env: &mut Env, v: &Value) -> H {
         Value::Bool(true) => env.atom(b"true"),
         Value::Bool(false) => env.atom(b"false"),
         Value::Number(n) => {
-            // arbitrary_precision: the literal is available as a string
+            // With arbitrary_precision, the number literal is available as a
+            // string.
             let s = n.as_str();
             if s.bytes().any(|c| c == b'.' || c == b'e' || c == b'E') {
                 env.float(s.parse::<f64>().unwrap_or(0.0))
             } else if let Ok(i) = s.parse::<i64>() {
                 env.int(i)
             } else {
-                // out of i64 range: fall back to float rather than a lossy
-                // path we can't round-trip
+                // The integer is out of the i64 range. A float is the
+                // fallback. The other paths are lossy and cannot round-trip.
                 env.float(s.parse::<f64>().unwrap_or(0.0))
             }
         }

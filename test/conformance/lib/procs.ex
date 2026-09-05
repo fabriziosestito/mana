@@ -1,17 +1,17 @@
 defmodule Conf.Procs do
   @moduledoc """
-  Conformance program: processes — spawn, zero-copy send, selective
-  receive (out-of-order matching), fan-out/collect, timeouts, message
-  data surviving collections, process crash isolation.
+  Conformance program for processes. It checks spawn, zero-copy send,
+  selective receive (out-of-order matching), fan-out and collect, timeouts,
+  message data that survives collections, and process crash isolation.
   """
 
   def go do
-    # ping-pong, several rounds through two processes
+    # Ping-pong: several rounds through two processes.
     me = self()
     pong = :erlang.spawn(fn -> pong_loop() end)
     :erlang.display(ping(pong, me, 5, 0))
 
-    # selective receive: take messages out of arrival order
+    # Selective receive: take messages out of arrival order.
     send(self(), {:b, 2})
     send(self(), {:a, 1})
     send(self(), {:c, 3})
@@ -33,12 +33,12 @@ defmodule Conf.Procs do
 
     :erlang.display({:ordered, a, b, c})
 
-    # fan-out: workers compute and reply; collect in worker order
+    # Fan-out: workers compute and reply. Collect in worker order.
     pids = fan_out(me, 10, [])
     :erlang.display(collect(pids, 0))
 
-    # messages carrying structure, with allocation pressure forcing GC
-    # between send and receive
+    # Messages that carry structure. Allocation pressure forces GC between
+    # send and receive.
     :erlang.spawn(fn -> send(me, {:payload, range(1, 100)}) end)
     _junk = churn(50, [])
 
@@ -46,7 +46,7 @@ defmodule Conf.Procs do
       {:payload, l} -> :erlang.display(sum(l, 0))
     end
 
-    # timeout fires when nothing arrives; 0 polls
+    # The timeout fires when nothing arrives. A timeout of 0 polls.
     receive do
       :never -> :erlang.display(:impossible)
     after
@@ -59,10 +59,11 @@ defmodule Conf.Procs do
       0 -> :erlang.display(:empty_poll)
     end
 
-    # a selective receive that times out must leave the messages it skipped
-    # visible to the next receive (BEAM resets the save pointer on timeout).
-    # Bandit relies on this: {:plug_conn, :sent} sits behind ThousandIsland's
-    # `receive :read_timeout after 0` flush on every keep-alive request.
+    # A selective receive that times out must leave the messages it skipped
+    # visible to the next receive. BEAM resets the save pointer on timeout.
+    # Bandit relies on this: {:plug_conn, :sent} sits behind the
+    # `receive :read_timeout after 0` flush of ThousandIsland on every
+    # keep-alive request.
     send(me, {:skipped, 1})
     send(me, {:skipped, 2})
 
@@ -88,8 +89,8 @@ defmodule Conf.Procs do
 
     :erlang.display(Process.info(me, :message_queue_len))
 
-    # same, for a POSITIVE timeout that actually elapses: the scan skips both
-    # messages, parks, times out, and must still reset
+    # The same check for a POSITIVE timeout that elapses: the scan skips both
+    # messages, parks, times out, and must still reset.
     send(me, {:skipped, 3})
     send(me, {:skipped, 4})
 
