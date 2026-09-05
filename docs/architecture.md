@@ -158,6 +158,34 @@ A whole-program analysis decides which functions can trigger a collection.
 Functions that cannot reach an allocation get no frame and no spills. Pure
 register code stays pure.
 
+### Memory safety of the runtime
+
+Compiled programs are memory safe by construction: no pointers, no mutable
+heap terms, a bounds test and a kind test before every indexed access. The
+runtime is not. It manages raw tagged words, and the Rust compiler cannot
+see the collector's invariants. The runtime therefore follows the pattern
+of the Go runtime: a cheap check that is always on, and a stress mode that
+is a knob.
+
+The always-on check runs where the collector already reads an object
+header. The kind must be one of the seven valid kinds, and the object must
+end before the end of its space. A cons cell must end before the nursery
+top. A word with an impossible tag aborts too. On failure the process
+exits with code 70 and prints the phase, the address, and the word. This
+is the same idea as Go's `found bad pointer in Go heap` throw. It costs a
+few compares per copied object.
+
+The stress mode is `MANA_GC_POISON=1`, on by default in debug builds. After
+every collection the runtime fills the evacuated memory with a poison word
+whose tag is the exception sentinel and whose kind byte is invalid. A stale
+pointer then reads poison and the next collection aborts, instead of the
+pointer reading a plausible old copy that fails much later. The stress
+matrix (`MANA_NURSERY_WORDS=512`, a collection at almost every allocation)
+runs with poison on.
+
+The invariants that these checks catch, and the remaining gaps against the
+Go runtime, are listed in `AGENTS.md`, section "Memory safety".
+
 ## BIF cuts
 
 Some OTP modules never compile from beam files. The runtime implements
