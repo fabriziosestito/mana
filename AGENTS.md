@@ -233,12 +233,20 @@ matrix. Six heap corruptions shipped in 2026, all in four invariant classes:
 
 Gaps against the Go runtime, in the order to pick them up:
 
-- `TODO(heap-verify)`: a heap verifier behind an environment variable
-  (`MANA_GC_VERIFY=1`). After every collection, walk every reachable term
-  and check the tag, the kind, and that each pointer lands in a live chunk.
-  Abort on the first bad word. Go has `GODEBUG` heap checks and write-barrier
-  assertions. We have one `eprintln!` in the collector. With this, the
-  stress matrix finds a bad root in one run instead of after a soak.
+- `TODO(gc-checks)`: always-on cheap checks in the collector, like Go's
+  `found bad pointer in Go heap` throw. Today `forward_minor` and
+  `forward_major` abort only on an impossible tag. Add, at the point where
+  the collector already reads the header: the kind must be one of the seven
+  valid kinds, the size must be below the chunk size, and a nursery or old
+  pointer must land inside a live chunk. Abort on failure. These are a few
+  compares per object on a path that already touches the header. They are
+  never a knob.
+- `TODO(heap-verify)`: a full verifier behind an environment variable
+  (`MANA_GC_VERIFY=1`), like Go's `GODEBUG=gccheckmark=1`. After every
+  collection, walk every reachable term from every root and check each
+  word. This is O(live heap) per collection, so it is off by default and
+  on in the stress matrix. With it, a bad root is found in one run instead
+  of after a soak.
 - `TODO(abi-consts-check)`: a test or `build.rs` that reads the mirrored
   constants (tags, kinds, `ProcCtx` word offsets, `NREG`, opcode tables) in
   `crates/mana-rt/src/term.rs` and `crates/mana-codegen/src/lib.rs` and
