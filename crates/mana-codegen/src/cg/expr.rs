@@ -1,8 +1,11 @@
+//! Expression compilation. `compile_tail` lowers an expression in tail
+//! position and ends the block with a return. `compile_value` lowers an
+//! expression to an `i64` term value. The sibling rule roots a value in a
+//! frame slot only when a later sibling can reach a GC point.
+
 use crate::*;
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    // ---- expression compilation ----
-
     pub(crate) fn compile_tail(
         &self,
         f: FunctionValue<'ctx>,
@@ -56,11 +59,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.compile_tail(f, handler, &mut hscope)
             }
             Expr::Apply { target, args } => {
-                // the sentinel propagates through the returned value —
-                // tail calls need no exception check
+                // The sentinel propagates through the returned value. A tail
+                // call needs no exception check.
                 let (call, _) = self.compile_apply(f, target, args, scope, true)?;
-                // every compiled callee (named, lift, shim, fun object) has
-                // the uniform tailcc prototype: guaranteed tail call
+                // Every compiled callee (named, lift, shim, fun object) has the
+                // uniform tailcc prototype. The tail call is guaranteed.
                 self.mark_tail(call);
                 let v = call_result(call)?;
                 self.builder.build_return(Some(&v)).map_err(be)?;
@@ -231,8 +234,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             Expr::Call { module, name, args } => {
                 if let Some(nf) = native_fn(module, name, args.len()) {
-                    // external native module: lower to a direct call to the
-                    // package's linked symbol (ctx, args...) -> term
+                    // External native module: emit a direct call to the linked
+                    // symbol of the package. The signature is (ctx, args...) -> term.
                     let callee = self.rt_fn(&nf.symbol, || self.c_fn_type(args.len()));
                     let argv = self.eval_args(f, args, scope)?;
                     let call = self
@@ -348,10 +351,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
-            // stacktraces are not built — TODO(stacktraces); the raw
-            // stacktrace argument was evaluated as part of the try lowering
+            // TODO(stacktraces): stacktraces are not built. The try lowering
+            // already evaluated the raw stacktrace argument.
             Expr::PrimOp { name, .. } if name == "build_stacktrace" => Ok(self.nil()),
-            // re-raise with dynamic class + raw stacktrace (dropped)
+            // Re-raise with a dynamic class. The raw stacktrace is dropped.
             Expr::PrimOp { name, args } if name == "raw_raise" && args.len() == 3 => {
                 let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
                 let ctx = self.ctx_val();
@@ -363,10 +366,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.builder.position_at_end(dead);
                 Ok(self.i64t.get_undef())
             }
-            // the writable-binary accumulator seed for <<acc/binary, ...>>
-            // append loops (Base.decode64 etc.); the arg is only a capacity
-            // hint and our binary construction copies on append, so an
-            // empty static binary is semantically exact
+            // The writable-binary accumulator seed for <<acc/binary, ...>>
+            // append loops (for example Base.decode64). The argument is only a
+            // capacity hint. Binary construction copies on append, so an empty
+            // static binary is exact.
             Expr::PrimOp { name, .. } if name == "bs_init_writable" => {
                 self.static_binary(&[])
             }
@@ -388,10 +391,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Expr::Map { pairs, update } => {
                 match update {
                     None => {
-                        // all-literal immediate keys (the struct/record case):
-                        // term order is known at compile time — emit the map
-                        // already sorted/deduped and skip mana_rt_map_norm.
-                        // Values still evaluate in source order (effects).
+                        // All keys are immediate literals (the struct/record case).
+                        // The term order is known at compile time. Emit the map
+                        // sorted and deduplicated, and skip mana_rt_map_norm.
+                        // Values still evaluate in source order because of effects.
                         let lit_keys: Option<Vec<&Literal>> = pairs
                             .iter()
                             .map(|(k, _, _)| match k {
@@ -417,8 +420,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                 let k = self.compile_literal(l)?;
                                 self.store_word(p, 1 + i as u64, k)?;
                             }
-                            // original order: a duplicate key's later value
-                            // overwrites the earlier store (last write wins)
+                            // Source order matters: for a duplicate key, the later
+                            // value overwrites the earlier store. The last write wins.
                             for (i, l) in keys.iter().enumerate() {
                                 let at = sorted
                                     .binary_search_by(|s| lit_key_ord(s, l))
@@ -432,8 +435,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                 .map_err(be)?;
                             return Ok(raw);
                         }
-                        // build unsorted, then normalize (pre-publication
-                        // mutation: the term hasn't escaped yet)
+                        // Build the map unsorted, then normalize it. The mutation
+                        // is safe because the term did not escape yet.
                         let n = pairs.len();
                         let mut children: Vec<&Expr> = Vec::with_capacity(2 * n);
                         for (k, _, v) in pairs {
@@ -471,8 +474,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         Ok(call_result(call)?.into_int_value())
                     }
                     Some(base) => {
-                        // `=>` = insert-or-replace (erlc rewrites maps:put/3
-                        // into these), `:=` = exact (badkey on miss)
+                        // `=>` inserts or replaces (erlc rewrites maps:put/3 into
+                        // this form). `:=` is exact and raises badkey on a miss.
                         let mut acc = self.compile_value(f, base, scope)?;
                         for (k, assoc, v) in pairs {
                             let wm = self.next_slot.get();
@@ -522,16 +525,16 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// Evaluate sibling expressions left→right; a value is spilled only if
-    /// a *later* sibling's evaluation contains a GC point. Returns fresh
-    /// values valid at the point of return.
+    /// Evaluate sibling expressions from left to right. A value is spilled
+    /// only if the evaluation of a later sibling contains a GC point. The
+    /// returned values are fresh and valid at the point of return.
     pub(crate) fn eval_siblings(
         &self,
         f: FunctionValue<'ctx>,
         exprs: &[&Expr],
         scope: &mut Scope<'ctx>,
     ) -> CgResult<Vec<IntValue<'ctx>>> {
-        // gc_after[i]: any expr j > i contains a GC point
+        // gc_after[i] is true if any expr j > i contains a GC point.
         let mut gc_after = vec![false; exprs.len()];
         let mut acc = false;
         for i in (0..exprs.len()).rev() {
@@ -542,7 +545,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Val(IntValue<'ctx>),
             Slot(u64),
         }
-        // spill slots die once reloaded below — release them for reuse
+        // The spill slots die after the reload below. Release them for reuse.
         let wm = self.next_slot.get();
         let mut held = Vec::with_capacity(exprs.len());
         for (i, e) in exprs.iter().enumerate() {
@@ -577,10 +580,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         out
     }
 
-    /// Evaluate and root every expression (used when the consumer itself is
-    /// an allocation). In frameless functions this can only be reached in
-    /// eternal-alloc (raise) mode, where allocation never collects — values
-    /// stay in SSA.
+    /// Evaluate and root every expression. The caller is itself an
+    /// allocation. In a frameless function this path is reached only in
+    /// eternal-alloc (raise) mode. There allocation never collects, so
+    /// values stay in SSA.
     pub(crate) fn eval_all_rooted(
         &self,
         f: FunctionValue<'ctx>,
@@ -590,8 +593,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         exprs
             .iter()
             .map(|e| {
-                // a variable already in a frame slot IS a root — reuse it;
-                // immediates (ints/atoms/nil) never move — keep in SSA
+                // A variable that already lives in a frame slot is a root. Reuse
+                // it. Immediates (ints, atoms, nil) never move. Keep them in SSA.
                 if let Expr::Var(name) = e {
                     if let Some(Binding::Slot(idx)) = scope.vars.get(name.as_str()) {
                         return Ok(Rooted::Slot(*idx));
@@ -607,9 +610,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 if self.framed() {
                     Ok(Rooted::Slot(self.spill(v)?))
                 } else {
-                    // frameless: the effect analysis proved no GC point
-                    // exists anywhere in this function (raise-path allocs
-                    // use the eternal allocator), so SSA is safe
+                    // Frameless: the effect analysis proved that this function
+                    // has no GC point (raise-path allocs use the eternal
+                    // allocator). SSA is safe.
                     Ok(Rooted::Val(v))
                 }
             })
@@ -623,7 +626,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// Arguments for a call: ctx first, then sibling-rule values.
+    /// The arguments for a call: ctx first, then the sibling-rule values.
     pub(crate) fn eval_args(
         &self,
         f: FunctionValue<'ctx>,

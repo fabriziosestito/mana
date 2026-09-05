@@ -1,9 +1,9 @@
 use crate::*;
 
-/// Erlang term order for the literal keys the presorted-map-literal path
-/// accepts: numbers < atoms < nil (nil is the empty list, which sorts after
-/// maps). Atoms compare by name bytes — same as the runtime's atom_bytes
-/// memcmp in mana_rt_compare.
+/// Erlang term order for the literal keys that the presorted-map-literal path
+/// accepts: numbers < atoms < nil. Nil is the empty list, and lists sort after
+/// maps. Atoms compare by name bytes. This is the same order as the atom_bytes
+/// memcmp in mana_rt_compare in the runtime.
 pub(crate) fn lit_key_ord(a: &Literal, b: &Literal) -> std::cmp::Ordering {
     fn rank(l: &Literal) -> u8 {
         match l {
@@ -21,9 +21,9 @@ pub(crate) fn lit_key_ord(a: &Literal, b: &Literal) -> std::cmp::Ordering {
 }
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    /// Inline flatmap lookup for a key whose equality is bit-identity
-    /// (atoms, smalls, nil). The subject must already be known to be a map.
-    /// Misses branch to `fail`; returns the value on the hit path.
+    /// Inline flatmap lookup for a key whose equality is bit identity
+    /// (atoms, smalls, nil). The caller must already know that the subject is a map.
+    /// A miss branches to `fail`. The hit path returns the value.
     pub(crate) fn inline_map_get(
         &self,
         f: FunctionValue<'ctx>,
@@ -125,8 +125,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("get", 3) => {
-                // miss (or non-map) yields the default — TODO(badmap): a
-                // non-map should raise
+                // A miss or a non-map yields the default. TODO(badmap): a
+                // non-map must raise.
                 let call = self
                     .builder
                     .build_call(
@@ -167,7 +167,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .build_conditional_branch(miss, miss_bb, hit_bb)
                     .map_err(be)?;
                 self.builder.position_at_end(hit_bb);
-                // {ok, V}: alloc, so root v in a temp slot first
+                // The {ok, V} tuple needs an allocation. Root v in a temporary slot first.
                 let vslot = if self.framed() { Some(self.spill(v)?) } else { None };
                 let p = self.alloc_words(3)?;
                 self.store_word(p, 0, self.i64t.const_int((2 << 8) | KIND_TUPLE, false))?;
@@ -329,7 +329,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("update", 3) => {
-                // update(K, V, M): key must exist (badkey otherwise)
+                // update(K, V, M): the key must exist. A missing key raises badkey.
                 let callee = self.rt_fn("mana_rt_map_update_exact", || {
                     self.i64t.fn_type(
                         &[
@@ -508,7 +508,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("fold", 3) => {
-                // fold(Fun, Acc, Map)
+                // Argument order: fold(Fun, Acc, Map).
                 let callee = self.rt_fn("mana_rt_maps_fold", || {
                     self.i64t.fn_type(
                         &[

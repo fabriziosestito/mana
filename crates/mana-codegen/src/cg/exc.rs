@@ -5,8 +5,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.i64t.const_int(EXC_SENTINEL, false)
     }
 
-    /// Where an unwinding exception goes: the innermost try handler, or the
-    /// per-function propagate block (unlink frame, return the sentinel).
+    /// The block where an unwinding exception goes: the innermost try
+    /// handler, or the per-function propagate block. The propagate block
+    /// unlinks the frame and returns the sentinel.
     pub(crate) fn unwind_target(&self, f: FunctionValue<'ctx>) -> CgResult<BasicBlock<'ctx>> {
         if let Some(h) = self.handlers.borrow().last() {
             return Ok(*h);
@@ -26,15 +27,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(bb)
     }
 
-    /// Store class/reason into the ctx and jump to the unwind target.
-    /// Leaves the builder in a fresh dead block.
+    /// Store the class and the reason into the ctx and jump to the unwind
+    /// target. This leaves the builder in a fresh dead block.
     pub(crate) fn emit_raise(
         &self,
         f: FunctionValue<'ctx>,
         class: IntValue<'ctx>,
         reason: IntValue<'ctx>,
     ) -> CgResult<()> {
-        // poor man's stacktrace, raise flavor (MANA_DEBUG_RAISE)
+        // A minimal stacktrace substitute for raises (MANA_DEBUG_RAISE).
         let site = format!("{}:{}", self.module_name, f.get_name().to_string_lossy());
         let ptr = self.static_bytes(site.as_bytes())?;
         self.builder
@@ -67,8 +68,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    /// After a call to a may-raise function: branch to the unwind target if
-    /// the sentinel came back.
+    /// After a call to a function that can raise: branch to the unwind
+    /// target if the call returned the sentinel.
     pub(crate) fn check_exc(
         &self,
         f: FunctionValue<'ctx>,
@@ -87,10 +88,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(ret)
     }
 
-    /// Bind try-catch variables: `<Class, Reason, Stk>` (3), `<Class,
+    /// Bind the try-catch variables: `<Class, Reason, Stk>` (3), `<Class,
     /// Reason>` (2) or `<Reason>` (1). The stacktrace slot carries the class
-    /// atom so `primop raise(Stk, Reason)` re-raises with the right class
-    /// (TODO(stacktraces)).
+    /// atom, so `primop raise(Stk, Reason)` re-raises with the correct class.
+    /// TODO(stacktraces): the slot does not hold a real stacktrace.
     pub(crate) fn bind_try_evars(
         &self,
         scope: &mut Scope<'ctx>,
@@ -113,7 +114,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// Branch to a fresh block that raises `error:badarg` unless `ok`.
+    /// If `ok` is false, branch to a fresh block that raises `error:badarg`.
     pub(crate) fn guard_badarg(
         &self,
         f: FunctionValue<'ctx>,
@@ -125,8 +126,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_conditional_branch(ok, cont, bad)
             .map_err(be)?;
         self.builder.position_at_end(bad);
-        // poor man's stacktrace: MANA_DEBUG_BADARG names the raising
-        // function (cold path — the call costs nothing unless raising)
+        // A minimal stacktrace substitute: MANA_DEBUG_BADARG names the
+        // function that raises. This is a cold path. The call costs nothing
+        // unless the function raises.
         let site = format!(
             "{}:{}",
             self.module_name,
@@ -172,8 +174,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let was = self.eternal_alloc.replace(true);
         let result: CgResult<(IntValue<'ctx>, IntValue<'ctx>)> = (|| {
             let (class, reason) = match name {
-                // primop raise(Stk, Reason): re-raise. The "stacktrace" slot
-                // carries the class atom (TODO(stacktraces)).
+                // primop raise(Stk, Reason) is a re-raise. The "stacktrace" slot
+                // carries the class atom. TODO(stacktraces): the slot does not
+                // hold a real stacktrace.
                 "raise" if args.len() == 2 => {
                     let class = self.compile_value(f, &args[0], scope)?;
                     let reason = self.compile_value(f, &args[1], scope)?;
@@ -193,9 +196,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     };
                     (self.atom_term("throw")?, reason)
                 }
-                // match_fail / error / anything else: class error.
-                // BEAM reports function_clause as a bare atom (the args go
-                // into the stacktrace, which we don't build yet).
+                // match_fail, error, and anything else: class error. BEAM
+                // reports function_clause as a bare atom. The args go into the
+                // stacktrace, which is not built yet.
                 _ => {
                     let reason = match args.first() {
                         Some(Expr::Tuple(items))

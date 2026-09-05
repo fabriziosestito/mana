@@ -1,9 +1,16 @@
+//! Reachability analysis over module summaries. The module holds the list
+//! of native BIF modules, the per-build manifest of external native modules,
+//! and the walk that finds every function reachable from the entry point.
+//! The walk also seeds exports of modules that dynamic dispatch can name.
+//! The native manifest is build data. It must never leak into cached
+//! summaries.
+
 use crate::*;
 
-/// Modules implemented natively (never compiled from beams).
-/// Modules implemented natively by the runtime — never compiled from beams,
-/// never chased as dependencies. The mix driver reads this list via
-/// `manac --print-bif-modules` (single source of truth for its closure BFS).
+/// Modules that the runtime implements natively. The compiler never
+/// compiles them from beams and never follows them as dependencies. The mix
+/// driver reads this list with `manac --print-bif-modules`. The list is the
+/// single source of truth for the closure BFS of the driver.
 pub const BIF_MODULES: &[&str] = &[
     "erlang", "maps", "io", "unicode", "persistent_term", "code", "io_lib",
     "logger", "ets", "application", "file", "prim_file", "math", "re", "timer",
@@ -17,21 +24,22 @@ pub(crate) fn is_bif_module(m: &str) -> bool {
     BIF_MODULES.contains(&m)
 }
 
-// ---- external native modules (hex-package `native/` crates) ----
+// External native modules (hex-package `native/` crates)
 //
-// Unlike BIF_MODULES (native code baked into libmana_rt.a, known to the
-// compiler), these are declared per-build from the `mana_native:` metadata
-// of a project's deps: a stub module whose calls lower to a symbol linked
-// from the package's compiled `native/` crate. The manifest is DATA, not
-// part of the tool binary, so it must NOT leak into cached summaries — the
-// summarizer records a call into a native module as an ordinary remote dep
-// (cache-safe); the per-fn (gc,raise) verdicts are injected at fixpoint
-// time (compute_may_gc / compute_may_raise) and consulted by the reference
-// walkers, both of which run every build.
+// BIF_MODULES is native code baked into libmana_rt.a and known to the
+// compiler. External native modules are different. Each build declares them
+// from the `mana_native:` metadata of the project dependencies. Each one is
+// a stub module. Its calls lower to a symbol linked from the compiled
+// `native/` crate of the package. The manifest is data, not part of the
+// tool binary. It must not leak into cached summaries. The summarizer
+// records a call into a native module as an ordinary remote dependency,
+// which is cache-safe. The per-function (gc,raise) verdicts are injected at
+// fixpoint time (compute_may_gc / compute_may_raise). The reference walkers
+// read them. Both steps run on every build.
 
 #[derive(Clone, Debug)]
 pub struct NativeFn {
-    /// The `#[no_mangle]` symbol in the package's native crate.
+    /// The `#[no_mangle]` symbol in the native crate of the package.
     pub symbol: String,
     pub may_gc: bool,
     pub may_raise: bool,
@@ -45,7 +53,8 @@ pub struct NativeManifest {
 
 pub(crate) static NATIVE_MODULES: std::sync::OnceLock<NativeManifest> = std::sync::OnceLock::new();
 
-/// Install the native-module manifest for this build (once, before compile).
+/// Install the native-module manifest for this build. Call it once, before
+/// compile.
 pub fn set_native_manifest(m: NativeManifest) {
     let _ = NATIVE_MODULES.set(m);
 }
@@ -61,15 +70,15 @@ pub(crate) fn native_fn(module: &str, name: &str, arity: usize) -> Option<&'stat
         .get(&(module.to_string(), name.to_string(), arity))
 }
 
-// ---- reachability ----
+// Reachability
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Edge {
     Local(FunName),
     Remote(String, FunName),
-    /// literal M:F named in a spawn/apply argument position where the
-    /// argument-list length is not statically known — every defined arity
-    /// of the target is reachable
+    /// A literal M:F in a spawn or apply argument position where the length
+    /// of the argument list is not known statically. Every defined arity of
+    /// the target is reachable.
     RemoteAnyArity(String, String),
 }
 
@@ -121,49 +130,51 @@ pub(crate) fn reachable_funs(
 
     let mut seen: HashSet<(String, FunName)> = HashSet::new();
     let mut work = vec![(entry_mod.to_string(), entry.clone())];
-    // Dynamic dispatch (erlang:apply/3, incl. erlc's computed M:F(...)
-    // calls) can only name a module through an atom. A compiled module
-    // whose name atom appears as a literal anywhere in reachable code
-    // (protocol impl_for tables, dispatch lists, pick-a-module functions)
-    // gets its exports seeded as roots; modules that are merely statically
-    // required (Kernel etc.) keep full pruning. Reflection exports
-    // (module_info) stays out — the runtime answers it; __info__ compiles
-    // (get_module_info BIF backs its attributes/compile clauses).
+    // Dynamic dispatch can only name a module through an atom. This covers
+    // erlang:apply/3 and the computed M:F(...) calls that erlc emits. A
+    // compiled module is a dispatch candidate when its name atom appears as
+    // a literal in reachable code (protocol impl_for tables, dispatch lists,
+    // pick-a-module functions). Its exports become roots. Modules that are
+    // only required statically (Kernel and others) keep full pruning. The
+    // reflection export module_info stays out, because the runtime answers
+    // it. __info__ compiles, because the get_module_info BIF backs its
+    // attributes/compile clauses.
     let module_names: HashSet<&str> = units.iter().map(|u| u.summary.name.as_str()).collect();
     let mod_by_name: HashMap<&str, &ModuleSummary> = units
         .iter()
         .map(|u| (u.summary.name.as_str(), &u.summary))
         .collect();
     let seed_set: HashSet<&str> = seed_exports.iter().map(|s| s.as_str()).collect();
-    // Dynamic-dispatch seeding: a module is a candidate target when its
-    // name atom appears in reachable code (protocol impl tables, dispatch
-    // lists). Which of its exports are roots depends on how dispatch names
-    // functions: literal name positions (`impl.to_string(x)`) seed just
-    // that name/arity; a dynamic name position anywhere (apply with a
-    // computed function) falls back to seeding every export of candidate
-    // modules. Elixir modules only — Erlang infra mentions each other's
-    // atoms constantly ({global, Name} etc.) and would drag in the whole
-    // OTP kernel; behaviour callback dispatch needs a finer rule —
-    // TODO(behaviour-seeding).
+    // Which exports of a candidate become roots depends on how dispatch
+    // names functions. A literal name position (`impl.to_string(x)`) seeds
+    // only that name/arity. A dynamic name position anywhere (apply with a
+    // computed function) seeds every export of the candidate modules. Full
+    // seeding applies to Elixir modules only. Erlang infrastructure modules
+    // mention the atoms of each other constantly ({global, Name} and
+    // others). Full seeding of them will pull in the whole OTP kernel.
+    // Behaviour callback dispatch needs a finer rule.
+    // TODO(behaviour-seeding): write that rule.
     let mut mentioned: BTreeSet<String> = BTreeSet::new();
     let mut missing_dyn: BTreeSet<String> = BTreeSet::new();
     let mut missing_modules: std::collections::BTreeMap<String, (String, FunName)> =
         Default::default();
-    // atoms mentioned by modules that contain a dynamic function-name
-    // position: those get FULL export seeding (the dispatch could name
-    // anything); everything else seeds only literally-named pairs
+    // Atoms that modules with a dynamic function-name position mention.
+    // These get full export seeding, because the dispatch can name any
+    // function. All other atoms seed only pairs with a literal name.
     let mut mentioned_dyn: BTreeSet<String> = BTreeSet::new();
     let mut dyn_pairs: HashSet<(String, usize)> = HashSet::new();
-    // MFA-tuple function names seeded at EVERY defined arity (apply-time
-    // args-list extension makes the literal arity unreliable)
+    // Function names from MFA tuples. Each is seeded at every defined
+    // arity, because apply-time extension of the args list makes the
+    // literal arity unreliable.
     let mut dyn_any_names: HashSet<String> = HashSet::new();
-    // atoms in module position of {M, F, Args} / {M, Opts} literal tuples
-    // (child specs) — chased as candidates even without an Elixir. prefix
+    // Atoms in module position of {M, F, Args} / {M, Opts} literal tuples
+    // (child specs). These are candidates even without an Elixir. prefix.
     let mut tuple_heads: HashSet<String> = HashSet::new();
     let mut dyn_modules: HashSet<String> = HashSet::new();
     let mut module_atoms: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut seeded: HashSet<(String, FunName)> = HashSet::new();
-    // seeding-scan deltas (see the incremental-seeding note in the loop)
+    // Deltas of the seeding scan. See the incremental-seeding comment in
+    // the loop.
     let mut new_mentioned: Vec<String> = Vec::new();
     let mut new_dyn: Vec<String> = Vec::new();
     let mut new_pairs: Vec<(String, usize)> = Vec::new();
@@ -186,15 +197,15 @@ pub(crate) fn reachable_funs(
                     .or_default()
                     .insert(a.clone());
             } else if a.starts_with("Elixir.") {
-                // possibly a dispatch target whose beam was never pulled
-                // (consolidated protocol impls); the driver decides
-                // whether a beam exists for it
+                // The atom can name a dispatch target whose beam was never
+                // pulled (consolidated protocol impls). The driver decides
+                // whether a beam exists for it.
                 missing_dyn.insert(a.clone());
             }
         }
-        // (ModuleAtom, FunAtom) appearing as consecutive literal call args
-        // is MFA-shaped data flow (proc_lib:start_link(gen, init_it, ...)):
-        // seed every defined arity of the named function
+        // A (ModuleAtom, FunAtom) pair in consecutive literal call args is
+        // MFA-shaped data flow, for example proc_lib:start_link(gen,
+        // init_it, ...). Seed every defined arity of the named function.
         for (pm, pf) in &fun.arg_pairs {
             if let Some(target) = mod_by_name.get(pm.as_str()) {
                 for df in &target.funs {
@@ -229,24 +240,25 @@ pub(crate) fn reachable_funs(
                 }
             }
         }
-        // Incremental seeding. The old form rescanned every mentioned
-        // module's exports on every work item; all the inputs (mentioned,
-        // mentioned_dyn, dyn_pairs) only ever grow, so processing just the
-        // deltas reaches the identical least fixpoint.
-        // full seeding stays Elixir-only (Erlang infra mentions each
-        // other constantly — full-seeding gen/global pulls all of OTP);
-        // pair seeding (dynamically-named functions) applies everywhere.
-        // Application-own modules (--seed-exports) get FULL export
-        // retention once touched — configs/templates dispatch into
-        // them by runtime-built atoms no static analysis can see.
-        // Untouched ones stay pruned (each conformance program must
-        // not drag in its siblings' closures).
+        // Incremental seeding. The inputs (mentioned, mentioned_dyn,
+        // dyn_pairs) only grow. A scan of only the deltas reaches the same
+        // least fixpoint as a rescan of every mentioned module's exports on
+        // every work item.
+        // Full seeding stays Elixir-only. Erlang infrastructure modules
+        // mention each other constantly. Full seeding of gen or global pulls
+        // in all of OTP. Pair seeding (functions with a dynamic name)
+        // applies everywhere.
+        // Modules of the application itself (--seed-exports) keep all
+        // exports once the walk touches them. Configs and templates dispatch
+        // into them with atoms built at run time. No static analysis can see
+        // those atoms. Untouched modules stay pruned. Each conformance
+        // program must not pull in the closures of its siblings.
         while !(new_mentioned.is_empty()
             && new_dyn.is_empty()
             && new_pairs.is_empty()
             && new_any_names.is_empty())
         {
-            // a module newly mentioned: seed per its current full status
+            // A newly mentioned module: seed it per its current full status.
             for a in std::mem::take(&mut new_mentioned) {
                 let full = (mentioned_dyn.contains(&a) && a.starts_with("Elixir."))
                     || seed_set.contains(a.as_str());
@@ -268,8 +280,8 @@ pub(crate) fn reachable_funs(
                     }
                 }
             }
-            // a mentioned module upgraded to full (named by a dyn-dispatch
-            // module): seed every export
+            // A mentioned module upgraded to full status, because a module
+            // with dynamic dispatch names it: seed every export.
             for a in std::mem::take(&mut new_dyn) {
                 if !(a.starts_with("Elixir.") && mentioned.contains(&a)) {
                     continue;
@@ -286,8 +298,8 @@ pub(crate) fn reachable_funs(
                     }
                 }
             }
-            // a new literally-named (fun, arity) pair: seed it in every
-            // mentioned module that exports it
+            // A new (fun, arity) pair with a literal name: seed it in every
+            // mentioned module that exports it.
             for (pf, pa) in std::mem::take(&mut new_pairs) {
                 if pf == "module_info" {
                     continue;
@@ -303,8 +315,8 @@ pub(crate) fn reachable_funs(
                     }
                 }
             }
-            // a new MFA-tuple function name: seed every defined arity of
-            // it in every mentioned module
+            // A new function name from an MFA tuple: seed every defined
+            // arity of it in every mentioned module.
             for pf in std::mem::take(&mut new_any_names) {
                 if pf == "module_info" {
                     continue;
@@ -325,7 +337,7 @@ pub(crate) fn reachable_funs(
         for edge in &fun.edges {
             let (tmod, tfun) = match edge {
                 Edge::Local(f) => (module.clone(), f.clone()),
-                Edge::Remote(m, _) if is_bif_module(m) || is_native_module(m) => continue, // BIF / native
+                Edge::Remote(m, _) if is_bif_module(m) || is_native_module(m) => continue,
                 Edge::Remote(m, f) => (m.clone(), f.clone()),
                 Edge::RemoteAnyArity(m, _) if is_bif_module(m) || is_native_module(m) => continue,
                 Edge::RemoteAnyArity(m, fa) => {
@@ -338,8 +350,8 @@ pub(crate) fn reachable_funs(
                             }
                         }
                     } else {
-                        // an uncompiled module named in a dynamic MFA — the
-                        // driver may be able to pull its beam
+                        // A dynamic MFA names an uncompiled module. The
+                        // driver can pull its beam.
                         missing_dyn.insert(m.clone());
                     }
                     continue;
@@ -358,25 +370,27 @@ pub(crate) fn reachable_funs(
                     tmod, module, fname.name, fname.arity, parse_err
                 ));
             } else {
-                // keep walking so ONE run reports every missing module —
-                // the driver batch-pulls them instead of one per rebuild
+                // Continue the walk, so that one run reports every missing
+                // module. The driver pulls them in one batch instead of one
+                // per rebuild.
                 missing_modules
                     .entry(tmod)
                     .or_insert_with(|| (module.clone(), fname.clone()));
             }
         }
     }
-    // missing modules are non-fatal: the driver pulls the ones it can
-    // locate and rebuilds; callers of the rest get stubbed (loud at
-    // runtime only if actually reached)
+    // Missing modules are not fatal. The driver pulls the ones that it can
+    // locate and rebuilds. Callers of the rest get stubs. A stub is loud at
+    // run time only if the program reaches it.
     for (m, (rm, rf)) in &missing_modules {
         eprintln!(
             "manac: module '{}' (required by {}:{}/{}) is not among the compiled modules",
             m, rm, rf.name, rf.arity
         );
     }
-    // module-position tuple heads ({M, Opts} / {M, F, Args} child specs)
-    // are candidates too, Elixir-prefixed or not (telemetry_poller!)
+    // Tuple heads in module position ({M, Opts} / {M, F, Args} child specs)
+    // are candidates too, with or without an Elixir. prefix. telemetry_poller
+    // is one example.
     for h in &tuple_heads {
         if !module_names.contains(h.as_str()) {
             missing_dyn.insert(h.clone());
@@ -401,8 +415,8 @@ pub(crate) fn reachable_funs(
     Ok((seen, missing_set))
 }
 
-/// Consecutive literal-atom argument pairs in call argument lists —
-/// MFA-shaped data flow feeding behaviour spawn machinery.
+/// Consecutive literal-atom argument pairs in call argument lists. They are
+/// MFA-shaped data flow that feeds the behaviour spawn machinery.
 pub(crate) fn collect_atom_arg_pairs(e: &Expr, out: &mut Vec<(String, String)>) {
     fn scan_args(args: &[Expr], out: &mut Vec<(String, String)>) {
         for w in args.windows(2) {
@@ -477,8 +491,8 @@ pub(crate) fn collect_atom_arg_pairs(e: &Expr, out: &mut Vec<(String, String)>) 
     }
 }
 
-/// Literal function names in dynamic-call name positions (with arity), and
-/// whether any name position is a computed expression.
+/// Literal function names (with arity) in the name positions of dynamic
+/// calls. Also reports whether any name position is a computed expression.
 pub(crate) fn collect_dyn_names(
     e: &Expr,
     pairs: &mut HashSet<(String, usize)>,
@@ -498,12 +512,14 @@ pub(crate) fn collect_dyn_names(
                 .for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads, any_names));
         }
         Expr::Call { module, name, args } => {
-            // a surviving erlang:apply/3 call has fully dynamic M and F
+            // An erlang:apply/3 call that survives to this point has a fully
+            // dynamic M and F.
             if module == "erlang" && name == "apply" && args.len() == 3 {
                 *dyn_any = true;
             }
-            // make_fun(Mod, F, A) with literal F/A: a callback-cache shape
-            // (gen_server) — the named function is dynamically dispatched
+            // make_fun(Mod, F, A) with a literal F and A is a callback-cache
+            // shape (gen_server). The named function is dispatched
+            // dynamically.
             if module == "erlang" && name == "make_fun" && args.len() == 3 {
                 if let (Expr::Lit(Literal::Atom(fa)), Expr::Lit(Literal::Int(n))) =
                     (&args[1], &args[2])
@@ -519,10 +535,11 @@ pub(crate) fn collect_dyn_names(
         Expr::Lit(_) | Expr::Var(_) | Expr::FunRef { .. } => {}
         Expr::Tuple(items) | Expr::Values(items) => {
             // {Mod, Fun, Args} literal tuples (supervisor child specs,
-            // callback tuples) are applied dynamically — and the args list
-            // is routinely EXTENDED at apply time (Plug.Debugger's banner
-            // {M, F, []} is called /5), so seed the name at EVERY defined
-            // arity. Still inert unless the module is a dynamic candidate.
+            // callback tuples) are applied dynamically. The args list is
+            // often extended at apply time. For example, the banner
+            // {M, F, []} of Plug.Debugger is called with arity 5. So seed
+            // the name at every defined arity. The seed stays inert unless
+            // the module is a dynamic candidate.
             if items.len() == 3 {
                 if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) =
                     (&items[0], &items[1])
@@ -534,7 +551,7 @@ pub(crate) fn collect_dyn_names(
                 }
             }
             // {Module, Opts} child specs: Supervisor calls
-            // Module.child_spec(Opts) dynamically
+            // Module.child_spec(Opts) dynamically.
             if items.len() == 2 {
                 if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Nil))
                 | (Expr::Lit(Literal::Atom(m)), Expr::Cons(..)) = (&items[0], &items[1])
@@ -593,9 +610,9 @@ pub(crate) fn collect_dyn_names(
     }
 }
 
-/// Every atom literal in an expression tree, including clause patterns
-/// (protocol dispatch matches on module atoms) — drives apply export
-/// seeding in reachable_funs.
+/// Every atom literal in an expression tree, including clause patterns.
+/// Protocol dispatch matches on module atoms. The result drives apply
+/// export seeding in reachable_funs.
 pub(crate) fn collect_atoms(e: &Expr, out: &mut BTreeSet<String>) {
     fn pat_atoms(p: &Pattern, out: &mut BTreeSet<String>) {
         match p {
@@ -676,8 +693,8 @@ pub(crate) fn collect_atoms(e: &Expr, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Length of a statically-spelled proper list (cons spine ending in nil),
-/// if determinable.
+/// Length of a proper list that the source spells out statically (a cons
+/// spine that ends in nil). Returns None when the length is not known.
 pub(crate) fn static_list_len(e: &Expr) -> Option<usize> {
     match e {
         Expr::Lit(Literal::Nil) => Some(0),
@@ -739,9 +756,10 @@ pub(crate) fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut Ha
                     arity: args.len(),
                 },
             ));
-            // literal-MFA spawns/applies are dynamic dispatch reachability
-            // can see: spawn(M, F, Args) / spawn_opt / apply — behaviour
-            // machinery (proc_lib → gen:init_it) lives on this path
+            // A spawn or apply with a literal MFA is dynamic dispatch that
+            // reachability can see: spawn(M, F, Args), spawn_opt, apply. The
+            // behaviour machinery (proc_lib to gen:init_it) lives on this
+            // path.
             let mfa_args = match (module.as_str(), name.as_str(), args.len()) {
                 ("erlang", "spawn", 3)
                 | ("erlang", "spawn_link", 3)

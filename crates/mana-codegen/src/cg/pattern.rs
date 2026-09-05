@@ -1,13 +1,16 @@
 use crate::*;
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    /// Emit tests for `pat` against `val`, branching to `fail` on mismatch.
-    /// Patterns don't allocate — EXCEPT binary patterns with binary-type
-    /// segments, which build sub-binaries (GC points). Wherever a sub-pattern
-    /// may allocate, the enclosing arm keeps its subject in a frame slot and
-    /// re-derives pointers after the sub-match, so no stale SSA pointer is
-    /// ever used across a collection (functions containing such patterns are
-    /// framed by effect analysis; bound vars are already slot-backed).
+    /// Emits tests for `pat` against `val`. On a mismatch, the code branches
+    /// to `fail`.
+    ///
+    /// Patterns do not allocate, with one exception. Binary patterns with
+    /// binary-type segments build sub-binaries, and these are GC points.
+    /// Where a sub-pattern can allocate, the enclosing arm keeps its subject
+    /// in a frame slot. It derives the pointers again after the sub-match.
+    /// As a result, no stale SSA pointer is used across a collection. Effect
+    /// analysis frames the functions that hold such patterns. Bound variables
+    /// are already backed by slots.
     pub(crate) fn match_pattern(
         &self,
         f: FunctionValue<'ctx>,
@@ -23,9 +26,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.match_pattern(f, val, inner, scope, fail)
             }
             Pattern::Lit(l @ Literal::Big(_)) => {
-                // interned big-literal terms have pointer identity, but a
-                // matching value may also arrive via ==-equal biglit from
-                // another intern site — compare exactly
+                // Interned big-literal terms have pointer identity. But a
+                // value that is equal under `==` can also arrive from another
+                // intern site. The comparison must be exact.
                 let expect = self.compile_literal(l)?;
                 let call = self
                     .builder
@@ -73,8 +76,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             Pattern::Binary(segs) => self.match_binary(f, val, segs, scope, fail),
             Pattern::Map(pairs) => {
-                // a map pattern — even the empty `~{}~`, which requires no
-                // keys — only ever matches maps
+                // A map pattern only matches maps. This also holds for the
+                // empty `~{}~`, which requires no keys.
                 let is_map = self.kind_test(f, val, |s, header| {
                     let k = s
                         .builder
@@ -96,9 +99,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         Some(s) => self.reload(s)?,
                         None => val,
                     };
-                    // immediate literal keys (atoms/smalls/nil) equal only
-                    // bit-identical terms: scan the key words inline — no
-                    // runtime call
+                    // Immediate literal keys (atoms, small integers, nil) are
+                    // equal only to bit-identical terms. The code scans the
+                    // key words inline, with no runtime call.
                     let immediate_key = matches!(
                         k,
                         Expr::Lit(Literal::Atom(_) | Literal::Nil)
@@ -223,8 +226,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// If this pattern's sub-matches contain a GC point, park the subject in
-    /// a frame slot so the caller can re-derive pointers after each one.
+    /// If the sub-matches of this pattern contain a GC point, this function
+    /// spills the subject to a frame slot. The caller can then derive the
+    /// pointers again after each sub-match.
     pub(crate) fn pattern_subject_slot(&self, pat: &Pattern, val: IntValue<'ctx>) -> CgResult<Option<u64>> {
         if !pattern_may_gc(pat) {
             return Ok(None);
@@ -235,11 +239,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(Some(self.spill(val)?))
     }
 
-    /// Match a bitstring pattern. The byte offset is a runtime value once
-    /// any segment has a dynamic size (or is utf8). Binary-type segments
-    /// allocate sub-binaries; the subject is kept in a frame slot across
-    /// those (see match_pattern). Constant-size integer literals compare
-    /// against static byte arrays.
+    /// Matches a bitstring pattern. The byte offset becomes a runtime value
+    /// after the first segment with a dynamic size or a utf8 type.
+    /// Binary-type segments allocate sub-binaries. The subject stays in a
+    /// frame slot across those segments (see match_pattern). Constant-size
+    /// integer literals compare against static byte arrays.
     pub(crate) fn match_binary(
         &self,
         f: FunctionValue<'ctx>,
@@ -275,24 +279,27 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .sum();
         let at_least = rest || !all_const;
         if !at_least && const_total_bits % 8 != 0 {
-            // our binaries are byte-aligned: an exact sub-byte-total
-            // pattern can never match
+            // Binaries are byte-aligned. An exact pattern with a total size
+            // that is not a multiple of 8 bits can never match.
             self.builder.build_unconditional_branch(fail).map_err(be)?;
             let dead = self.ctx.append_basic_block(f, "bm.dead");
             self.builder.position_at_end(dead);
             return Ok(());
         }
         let const_total: u64 = const_total_bits.div_ceil(8);
-        // preflight: is-binary + (for all-const patterns) the length check;
-        // dynamic patterns re-check bounds per segment. Inline: tag test,
-        // kind byte, length compare — no runtime call.
+        // Preflight: the is-binary test and the length check. For all-constant
+        // patterns the length check is exact. For dynamic patterns it is a
+        // lower bound, and each segment checks its bounds again. The tag
+        // test, the kind byte, and the length compare are inline, with no
+        // runtime call.
         let ok = self.kind_test(f, val, |s, header| {
             let k = s
                 .builder
                 .build_and(header, s.i64t.const_int(0xff, false), "bl.k")
                 .map_err(be)?;
-            // kinds 5 (bin) and 13 (sub-binary view) differ only in bit 3;
-            // both carry len<<8 in the header, so the length check is shared
+            // Kinds 5 (bin) and 13 (sub-binary view) differ only in bit 3.
+            // Both carry len<<8 in the header, so one length check serves
+            // both.
             let k2 = s
                 .builder
                 .build_or(k, s.i64t.const_int(8, false), "bl.k2")
@@ -325,10 +332,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.branch_test(f, ok, fail)?;
 
         let mut off: IntValue<'ctx> = self.i64t.const_zero();
-        // true while every previous segment had a static byte width: the
-        // preflight (len >= const_total) then already bounds-checks this
-        // segment, so const/byte reads can inline without a runtime call.
-        // static_bits tracks the exact bit offset while prefix_static.
+        // prefix_static is true while every previous segment had a static
+        // byte width. In that case the preflight (len >= const_total) already
+        // bounds-checks this segment. Constant and byte reads can then inline
+        // without a runtime call. static_bits tracks the exact bit offset
+        // while prefix_static holds.
         let mut prefix_static = true;
         let mut static_bits: u64 = 0;
         for (spec, seg) in specs.iter().zip(segs) {
@@ -347,9 +355,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             match &spec.kind {
                 SegKind::Int { size } => {
                     if let SegSize::Bits(s) = size {
-                        // sub-byte unsigned big-endian read at a constant
-                        // bit offset (nibble destructuring in
-                        // Code.Identifier.escape and friends)
+                        // A sub-byte unsigned big-endian read at a constant
+                        // bit offset. This is the nibble destructuring shape
+                        // in Code.Identifier.escape and similar functions.
                         if !prefix_static {
                             return Err(
                                 "TODO(bitstring): sub-byte segment after dynamic prefix"
@@ -423,17 +431,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         continue;
                     }
                     let nbytes = self.seg_bytes(f, size, scope, Some(fail))?;
-                    // constant integer sub-patterns with constant sizes
-                    // compare as bytes (covers erlc's wide folded literals)
+                    // Constant integer sub-patterns with constant sizes
+                    // compare as bytes. This covers the wide folded literals
+                    // from erlc.
                     if let (SegSize::Bytes(n), Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_)))) =
                         (size, seg.value.as_ref())
                     {
                         if let Some(bytes) =
                             seg_const_bytes(&Expr::Lit(l.clone()), *n, spec.little)?
                         {
-                            // short literals under a preflighted length:
-                            // inline byte loads + compares (the whitespace
-                            // trim pyramid runs ~20 of these per string)
+                            // Short literals under a preflighted length use
+                            // inline byte loads and compares. The whitespace
+                            // trim pyramid runs about 20 of these per string.
                             if prefix_static && bytes.len() <= 16 {
                                 let base = self.bin_base_addr(f, subject)?;
                                 let bp = self
@@ -538,9 +547,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     if matches!(size, SegSize::Bytes(n) if *n > 8) {
                         return Err("TODO(bignum-segments): binding integer segments over 64 bits".into());
                     }
-                    // 1-byte unsigned reads under a preflighted length:
-                    // inline load (<<h, rest::binary>> — the string-walk
-                    // shape)
+                    // A 1-byte unsigned read under a preflighted length is an
+                    // inline load. This is the string-walk shape
+                    // <<h, rest::binary>>.
                     if prefix_static && matches!(size, SegSize::Bytes(1)) && !spec.signed {
                         let base = self.bin_base_addr(f, subject)?;
                         let bp = self
@@ -606,11 +615,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     off = self.builder.build_int_add(off, nbytes, "boff").map_err(be)?;
                 }
                 SegKind::Bin { size } => {
-                    // `rest::binary` after a static prefix (the string-walk
-                    // shape <<c, rest::binary>>): build the zero-copy view
-                    // inline — 3 words, no runtime call, no byte copy. The
-                    // preflight already proved len >= off. Allocate first,
-                    // then re-read the subject: the alloc may GC and move it.
+                    // `rest::binary` after a static prefix is the string-walk
+                    // shape <<c, rest::binary>>. The code builds the zero-copy
+                    // view inline: 3 words, no runtime call, no byte copy. The
+                    // preflight already proved len >= off. The code allocates
+                    // first and then reads the subject again. The allocation
+                    // can run a GC that moves the subject.
                     if matches!(size, SegSize::All) && prefix_static && slot.is_some() {
                         let vp = self.alloc_words(3)?;
                         let subject = self.reload(slot.unwrap())?;
@@ -727,7 +737,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 _ => prefix_static = false,
             }
         }
-        // no rest segment: the pattern must consume the binary exactly
+        // Without a rest segment, the pattern must consume the binary exactly.
         if !rest && !all_const {
             let subject = match slot {
                 Some(s) => self.reload(s)?,
@@ -760,9 +770,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    /// The byte count of a segment as a runtime value. Dynamic sizes verify
-    /// smallness/alignment: in patterns (`fail` set) a bad size is a match
-    /// failure; in construction it raises badarg.
+    /// Returns the byte count of a segment as a runtime value. Dynamic sizes
+    /// check that the size is a small integer and byte-aligned. In a pattern
+    /// (`fail` is set), a bad size is a match failure. In construction, a bad
+    /// size raises badarg.
     pub(crate) fn seg_bytes(
         &self,
         f: FunctionValue<'ctx>,
@@ -776,7 +787,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             SegSize::All => Err("internal: seg_bytes on rest segment".into()),
             SegSize::Dyn { size, unit } => {
                 let v = self.compile_value(f, size, scope)?;
-                // small int?
                 let tag = self.tag_of(v)?;
                 let is_int = self
                     .builder
@@ -799,7 +809,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .builder
                     .build_int_mul(raw, self.i64t.const_int(*unit as u64, false), "sz.bits")
                     .map_err(be)?;
-                // bits >= 0 and byte-aligned
                 let low = self
                     .builder
                     .build_and(bits, self.i64t.const_int(7, false), "sz.low")

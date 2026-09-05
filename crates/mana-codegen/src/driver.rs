@@ -1,20 +1,21 @@
 use crate::*;
 
-/// Compile a program to one object file per module in `out_dir`; returns
-/// the object paths. Only functions reachable from `entry` are compiled
-/// (closed world). A C `main` (init ctx, call entry) lands in the entry
-/// module's object. `poisoned` maps unparseable module names to their
-/// errors, surfaced if reachability needs them.
-/// The content-addressed object cache (content-hash build-cache model). An
-/// entry is keyed by the "action": everything that feeds a module's object —
-/// the compiler binary itself, the target/config, the module's core text,
-/// its include set, the effect verdicts of its remote callees, the missing
-/// modules it references, and whether it emits main. Anything new that
-/// influences codegen MUST be added to the key (a key that omits a codegen
-/// input is the canonical cache-poisoning bug).
+/// The content-addressed object cache (content-hash build-cache model). The
+/// key of an entry is the "action": every input that feeds the object of a
+/// module. The inputs are:
+/// - the compiler binary itself
+/// - the target and the codegen config
+/// - the core text of the module
+/// - its include set
+/// - the effect verdicts of its remote callees
+/// - the missing modules that it references
+/// - whether it emits main
+///
+/// If a new input influences codegen, you MUST add it to the key. A key
+/// that omits a codegen input is the canonical cache-poisoning bug.
 pub struct ObjCache {
     pub root: PathBuf,
-    /// blake3 of the running compiler binary (dev-branch tool identity)
+    /// The blake3 hash of the current compiler binary (dev-branch tool identity).
     pub tool_hash: [u8; 32],
     pub debug: bool,
 }
@@ -28,8 +29,8 @@ impl ObjCache {
             .join(format!("{}.o", hex))
     }
 
-    /// Cache lookup; refreshes the entry's mtime (age-based trim keeps
-    /// recently-used entries) at most ~hourly.
+    /// Cache lookup. It refreshes the mtime of the entry at most once per
+    /// hour. The age-based trim keeps the entries with a recent mtime.
     pub(crate) fn get(&self, key: &blake3::Hash) -> Option<PathBuf> {
         let p = self.path_for(key);
         let meta = std::fs::metadata(&p).ok()?;
@@ -44,10 +45,10 @@ impl ObjCache {
         Some(p)
     }
 
-    /// Idempotent publish: write-to-temp + atomic rename. Concurrent manac
-    /// processes may duplicate effort but cannot corrupt entries. (File
-    /// locking is notoriously unreliable on network filesystems — this
-    /// scheme needs none.)
+    /// Idempotent publish: write to a temp file, then an atomic rename.
+    /// Concurrent manac processes can duplicate work, but they cannot corrupt
+    /// an entry. File locking is unreliable on network filesystems. This
+    /// scheme needs no locks.
     pub(crate) fn put(&self, key: &blake3::Hash, obj: &Path) -> CgResult<PathBuf> {
         let dst = self.path_for(key);
         if let Some(parent) = dst.parent() {
@@ -59,8 +60,8 @@ impl ObjCache {
         Ok(dst)
     }
 
-    /// Age-based trim: at most once per 24h, drop entries not
-    /// used (mtime) for 30 days. Best-effort — errors are ignored.
+    /// Age-based trim. At most once per 24h, it removes the entries with an
+    /// mtime older than 30 days. It is best-effort. It ignores errors.
     pub fn trim(&self) {
         let stamp = self.root.join("obj").join("trim.stamp");
         if let Ok(meta) = std::fs::metadata(&stamp) {
@@ -96,14 +97,14 @@ impl ObjCache {
 }
 
 pub(crate) fn filetime_touch(p: &Path) -> std::io::Result<()> {
-    // portable mtime refresh: open for append and set_len to current size
+    // Portable mtime refresh. A set_len to the current size updates the mtime.
     let f = std::fs::OpenOptions::new().append(true).open(p)?;
     let len = f.metadata()?.len();
     f.set_len(len)
 }
 
-/// Phase timings for one compile_program run. key/codegen are summed across
-/// Rayon workers (CPU time, not wall).
+/// Phase timings for one compile_program run. key_s and codegen_s are sums
+/// across the Rayon workers (CPU time, not wall time).
 pub struct CompileStats {
     pub reach_s: f64,
     pub gc_s: f64,
@@ -114,6 +115,12 @@ pub struct CompileStats {
     pub misses: usize,
 }
 
+/// Compile a program to one object file per module in `out_dir`. Returns
+/// the object paths. The compiler compiles only the functions that are
+/// reachable from `entry` (closed world). A C `main` (init ctx, call entry)
+/// lands in the object of the entry module. `poisoned` maps the names of
+/// unparseable modules to their errors. These errors surface if reachability
+/// needs them.
 pub fn compile_program(
     units: &[ModuleUnit],
     entry_mod: &str,
@@ -161,8 +168,8 @@ pub fn compile_program(
     let t = std::time::Instant::now();
     let raise_set = compute_may_raise(units, &reachable);
     let raise_s = t.elapsed().as_secs_f64();
-    // per-module include sets, built once (reachable is tens of thousands
-    // of entries — a per-module filter scan is quadratic)
+    // This builds the per-module include sets once. reachable has tens of
+    // thousands of entries. A filter scan per module is quadratic.
     let mut includes: HashMap<&str, HashSet<FunName>> = HashMap::new();
     for (module, f) in &reachable {
         includes
@@ -173,9 +180,9 @@ pub fn compile_program(
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("creating {}: {}", out_dir.display(), e))?;
-    // one LLVM Context per module → modules compile in parallel. Target
-    // init is not thread-safe — do it once, up front; workers get deep
-    // stacks (AST walkers recurse per list element).
+    // One LLVM Context per module, so the modules compile in parallel. Target
+    // init is not thread-safe. It runs once, before the pool starts. The
+    // workers get deep stacks because the AST walkers recurse per list element.
     Target::initialize_native(&InitializationConfig::default())
         .map_err(|e| format!("target init: {}", e))?;
     use rayon::prelude::*;
@@ -219,8 +226,9 @@ pub fn compile_program(
                 }
             }
             let tc = std::time::Instant::now();
-            // object-cache miss: now (and only now) the AST is needed. If
-            // this run didn't parse it, re-read + verify + parse here.
+            // Object-cache miss. Only a miss needs the AST. If this run did not
+            // parse the module, the code reads the file again, checks its hash,
+            // and parses it here.
             let reparsed: Module;
             let m: &Module = match &u.ast {
                 Some(m) => m,
@@ -290,9 +298,9 @@ pub fn compile_program(
     ))
 }
 
-/// The action key for one module's object: a blake3 hash over every input
-/// that can influence the emitted code. Deterministic encoding — all sets
-/// are sorted before hashing.
+/// The action key for the object of one module: a blake3 hash over every
+/// input that can influence the emitted code. The encoding is deterministic.
+/// The function sorts all sets before it hashes them.
 pub(crate) fn action_key(
     cache: &ObjCache,
     m: &ModuleSummary,
@@ -307,11 +315,12 @@ pub(crate) fn action_key(
     let mut h = blake3::Hasher::new();
     h.update(b"mana-action-v2\0");
     h.update(&cache.tool_hash);
-    // target + codegen config (constants today; keyed for the day they move)
+    // Target and codegen config. They are constants today. They are in the
+    // key for the day they change.
     h.update(TargetMachine::get_default_triple().as_str().to_bytes());
     h.update(b"O2/PIC\0");
-    // the AST is a pure function of the source text given tool_hash (the
-    // parser lives in the manac binary), so the source hash keys it
+    // Given tool_hash, the AST is a pure function of the source text, because
+    // the parser lives in the manac binary. So the source hash keys the AST.
     h.update(source_hash);
     h.update(b"\0include\0");
     let mut inc: Vec<String> = include
@@ -333,9 +342,9 @@ pub(crate) fn action_key(
             h.update(b"noentry\0");
         }
     }
-    // cross-unit deps: the (module, fun, arity, gc, raise) verdict of every
-    // remote callee, plus referenced-but-missing modules (callers of those
-    // compile as stubs)
+    // Cross-unit deps: the (module, fun, arity, gc, raise) verdict of every
+    // remote callee, plus the referenced modules that are missing. Callers of
+    // a missing module compile as stubs.
     let mut dep_lines: Vec<String> = Vec::new();
     for fname in include {
         if let Some(fun) = m.funs.iter().find(|f| &f.name == fname) {

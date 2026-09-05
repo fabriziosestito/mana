@@ -5,9 +5,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         match l {
             Literal::Int(n) => Ok(self.small_int(*n)),
             Literal::Big(d) => {
-                // an inert interned big-literal term: orders/compares/
-                // prints correctly; arithmetic on it is badarith at runtime
-                // (TODO(bignum)). Decimal's pow10 tables and >=-guards work.
+                // An inert interned big-literal term. It orders, compares, and
+                // prints correctly. Arithmetic on it is badarith at runtime
+                // (TODO(bignum)). The pow10 tables and the >= guards of Decimal work.
                 let ptr = self.static_bytes(d.as_bytes())?;
                 let callee = self.rt_fn("mana_rt_big_literal", || {
                     self.i64t.fn_type(
@@ -53,8 +53,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         arg: &Expr,
         scope: &mut Scope<'ctx>,
     ) -> CgResult<()> {
-        // statement boundary: temps rooted while evaluating `arg` are dead
-        // once the values sit in the let-bound var slots
+        // Statement boundary. The temps that are rooted during the evaluation
+        // of `arg` are dead when the values sit in the let-bound var slots.
         let wm = self.next_slot.get();
         let r = self.bind_let_inner(f, vars, arg, scope);
         self.next_slot.set(wm);
@@ -142,9 +142,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// Case scrutinees. If any guard contains a GC point, values must be
-    /// re-loadable per clause (later clauses re-match after the guard ran),
-    /// so everything goes to slots; otherwise plain sibling evaluation.
+    /// Case scrutinees. If a guard or a pattern contains a GC point, each
+    /// clause must reload the values. Later clauses match again after the
+    /// guard ran. In that case all values go to slots. Otherwise, the values
+    /// are plain SSA siblings.
     pub(crate) fn compile_case_arg(
         &self,
         f: FunctionValue<'ctx>,
@@ -174,14 +175,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// Case pre-dispatch: for the maximal prefix of clauses whose first
-    /// pattern has a static discriminant (small-int / nil literal, or a
-    /// binary starting with a constant byte), jump straight to the FIRST
-    /// clause carrying the subject's key via an LLVM `switch`; clauses then
-    /// run sequentially from there as before. Subjects with no matching
-    /// key (or of another shape) go to the first key-less clause — or
-    /// nomatch. Turns Elixir's generated 1400-clause byte tables
-    /// (String.Unicode) from O(n) prefix compares per byte into one jump.
+    /// Case pre-dispatch. It takes the longest prefix of clauses whose first
+    /// pattern has a static discriminant. A static discriminant is a small-int
+    /// literal, a nil literal, or a binary that starts with a constant byte.
+    /// An LLVM `switch` jumps to the FIRST clause that has the key of the
+    /// subject. From there the clauses run in order, as without the switch.
+    /// A subject with no matching key, or of another shape, goes to the first
+    /// clause without a key, or to nomatch. This turns the generated
+    /// 1400-clause byte tables of Elixir (String.Unicode) from O(n) prefix
+    /// compares per byte into one jump.
     pub(crate) fn emit_case_dispatch(
         &self,
         f: FunctionValue<'ctx>,
@@ -190,7 +192,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         blocks: &[BasicBlock<'ctx>],
         fail_bb: BasicBlock<'ctx>,
     ) -> CgResult<()> {
-        // keyed prefix
         let mut keys: Vec<DiscKey> = Vec::new();
         for c in clauses {
             match c.patterns.first().and_then(Self::clause_disc) {
@@ -198,7 +199,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 None => break,
             }
         }
-        // the switch needs one discriminant CLASS over the prefix
+        // The switch needs one discriminant CLASS over the whole prefix.
         let all_word = keys.iter().all(|k| matches!(k, DiscKey::Word(_)));
         let all_byte = keys.iter().all(|k| matches!(k, DiscKey::Byte0(_)));
         if keys.len() < 4 || !(all_word || all_byte) {
@@ -210,7 +211,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             CaseVals::Ssa(vs) => vs[0],
             CaseVals::Slots(slots) => self.reload(slots[0])?,
         };
-        // first clause per distinct key (earlier clauses win)
+        // One arm per distinct key. The first clause with that key wins.
         let mut seen: HashSet<DiscKey> = HashSet::new();
         let mut arms: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
         for (i, k) in keys.iter().enumerate() {
@@ -225,8 +226,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let disc = if all_word {
             subject
         } else {
-            // binary subject with len >= 1: its first byte; anything else:
-            // an impossible key (256) -> default
+            // For a binary subject with len >= 1, the discriminant is its first
+            // byte. For any other subject, it is the impossible key 256, which
+            // goes to default.
             let miss_bb = self.ctx.append_basic_block(f, "disp.miss");
             let bin_bb = self.ctx.append_basic_block(f, "disp.bin");
             let merge = self.ctx.append_basic_block(f, "disp.merge");
@@ -273,14 +275,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    /// Static discriminant of a clause's FIRST pattern for the case
-    /// pre-dispatch switch: the whole term word for small-int / nil
-    /// literals, or the first byte for a binary pattern that starts with a
-    /// constant byte-sized integer segment. None = this clause may match
-    /// any subject (variable, atom, tuple, alias...), which ends the
-    /// switchable prefix. Only `Some` keys are ever skipped, and only when
-    /// the subject's key provably differs — so ordering, guards and
-    /// fallthrough semantics are unchanged.
+    /// The static discriminant of the FIRST pattern of a clause, for the case
+    /// pre-dispatch switch. For a small-int or nil literal, the key is the
+    /// whole term word. For a binary pattern that starts with a constant
+    /// byte-sized integer segment, the key is the first byte. None means that
+    /// this clause can match any subject (variable, atom, tuple, alias, and
+    /// more). Such a clause ends the switchable prefix. The switch skips only
+    /// `Some` clauses, and only when the key of the subject is known to
+    /// differ. As a result, the order, the guards, and the fallthrough
+    /// semantics do not change.
     pub(crate) fn clause_disc(p: &Pattern) -> Option<DiscKey> {
         match p {
             Pattern::Lit(Literal::Int(n)) if (-(1i64 << 60)..(1i64 << 60)).contains(n) => {
@@ -322,8 +325,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .collect();
         self.emit_case_dispatch(f, vals, clauses, &blocks, fail_bb)?;
 
-        // clauses are mutually exclusive at runtime: each attempt may reuse
-        // the temp slots of the previous one (subject slots sit below wm)
+        // Clauses are mutually exclusive at runtime. Each attempt can reuse
+        // the temp slots of the previous attempt. The subject slots sit below wm.
         let wm = self.next_slot.get();
         for (i, clause) in clauses.iter().enumerate() {
             self.next_slot.set(wm);
@@ -342,8 +345,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             let mut cscope = scope.clone();
             for (i, p) in clause.patterns.iter().enumerate() {
-                // reload lazily: an allocating binary pattern earlier in
-                // this clause invalidates SSA copies of later subjects
+                // Reload late. A binary pattern earlier in this clause can
+                // allocate. That allocation invalidates the SSA copies of
+                // later subjects.
                 let v = match vals {
                     CaseVals::Ssa(vs) => vs[i],
                     CaseVals::Slots(slots) => self.reload(slots[i])?,
@@ -397,9 +401,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    /// A clause body producing `nvals` values (Core Erlang `<a, b>` bodies
-    /// under multi-value lets). nvals == 1 accepts any expression; multi
-    /// accepts Values plus Let/Do/Case wrappers around them.
+    /// A clause body that produces `nvals` values. These are the Core Erlang
+    /// `<a, b>` bodies under multi-value lets. For nvals == 1, the body can
+    /// be any expression. For more values, the body must be Values, or a Let,
+    /// Do, or Case wrapper around Values.
     pub(crate) fn compile_body_values(
         &self,
         f: FunctionValue<'ctx>,
@@ -428,7 +433,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Expr::Case { arg, clauses } => {
                 Ok(self.compile_case_values(f, arg, clauses, scope, nvals)?)
             }
-            // raising bodies produce no values; the phi inputs are dead
+            // A body that raises produces no values. The phi inputs are dead.
             Expr::PrimOp { name, args } if is_raise(name) => {
                 self.compile_raise(f, name, args, scope)?;
                 Ok(vec![self.i64t.get_undef(); nvals])
@@ -451,7 +456,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// A case in value position yielding `nvals` values via N phis.
+    /// A case in value position. It yields `nvals` values through N phis.
     pub(crate) fn compile_case_values(
         &self,
         f: FunctionValue<'ctx>,

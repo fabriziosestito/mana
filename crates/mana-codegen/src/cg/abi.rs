@@ -1,3 +1,10 @@
+//! Calling convention and runtime ABI helpers for the code generator.
+//!
+//! Contract: every compiled function is `tailcc` and has the uniform
+//! prototype (see `NREG`). The runtime calls compiled code only through
+//! C-ABI wrappers. This module also declares the runtime externs and
+//! holds the tag, allocation, and memory access helpers.
+
 use crate::*;
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
@@ -7,10 +14,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         f
     }
 
-    /// Emit a `tailcc` call to a named compiled function. `tail` = the call
-    /// is in tail position, immediately before `ret`: `musttail` when the
-    /// caller is `tailcc` too (LLVM requires matching conventions); a
-    /// `tail` hint otherwise (lifted fun bodies stay `ccc`, see TODO(lco-funs)).
+    /// Emit a `tailcc` call to a named compiled function. `tail` means that
+    /// the call is in tail position, directly before `ret`. If the caller is
+    /// `tailcc` too, the call is `musttail` (LLVM requires matching
+    /// conventions). Otherwise the call gets the `tail` hint (see
+    /// TODO(lco-funs)).
     pub(crate) fn call_compiled(
         &self,
         callee: FunctionValue<'ctx>,
@@ -27,8 +35,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(call)
     }
 
-    /// `musttail` if the current function shares the callee's convention,
-    /// else the best-effort `tail` hint.
+    /// Set `musttail` if the current function has the same convention as the
+    /// callee. Otherwise set the best-effort `tail` hint.
     pub(crate) fn mark_tail(&self, call: CallSiteValue<'ctx>) {
         let caller_cc = self
             .builder
@@ -43,11 +51,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// A C-ABI entry for a `tailcc` function: the runtime calls compiled code
-    /// through function pointers (mana_exports, spawn, apply) with `extern "C"`.
-    /// The runtime's C-ABI view of a compiled function: `extern "C" fn(ctx,
-    /// a0..a{arity-1})` with the natural C prototype (call_dynamic
-    /// transmutes to exactly that), forwarding into the uniform tailcc body.
+    /// A C-ABI entry for a `tailcc` function. The runtime calls compiled code
+    /// through `extern "C"` function pointers (mana_exports, spawn, apply).
+    /// The wrapper is the runtime's C-ABI view of a compiled function:
+    /// `extern "C" fn(ctx, a0..a{arity-1})` with the natural C prototype.
+    /// call_dynamic transmutes to exactly that prototype. The wrapper
+    /// forwards into the uniform tailcc body.
     pub(crate) fn ccc_wrapper(&self, target: FunctionValue<'ctx>, arity: usize) -> FunctionValue<'ctx> {
         let sym = format!("{}.c", target.get_name().to_string_lossy());
         if let Some(w) = self.module.get_function(&sym) {
@@ -71,8 +80,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         w
     }
 
-    /// The natural C prototype `i64 (ptr ctx, i64 x arity)`: runtime BIFs
-    /// and Mana.Native package symbols are `extern "C"` and keep it.
+    /// The natural C prototype `i64 (ptr ctx, i64 x arity)`. Runtime BIFs
+    /// and Mana.Native package symbols are `extern "C"` and keep this
+    /// prototype.
     pub(crate) fn c_fn_type(&self, arity: usize) -> FunctionType<'ctx> {
         let mut params: Vec<BasicMetadataTypeEnum> =
             vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
@@ -80,8 +90,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.i64t.fn_type(&params, false)
     }
 
-    /// The uniform prototype (see NREG). `_arity` is kept for call-site
-    /// documentation; the type no longer depends on it.
+    /// The uniform prototype (see NREG). `_arity` documents the call site.
+    /// The type does not depend on it.
     pub(crate) fn term_fn_type(&self, _arity: usize) -> FunctionType<'ctx> {
         let mut params: Vec<BasicMetadataTypeEnum> =
             vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
@@ -89,11 +99,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.i64t.fn_type(&params, false)
     }
 
-    /// Pack `ctx + args` into the uniform call vector: the first NREG-1
-    /// args ride in registers; when there are more, the last register slot
-    /// carries nothing and args NREG-1.. go to the ctx spill area (a
-    /// per-scheduler scratch consumed by the callee prologue before any
-    /// other code runs, so no GC point and no re-entrancy can intervene).
+    /// Pack `ctx + args` into the uniform call vector. If there are NREG args
+    /// or fewer, all of them ride in registers. If there are more, the first
+    /// NREG-1 args ride in registers and the last register slot carries
+    /// nothing. Args NREG-1.. then go to the ctx spill area. The spill area
+    /// is a per-scheduler scratch. The callee prologue consumes it before
+    /// any other code runs, so no GC point and no re-entrancy can intervene.
     pub(crate) fn pack_args(
         &self,
         argv: &[BasicMetadataValueEnum<'ctx>],
@@ -109,7 +120,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             return Ok(out);
         }
-        out.extend_from_slice(&argv[1..NREG]); // args 0..NREG-2 in registers
+        out.extend_from_slice(&argv[1..NREG]); // args 0..NREG-2 ride in registers
         let ctx = argv[0].into_pointer_value();
         let spill = self.mem_load(ctx, CTX_ARGV_SPILL, MemKind::Ctx)?;
         let sp = self
@@ -128,9 +139,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(out)
     }
 
-    /// Prologue counterpart of `pack_args`: the value of the callee's
-    /// `i`-th argument (0-based) given its total arg count. MUST be called
-    /// at function entry before any call or allocation.
+    /// Prologue counterpart of `pack_args`: the value of the callee's `i`-th
+    /// argument (0-based), given its total arg count. Call this function at
+    /// function entry, before any call or allocation.
     pub(crate) fn param_at(&self, f: FunctionValue<'ctx>, i: usize, nargs: usize) -> CgResult<IntValue<'ctx>> {
         if nargs <= NREG || i < NREG - 1 {
             return Ok(f.get_nth_param(1 + i as u32).unwrap().into_int_value());
@@ -167,7 +178,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         expr_may_gc(e, &self.module_name, self.gc_set, &mut letrec)
     }
 
-    // ---- runtime externs ----
+    // Runtime externs
 
     pub(crate) fn rt_fn(
         &self,
@@ -239,7 +250,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         })
     }
 
-    /// (ctx, term) -> term runtime BIF helper.
+    /// A runtime BIF helper with the prototype (ctx, term) -> term.
     pub(crate) fn rt_pt_i64(&self, name: &str) -> FunctionValue<'ctx> {
         self.rt_fn(name, || {
             self.i64t.fn_type(
@@ -309,7 +320,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         })
     }
 
-    /// (term, term) -> i64 runtime helper.
+    /// A runtime helper with the prototype (term, term) -> i64.
     pub(crate) fn rt_tt_i64(&self, name: &str) -> FunctionValue<'ctx> {
         self.rt_fn(name, || {
             self.i64t.fn_type(
@@ -322,7 +333,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         })
     }
 
-    /// (ctx, op, a, b) -> term arithmetic slow path.
+    /// The arithmetic slow path, with the prototype (ctx, op, a, b) -> term.
     pub(crate) fn rt_arith(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_arith", || {
             self.i64t.fn_type(
@@ -337,10 +348,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         })
     }
 
-    /// Raise an exception: primop match_fail/raise or erlang:error|exit|throw.
-    /// Reason terms are built with the eternal allocator (never moved, GC
-    /// scans their fields). Leaves the builder in a dead block.
-    /// (ctx, term, term) -> term runtime helper.
+    /// A runtime helper with the prototype (ctx, term, term) -> term. The
+    /// raising helpers use this shape: primop match_fail/raise and
+    /// erlang:error|exit|throw. Their reason terms use the eternal allocator.
+    /// The GC never moves these terms, but it scans their fields.
     pub(crate) fn rt_ptt_i64(&self, name: &str) -> FunctionValue<'ctx> {
         self.rt_fn(name, || {
             self.i64t.fn_type(
@@ -354,7 +365,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         })
     }
 
-    // ---- helpers ----
+    // Helpers
 
     pub(crate) fn local_fn(&self, fname: &FunName) -> CgResult<FunctionValue<'ctx>> {
         self.fns
@@ -399,9 +410,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)
     }
 
-    /// Inline nursery bump allocation: load top/end from ctx words 0/1,
-    /// bump on the fast path, call `mana_rt_alloc_slow` (collect) on
-    /// overflow. Remains a GC point via the slow path.
+    /// Inline nursery bump allocation. The fast path loads top and end from
+    /// ctx words 0 and 1, then bumps top. On overflow, the slow path calls
+    /// `mana_rt_alloc_slow`, which collects. The slow path keeps this a GC
+    /// point.
     pub(crate) fn alloc_words(&self, n: u64) -> CgResult<PointerValue<'ctx>> {
         self.alloc_words_kind(n, false)
     }
@@ -529,7 +541,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(v.into_int_value())
     }
 
-    /// Heap-object word access (the overwhelmingly common case).
+    /// Heap object word access. This is the most common case.
     pub(crate) fn store_word(
         &self,
         p: PointerValue<'ctx>,

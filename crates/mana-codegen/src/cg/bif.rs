@@ -3,11 +3,12 @@ use crate::*;
 impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// Lower a call to a BIF module (`erlang`, `maps`, `file`, ...).
     ///
-    /// Calls into modules other than `erlang` go to their own lowering
+    /// A call into a module other than `erlang` goes to its own lowering
     /// method first. The `erlang` BIFs live in `bif_erlang.rs` as family
-    /// methods that return `None` when they do not know the (name, arity)
-    /// pair. No pair belongs to two families, so the chain order does not
-    /// matter. Arguments are evaluated once, before the chain.
+    /// methods. A family method returns `None` when it does not know the
+    /// (name, arity) pair. No pair belongs to two families, so the chain
+    /// order does not matter. The chain evaluates the arguments once,
+    /// before the first family.
     ///
     /// Arithmetic can allocate bignums, but through `alloc_shared`. That is
     /// never a GC point, so the may-gc analysis does not change.
@@ -50,12 +51,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return self.compile_re_bif(f, name, args, scope);
         }
         if module == "timer" {
-            // no timer server in a static binary: start is a no-op, tc is
-            // native; send_after/apply_after wait for the timers milestone
+            // A static binary has no timer server. start is a no-op and tc is
+            // native. send_after and apply_after wait for the timers milestone.
             let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             return match (name, argv.len()) {
                 ("start", 0) | ("start_link", 0) => self.atom_term("ok"),
-                // unit helpers: N * 1000^k as small-int arithmetic
+                // The unit helpers compute N * 1000^k with small-int arithmetic.
                 ("seconds", 1) | ("minutes", 1) | ("hours", 1) => {
                     let factor: u64 = match name {
                         "seconds" => 1000,
@@ -104,8 +105,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return self.compile_application_bif(f, name, args, scope);
         }
         if module == "net_kernel" && name == "monitor_nodes" {
-            // single node, forever: subscribing to node events is a no-op
-            // (pg's init calls this — the rest of net_kernel keeps raising)
+            // There is one node, forever. A subscription to node events is a
+            // no-op. The init of pg calls this. The rest of net_kernel still
+            // raises.
             self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             return self.atom_term("ok");
         }
@@ -113,17 +115,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             if let Some(v) = self.compile_zlib_bif(f, name, args, scope)? {
                 return Ok(v);
             }
-            // unhandled zlib names fall through to the raise arm below
+            // An unhandled zlib name falls through to the raise arm below.
         }
         if matches!(
             module,
             "erts_internal" | "elixir_erl" | "erl_eval" | "beam_lib" | "global"
                 | "global_group" | "net_kernel" | "zlib"
         ) {
-            // BEAM/compiler/distribution guts: compile the call as a runtime
-            // raise instead of poisoning the whole caller — reached code
-            // often only touches these on branches that never run
-            // (GenServer.whereis' {global, Name} arm, ...). Args evaluated.
+            // These modules are BEAM, compiler, or distribution internals. The
+            // call compiles to a runtime raise, so the whole caller stays
+            // compilable. Reached code often touches these modules only on
+            // branches that never run, for example the {global, Name} arm of
+            // GenServer.whereis. The args are evaluated.
             self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             let module_atom = self.atom_term(module)?;
             let reason = self.eternal_pair("unsupported", module_atom)?;
@@ -138,7 +141,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return Ok(self.i64t.get_undef());
         }
         if (module == "file") && name == "sendfile" && args.len() == 5 {
-            // read-at + parking send loop in the runtime (Plug.Static)
+            // The runtime runs a read-at and parking send loop. Plug.Static
+            // uses this.
             let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             let call = self
                 .builder
@@ -171,10 +175,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return self.check_exc(f, v);
         }
         if module == "file" || module == "prim_file" {
-            // native file cut (OTP's file.erl/prim_file never compiled) —
-            // implemented names dispatch to mana_rt_file by opcode; the
-            // rest keep answering {error, enotsup}. prim_file shares the
-            // table (Plug.Static stats files through it directly).
+            // The native file cut. OTP's file.erl and prim_file are never
+            // compiled. An implemented name dispatches to mana_rt_file by
+            // opcode. Every other name returns {error, enotsup}. prim_file
+            // shares the table because Plug.Static stats files through it
+            // directly.
             let op: Option<u64> = match (name, args.len()) {
                 ("read_file", 1) => Some(0),
                 ("write_file", 2) => Some(1),
@@ -243,19 +248,19 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .map_err(be);
         }
         if module == "logger" {
-            // logging is disabled in mana binaries: allow/2 says no (which
-            // prunes every emit path), everything else is an ok no-op —
-            // TODO(logger): a real stderr handler. Args still evaluated.
+            // Logging is disabled in mana binaries. allow/2 returns false, which
+            // prunes every emit path. Every other name is an ok no-op. The args
+            // are still evaluated. TODO(logger): write a real stderr handler.
             self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             return match name {
                 "allow" => self.atom_term("false"),
-                // Logger.metadata cases on undefined | map
+                // Logger.metadata matches on undefined | map.
                 "get_process_metadata" => self.atom_term("undefined"),
                 _ => self.atom_term("ok"),
             };
         }
-        // raising BIFs: reason terms use the eternal allocator so raise
-        // paths don't create GC points
+        // Raising BIFs: the reason terms use the eternal allocator, so a raise
+        // path is not a GC point.
         if matches!(
             (name, args.len()),
             ("error", 1) | ("error", 2) | ("exit", 1) | ("throw", 1)
@@ -264,13 +269,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return Ok(self.i64t.get_undef());
         }
         if name == "error" && args.len() == 3 {
-            // error/3: the error_info options only affect stacktrace
-            // decoration — TODO(stacktraces)
+            // TODO(stacktraces): error/3 drops the error_info options. They only
+            // affect stacktrace decoration.
             self.compile_raise(f, "error", &args[..1], scope)?;
             return Ok(self.i64t.get_undef());
         }
         if name == "nif_error" {
-            // a nif stub without a native override: raise like error/1
+            // A nif stub without a native override raises like error/1.
             self.compile_raise(f, "error", &args[..1], scope)?;
             return Ok(self.i64t.get_undef());
         }

@@ -1,12 +1,12 @@
-//! AST for the Core Erlang subset emitted by `erlc +to_core`.
-//! Annotations (`-| [...]`) are parsed and discarded.
+//! AST for the Core Erlang subset that `erlc +to_core` emits.
+//! The parser reads annotations (`-| [...]`) and discards them.
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub name: String,
     pub exports: Vec<FunName>,
-    /// `-behaviour(...)` attributes (module_info(:attributes) needs them —
-    /// benchee-style behaviour checks)
+    /// The `-behaviour(...)` attributes. module_info(:attributes) needs them
+    /// for benchee-style behaviour checks.
     pub behaviours: Vec<String>,
     pub definitions: Vec<(FunName, Fun)>,
 }
@@ -26,7 +26,8 @@ pub struct Fun {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
-    /// > i64: decimal digits; valid only as a bitstring segment constant
+    /// An integer outside the 61-bit small range, as decimal digits. Codegen
+    /// interns it as a bignum literal.
     Big(String),
     Float(f64),
     Atom(String),
@@ -34,8 +35,8 @@ pub enum Literal {
 }
 
 /// One segment of a bitstring: `#<value>(size, unit, type, flags)`.
-/// The spec args (size/unit/type/flags) are kept as raw expressions; only
-/// the syntax is supported for now — codegen rejects binaries.
+/// The spec args (size, unit, type, flags) stay raw expressions. Codegen
+/// interprets them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BinSegment<V> {
     pub value: V,
@@ -48,7 +49,7 @@ pub enum Expr {
     Lit(Literal),
     Tuple(Vec<Expr>),
     Cons(Box<Expr>, Box<Expr>),
-    /// `<e1, ..., en>` multi-value expression (only valid in certain positions)
+    /// A `<e1, ..., en>` multi-value expression. It is valid only in certain positions.
     Values(Vec<Expr>),
     Fun(Box<Fun>),
     /// A function used as a value: bare `'f'/1` (local) or `fun 'm':'f'/1`.
@@ -66,20 +67,20 @@ pub enum Expr {
         defs: Vec<(FunName, Fun)>,
         body: Box<Expr>,
     },
-    /// `apply f (args)` — f is a local fname or a variable holding a fun
+    /// `apply f (args)`. The target f is a local fname or a variable that holds a fun.
     Apply {
         target: ApplyTarget,
         args: Vec<Expr>,
     },
-    /// `call m:f (args)` — m, f restricted to atom literals for now
+    /// `call m:f (args)`. Both m and f must be atom literals.
     Call {
         module: String,
         name: String,
         args: Vec<Expr>,
     },
-    /// `call M:F(args)` where the module and/or function position is a
-    /// computed expression (erlc emits these for dynamic `m.f(...)` calls);
-    /// compiles as erlang:apply/3.
+    /// `call M:F(args)` where the module position, the function position, or
+    /// both hold a computed expression. erlc emits this form for dynamic
+    /// `m.f(...)` calls. It compiles as erlang:apply/3.
     CallDyn {
         module: Box<Expr>,
         name: Box<Expr>,
@@ -95,10 +96,10 @@ pub enum Expr {
     },
     /// `#{ seg, ... }#` bitstring construction
     Binary(Vec<BinSegment<Box<Expr>>>),
-    /// `~{ k => v, ... }~` or `~{ k := v | M }~` map construction/update.
-    /// `=>` inserts-or-replaces; `:=` requires the key to exist (badkey).
-    /// erlc rewrites `maps:put/3` calls into `=>` updates, so the
-    /// distinction is load-bearing, not a syntax nicety.
+    /// `~{ k => v, ... }~` or `~{ k := v | M }~` map construction or update.
+    /// `=>` inserts or replaces the key. `:=` requires that the key exists
+    /// (badkey). erlc rewrites `maps:put/3` calls into `=>` updates, so the
+    /// two forms must stay distinct.
     Map {
         pairs: Vec<(Expr, MapAssoc, Expr)>,
         update: Option<Box<Expr>>,
@@ -111,7 +112,7 @@ pub enum Expr {
         evars: Vec<String>,
         handler: Box<Expr>,
     },
-    /// `do e1 e2` — sequence
+    /// `do e1 e2`: a sequence.
     Do(Box<Expr>, Box<Expr>),
 }
 
@@ -130,9 +131,9 @@ pub struct Clause {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapAssoc {
-    /// `=>` — insert or replace
+    /// `=>`: insert or replace the key.
     Assoc,
-    /// `:=` — exact: key must already exist
+    /// `:=`: exact. The key must already exist.
     Exact,
 }
 
@@ -146,6 +147,6 @@ pub enum Pattern {
     Alias(String, Box<Pattern>),
     /// `#{ seg, ... }#` bitstring pattern
     Binary(Vec<BinSegment<Box<Pattern>>>),
-    /// `~{ k := p, ... }~` map pattern (keys are expressions)
+    /// `~{ k := p, ... }~` map pattern. The keys are expressions.
     Map(Vec<(Expr, Pattern)>),
 }

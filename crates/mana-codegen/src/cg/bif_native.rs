@@ -1,7 +1,8 @@
 use crate::*;
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    /// io_lib cut: format engine in the runtime, charlists out.
+    /// The io_lib cut. The format engine runs in the runtime and returns
+    /// charlists.
     pub(crate) fn compile_io_lib_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -33,8 +34,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
-    /// :re on the Rust regex crate; version() is "mana" so Elixir's Regex
-    /// recompiles from source instead of trusting sigil-baked PCRE blobs.
+    /// The re cut runs on the Rust regex crate. version() returns "mana".
+    /// With that version, Elixir's Regex recompiles each regex from source.
+    /// It does not trust the PCRE blobs that sigils bake in.
     pub(crate) fn compile_re_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -114,7 +116,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
-    /// math module: f64 ops in the runtime (box_float never GCs).
+    /// The math cut. The f64 operations run in the runtime. box_float is
+    /// never a GC point.
     pub(crate) fn compile_math_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -143,7 +146,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ("ceil", 1) => 16,
             _ => return Err(format!("unsupported BIF math:{}/{}", name, argv.len())),
         };
-        let dummy = self.i64t.const_int(1, false); // small 0
+        let dummy = self.i64t.const_int(1, false); // the small integer 0
         let a = argv.first().copied().unwrap_or(dummy);
         let b = argv.get(1).copied().unwrap_or(dummy);
         let callee = self.rt_fn("mana_rt_math", || {
@@ -174,10 +177,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
-    /// zlib cut: streaming compression over miniz_oxide. Handled names
-    /// return Some(result); unknown zlib functions return None so the
+    /// The zlib cut: streaming compression over miniz_oxide. A handled name
+    /// returns Some(result). An unknown zlib function returns None, and the
     /// caller falls through to the runtime-raise arm. Handle terms are
-    /// {mana_zlib, N} opaque tuples.
+    /// opaque {mana_zlib, N} tuples.
     pub(crate) fn compile_zlib_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -186,7 +189,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         scope: &mut Scope<'ctx>,
     ) -> CgResult<Option<IntValue<'ctx>>> {
         let arity = args.len();
-        // arg count → runtime fn type (ctx pointer + N i64 terms)
+        // The runtime function type for n terms: a ctx pointer, then n i64 terms.
         let ty = |n: usize| {
             let mut params: Vec<BasicMetadataTypeEnum> =
                 vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
@@ -195,7 +198,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         };
         let small = |v: i64| self.i64t.const_int(((v << 3) as u64) | 0b001, false);
 
-        // (symbol, extra term args appended after the evaluated call args)
+        // A plan is (runtime symbol, count of call args to pass, extra terms).
+        // The extra terms go after the evaluated call args.
         let plan: Option<(&str, usize, Vec<IntValue<'ctx>>)> = match (name, arity) {
             ("open", 0) => Some(("mana_rt_zlib_open", 0, vec![])),
             ("close", 1) => Some(("mana_rt_zlib_close", 1, vec![])),
@@ -206,9 +210,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 2,
                 vec![small(15), self.atom_term("default")?],
             )),
-            // deflateInit/6: Z, Level, Method, WindowBits, MemLevel, Strategy
-            // — honor Level(1), WindowBits(3), Strategy(5); drop the rest
-            ("deflateInit", 6) => None, // handled specially below
+            // deflateInit/6 takes Z, Level, Method, WindowBits, MemLevel, Strategy.
+            // The lowering passes Level(1), WindowBits(3), and Strategy(5).
+            // It drops the rest.
+            ("deflateInit", 6) => None, // lowered below
             ("deflate", 2) => Some((
                 "mana_rt_zlib_deflate",
                 2,
@@ -227,7 +232,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             _ => return Ok(None),
         };
 
-        // deflateInit/6 selects a subset of the evaluated args
         if name == "deflateInit" && arity == 6 {
             let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
             let callee = self.rt_fn("mana_rt_zlib_deflate_init", || ty(4));
@@ -269,7 +273,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(Some(self.check_exc(f, v)?))
     }
 
-    /// ets cut: the global KV store (keypos 1 only, no match specs).
+    /// The ets cut: a global key-value store. Only keypos 1 is supported.
+    /// Match specs cover the shapes that Registry and Phoenix.PubSub use.
     pub(crate) fn compile_ets_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -306,8 +311,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             })
         };
         let call = match (name, argv.len()) {
-            // tables are identified by their name term; the option list
-            // is parsed for the table kind (set / bag / duplicate_bag)
+            // A table is identified by its name term. The runtime parses the
+            // option list for the table kind (set, bag, or duplicate_bag).
             ("new", 2) => self
                 .builder
                 .build_call(
@@ -446,8 +451,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     "ets",
                 )
                 .map_err(be)?,
-            // whole-table delete: treat as ok (closed world: tables die
-            // with the process) — TODO(ets)
+            // TODO(ets): whole-table delete returns true and does nothing.
+            // Tables die with the process in this closed world.
             ("delete", 1) => return self.atom_term("true"),
             _ => return Err(format!("unsupported BIF ets:{}/{}", name, argv.len())),
         };
@@ -455,7 +460,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
-    /// application cut: env store; no applications actually start.
+    /// The application cut: an env store. No application starts.
     pub(crate) fn compile_application_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -514,7 +519,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 Ok(call_result(call)?.into_int_value())
             }
-            // set_env/4's opts (timeout/persistent) are irrelevant here
+            // The opts of set_env/4 (timeout, persistent) have no effect here.
             ("set_env", 3) | ("set_env", 4) => {
                 let callee = self.rt_fn("mana_rt_app_set_env", || {
                     self.i64t.fn_type(
@@ -553,7 +558,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// code module cut: "loaded" = compiled into this binary.
+    /// The code cut. A module is "loaded" when it is compiled into this
+    /// binary.
     pub(crate) fn compile_code_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -564,8 +570,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
         match (name, argv.len()) {
             ("root_dir", 0) | ("lib_dir", 0) => {
-                // static binaries have no OTP tree; a plausible path keeps
-                // header-printing callers alive (they only display it)
+                // A static binary has no OTP tree. A plausible path keeps the
+                // callers that print headers alive. They only display the path.
                 let s = b"/mana";
                 let bin = self.compile_binary_const_term(f, s, scope)?;
                 let call = self
@@ -580,9 +586,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("lib_dir", 1) | ("priv_dir", 1) => {
-                // real per-app dirs baked by the --app boot generator
-                // (env key {:mana_app_dirs, App}); {error, bad_name} for
-                // anything not baked — same failure BEAM gives unknown apps
+                // The --app boot generator bakes the per-app dirs under the env
+                // key {:mana_app_dirs, App}. An app that is not baked gets
+                // {error, bad_name}. BEAM returns the same error for an unknown
+                // app.
                 let is_priv = self.i64t.const_int((name == "priv_dir") as u64, false);
                 let call = self
                     .builder
@@ -632,7 +639,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// persistent_term cut: a global table of eternal deep copies.
+    /// The persistent_term cut: a global table of eternal deep copies.
     pub(crate) fn compile_pt_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -714,8 +721,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
-    /// unicode module cut: chardata conversion in the runtime (utf8 only —
-    /// the encoding arguments are evaluated and ignored).
+    /// The unicode cut. Chardata conversion runs in the runtime and supports
+    /// utf8 only. The encoding arguments are evaluated and ignored.
     pub(crate) fn compile_unicode_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -742,7 +749,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
-    /// crypto cut: the Plug.Crypto subset over RustCrypto.
+    /// The crypto cut: the Plug.Crypto subset over RustCrypto.
     pub(crate) fn compile_crypto_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -796,8 +803,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
-    /// gen_tcp/inet cut: everything routes through mana_rt_tcp by opcode.
-    /// recv/accept/connect/send suspend the caller — GC + raise points.
+    /// The gen_tcp/inet cut. Every call routes through mana_rt_tcp by opcode.
+    /// recv, accept, connect, and send suspend the caller. They are GC points
+    /// and raise points.
     pub(crate) fn compile_tcp_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -806,7 +814,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         args: &[Expr],
         scope: &mut Scope<'ctx>,
     ) -> CgResult<IntValue<'ctx>> {
-        // (opcode, arg slots, pad-with-infinity?)
+        // A spec is (opcode, append infinity as the missing timeout argument).
         let spec: Option<(u64, bool)> = match (module, name, args.len()) {
             ("gen_tcp", "connect", 3) => Some((0, true)),
             ("gen_tcp", "connect", 4) => Some((0, false)),
@@ -873,8 +881,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.check_exc(f, v)
     }
 
-    /// The native io cut: stdout only, bypassing OTP's group-leader
-    /// io-protocol entirely (io.erl is never compiled).
+    /// The native io cut: stdout only. It bypasses the group-leader io
+    /// protocol of OTP. io.erl is never compiled.
     pub(crate) fn compile_io_bif(
         &self,
         f: FunctionValue<'ctx>,
@@ -884,8 +892,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     ) -> CgResult<IntValue<'ctx>> {
         let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
         match (name, argv.len()) {
-            // devices other than stdout are not supported; the device arg
-            // (standard_io etc.) is evaluated and ignored
+            // Only stdout is supported. The device arg (for example
+            // standard_io) is evaluated and ignored.
             ("put_chars", 1) | ("put_chars", 2) => {
                 let data = *argv.last().unwrap();
                 let call = self
@@ -900,7 +908,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("format", 2) | ("format", 3) => {
-                // format/3's device arg (first) is ignored like put_chars/2's
+                // The first arg of format/3 is the device. It is ignored, as in
+                // put_chars/2.
                 let (fmt, fargs) = if argv.len() == 3 {
                     (argv[1], argv[2])
                 } else {

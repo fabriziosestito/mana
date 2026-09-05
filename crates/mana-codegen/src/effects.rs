@@ -1,3 +1,10 @@
+//! Effect analysis for reachable functions: which functions can raise an
+//! exception, and which functions contain a GC point. The module holds two
+//! reference walkers (`expr_may_raise`, `expr_may_gc`) and their
+//! condensers (`cond_may_raise`, `cond_may_gc`). The condensers must stay
+//! arm-for-arm mirrors of the walkers. `MANA_CHECK_ANALYSIS=1` checks that
+//! the condensed fixpoint equals the reference result.
+
 use crate::*;
 
 pub(crate) fn is_raise(primop: &str) -> bool {
@@ -7,8 +14,8 @@ pub(crate) fn is_raise(primop: &str) -> bool {
     )
 }
 
-/// erlang-module BIFs that may raise (shared by the boolean walker and the
-/// condenser — one list, no divergence).
+/// The `erlang` BIFs that can raise. The boolean walker and the condenser
+/// share this one list, so they cannot diverge.
 pub(crate) fn erlang_may_raise(name: &str, arity: usize) -> bool {
     matches!(
         (name, arity),
@@ -126,7 +133,8 @@ pub(crate) fn erlang_may_raise(name: &str, arity: usize) -> bool {
     )
 }
 
-/// Allocating erlang BIFs — GC points (shared list, like erlang_may_raise).
+/// The `erlang` BIFs that allocate. Each one is a GC point. The walker and
+/// the condenser share this list, like `erlang_may_raise`.
 pub(crate) fn erlang_may_gc(name: &str, arity: usize) -> bool {
     matches!(
         (name, arity),
@@ -164,16 +172,16 @@ pub(crate) fn erlang_may_gc(name: &str, arity: usize) -> bool {
     )
 }
 
-// ---- GC-effect analysis ----
+// GC-effect analysis
 
-/// Fixpoint: which reachable functions may trigger a collection.
-/// Per-function (base, deps) condensations come straight from the module
-/// summaries — both effect traversals are pure monotone ORs over
-/// set-membership lookups, so `base || deps ∩ set != ∅` is exact — and a
-/// worklist fixpoint runs over the condensed graph. MANA_CHECK_ANALYSIS=1
-/// cross-checks against the original per-iteration AST walkers (requires
-/// every unit to carry its AST — the driver disables the summary cache
-/// under the flag).
+/// Fixpoint: the reachable functions that can trigger a collection.
+/// The per-function (base, deps) condensations come from the module
+/// summaries. Both effect traversals are monotone ORs over set-membership
+/// lookups. Therefore `base || deps ∩ set != ∅` is exact. A worklist
+/// fixpoint runs over the condensed graph. `MANA_CHECK_ANALYSIS=1` compares
+/// the result with the original per-iteration AST walkers. This check needs
+/// the AST of every unit. The driver disables the summary cache under the
+/// flag.
 pub(crate) fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)>) -> GcSet {
     let defs: HashMap<(&str, &FunName), &summary::FunSummary> = units
         .iter()
@@ -193,9 +201,9 @@ pub(crate) fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, 
         .collect();
     let conds = inject_native_conds(conds, true);
     let set = effect_fixpoint(conds);
-    // native fns were injected only to resolve their callers; they are not
-    // compiled functions, so drop them from the result (the reference
-    // walker never has them as keys either).
+    // Native fns were injected only to resolve their callers. They are not
+    // compiled functions, so the result drops them. The reference walker
+    // never has them as keys either.
     let set: GcSet = set.into_iter().filter(|(m, _)| !is_native_module(m)).collect();
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
         if let Some(mods) = all_asts(units) {
@@ -206,7 +214,7 @@ pub(crate) fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, 
     set
 }
 
-/// Fixpoint: which reachable functions may raise an exception.
+/// Fixpoint: the reachable functions that can raise an exception.
 pub(crate) fn compute_may_raise(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)>) -> GcSet {
     let defs: HashMap<(&str, &FunName), &summary::FunSummary> = units
         .iter()
@@ -236,10 +244,11 @@ pub(crate) fn compute_may_raise(units: &[ModuleUnit], reachable: &HashSet<(Strin
     set
 }
 
-/// Native-module callees appear in summary deps but never in `defs` (they
-/// are not compiled). Inject them into the fixpoint with the manifest's
-/// per-fn verdict as their base and no further deps, so a compiled caller's
-/// dep on a native fn resolves. `gc` selects the may_gc vs may_raise flag.
+/// Native-module callees appear in summary deps but never in `defs`, because
+/// they are not compiled. This function injects them into the fixpoint with
+/// the per-fn verdict of the manifest as their base and no further deps.
+/// Then a dep of a compiled caller on a native fn resolves. `gc` selects the
+/// may_gc flag or the may_raise flag.
 pub(crate) fn inject_native_conds(
     mut conds: HashMap<(String, FunName), (bool, Vec<(String, FunName)>)>,
     gc: bool,
@@ -262,14 +271,14 @@ pub(crate) fn inject_native_conds(
     conds
 }
 
-/// The parsed ASTs of every unit, or None if any unit came from a summary
-/// hit (check mode needs the reference walkers).
+/// The parsed ASTs of every unit. Returns None if any unit came from a
+/// summary hit. Check mode needs the reference walkers, so it needs the ASTs.
 pub(crate) fn all_asts(units: &[ModuleUnit]) -> Option<Vec<&Module>> {
     units.iter().map(|u| u.ast.as_ref()).collect()
 }
 
-/// Least fixpoint of `f ∈ set ⇔ base(f) || deps(f) ∩ set ≠ ∅` via reverse
-/// edges: when a function turns true, only its dependents get revisited.
+/// Least fixpoint of `f ∈ set ⇔ base(f) || deps(f) ∩ set ≠ ∅` over reverse
+/// edges. When a function turns true, only its dependents get a new visit.
 pub(crate) fn effect_fixpoint(
     conds: HashMap<(String, FunName), (bool, Vec<(String, FunName)>)>,
 ) -> GcSet {
@@ -375,9 +384,10 @@ pub(crate) fn clause_irrefutable(c: &Clause) -> bool {
     is_true_atom(&c.guard) && c.patterns.iter().all(|p| matches!(p, Pattern::Var(_)))
 }
 
-/// Can evaluating `e` raise? Sources: raising primops/BIFs, fun-value
-/// applies (badfun), refutable cases (case_clause/function_clause), and
-/// calls to may-raise functions. Raises inside a `try` argument are caught.
+/// Can the evaluation of `e` raise? The sources are: primops and BIFs that
+/// raise, fun-value applies (badfun), refutable cases (case_clause,
+/// function_clause), and calls to functions that can raise. A `try` catches
+/// the raises inside its argument.
 pub(crate) fn expr_may_raise(
     e: &Expr,
     cur_mod: &str,
@@ -475,15 +485,17 @@ pub(crate) fn expr_may_raise(
                         || expr_may_raise(&c.body, cur_mod, raise_set, letrec_bound)
                 })
         }
-        // raises inside the protected argument are caught by this try
+        // This try catches the raises inside the protected argument.
         Expr::Try { body, handler, .. } => {
             expr_may_raise(body, cur_mod, raise_set, letrec_bound)
                 || expr_may_raise(handler, cur_mod, raise_set, letrec_bound)
         }
-        // construction raises badarg on non-int values / non-binary splices;
-        // fully-constant literals compile to static terms (no raise)
+        // Construction raises badarg on non-integer values and on non-binary
+        // splices. Fully-constant literals compile to static terms, so they
+        // do not raise.
         Expr::Binary(segs) => !binary_all_const(segs),
-        // updates raise badmap/badkey; construction only via children
+        // Updates raise badmap or badkey. Construction raises only through
+        // the children.
         Expr::Map { pairs, update } => {
             update.is_some()
                 || pairs.iter().any(|(k, _, v)| {
@@ -494,9 +506,9 @@ pub(crate) fn expr_may_raise(
     }
 }
 
-/// Does evaluating `e` contain a GC point? Allocation sites are GC points;
-/// calls consult the (possibly still-growing) fixpoint set; letrec-bound
-/// applies and fun-value applies are conservatively GC points.
+/// Does the evaluation of `e` contain a GC point? Allocation sites are GC
+/// points. Calls consult the fixpoint set, which can still grow. Letrec-bound
+/// applies and fun-value applies count as GC points. This is conservative.
 pub(crate) fn expr_may_gc(
     e: &Expr,
     cur_mod: &str,
@@ -507,11 +519,12 @@ pub(crate) fn expr_may_gc(
         Expr::Var(_) => false,
         Expr::Lit(Literal::Float(_)) => true, // boxed
         Expr::Lit(_) => false,
-        // allocation sites (CallDyn builds its args list + callee unknown)
+        // Allocation sites. CallDyn builds its args list, and its callee is
+        // unknown.
         Expr::Tuple(_) | Expr::Cons(..)
         | Expr::LetRec { .. } | Expr::Map { .. }
         | Expr::CallDyn { .. } => true,
-        // captureless funs are static constants — no allocation
+        // Funs without captures are static constants. They do not allocate.
         Expr::FunRef { .. } => false,
         Expr::Fun(fun) => {
             let mut bound: HashSet<String> = fun.params.iter().cloned().collect();
@@ -519,7 +532,7 @@ pub(crate) fn expr_may_gc(
             free_vars(&fun.body, &mut bound, &mut out);
             !out.is_empty()
         }
-        // fully-constant binaries are static terms — no allocation
+        // Fully-constant binaries are static terms. They do not allocate.
         Expr::Binary(segs) => !binary_all_const(segs),
         Expr::Apply { target, args } => {
             let target_gc = match target {
@@ -552,7 +565,6 @@ pub(crate) fn expr_may_gc(
                         .iter()
                         .any(|a| expr_may_gc(a, cur_mod, gc_set, letrec_bound));
             }
-            // allocating erlang BIFs are GC points
             if module == "erlang" && erlang_may_gc(name, args.len()) {
                 return true;
             }
@@ -567,8 +579,9 @@ pub(crate) fn expr_may_gc(
             {
                 return true;
             }
-            // io:nl allocates its newline binary; unicode/re allocate results;
-            // file/gen_tcp/inet allocate result tuples and may suspend
+            // io:nl allocates its newline binary. unicode and re allocate
+            // their results. file, gen_tcp, and inet allocate result tuples
+            // and can suspend.
             if matches!(
                 module.as_str(),
                 "io" | "unicode" | "re" | "timer" | "file" | "prim_file"
@@ -592,8 +605,8 @@ pub(crate) fn expr_may_gc(
         Expr::PrimOp { name, args } if is_raise(name) => args
             .iter()
             .any(|a| raise_arg_may_gc(a, cur_mod, gc_set, letrec_bound)),
-        // recv_wait_timeout suspends the process — other processes run and
-        // may collect the shared heap, so it is a GC point
+        // recv_wait_timeout suspends the process. Other processes run and
+        // can collect the shared heap, so it is a GC point.
         Expr::PrimOp { name, .. } if name == "recv_wait_timeout" => true,
         Expr::PrimOp { args, .. } => args
             .iter()
@@ -629,9 +642,9 @@ pub(crate) fn expr_may_gc(
     }
 }
 
-/// GC-point analysis for raise arguments: the reason term is built with the
-/// eternal allocator (no GC), so allocation nodes don't count — only calls
-/// into compiled code do.
+/// GC-point analysis for raise arguments. The eternal allocator builds the
+/// reason term, and it has no GC. Allocation nodes therefore do not count.
+/// Only calls into compiled code count.
 pub(crate) fn raise_arg_may_gc(
     e: &Expr,
     cur_mod: &str,
@@ -647,20 +660,23 @@ pub(crate) fn raise_arg_may_gc(
             raise_arg_may_gc(h, cur_mod, gc_set, letrec_bound)
                 || raise_arg_may_gc(t, cur_mod, gc_set, letrec_bound)
         }
-        // anything with control flow or calls: fall back to the full analysis
+        // Every node with control flow or calls goes to the full analysis.
         other => expr_may_gc(other, cur_mod, gc_set, letrec_bound),
     }
 }
 
-// ---- effect condensers ----
+// Effect condensers
 //
-// Arm-for-arm mirrors of expr_may_raise / expr_may_gc / raise_arg_may_gc:
-// every `set.contains(k)` becomes `deps.insert(k)` (Local resolved against
-// cur_mod), every unconditional `true` sets `base`, and early returns that
-// skip child scans are mirrored as returns. The walkers' short-circuiting
-// doesn't change the OR's value, so `base || deps ∩ set` is exact.
+// These are arm-for-arm mirrors of expr_may_raise, expr_may_gc, and
+// raise_arg_may_gc. Keep them in sync. The mapping is:
+// - Every `set.contains(k)` becomes `deps.insert(k)`. A Local target
+//   resolves against cur_mod.
+// - Every unconditional `true` sets `base`.
+// - Every early return that skips the child scan stays an early return.
+// The short-circuit evaluation of the walkers does not change the value of
+// the OR, so `base || deps ∩ set` is exact.
 
-/// Mirror of expr_may_raise.
+/// Mirror of expr_may_raise. Keep it in sync.
 pub(crate) fn cond_may_raise(
     e: &Expr,
     cur_mod: &str,
@@ -754,7 +770,7 @@ pub(crate) fn cond_may_raise(
                 cond_may_raise(&c.body, cur_mod, letrec_bound, base, deps);
             }
         }
-        // raises inside the protected argument are caught by this try
+        // This try catches the raises inside the protected argument.
         Expr::Try { body, handler, .. } => {
             cond_may_raise(body, cur_mod, letrec_bound, base, deps);
             cond_may_raise(handler, cur_mod, letrec_bound, base, deps);
@@ -776,7 +792,7 @@ pub(crate) fn cond_may_raise(
     }
 }
 
-/// Mirror of expr_may_gc.
+/// Mirror of expr_may_gc. Keep it in sync.
 pub(crate) fn cond_may_gc(
     e: &Expr,
     cur_mod: &str,
@@ -788,11 +804,12 @@ pub(crate) fn cond_may_gc(
         Expr::Var(_) => {}
         Expr::Lit(Literal::Float(_)) => *base = true, // boxed
         Expr::Lit(_) => {}
-        // allocation sites (CallDyn builds its args list + callee unknown)
+        // Allocation sites. CallDyn builds its args list, and its callee is
+        // unknown.
         Expr::Tuple(_) | Expr::Cons(..)
         | Expr::LetRec { .. } | Expr::Map { .. }
         | Expr::CallDyn { .. } => *base = true,
-        // captureless funs are static constants — no allocation
+        // Funs without captures are static constants. They do not allocate.
         Expr::FunRef { .. } => {}
         Expr::Fun(fun) => {
             let mut bound: HashSet<String> = fun.params.iter().cloned().collect();
@@ -802,7 +819,7 @@ pub(crate) fn cond_may_gc(
                 *base = true;
             }
         }
-        // fully-constant binaries are static terms — no allocation
+        // Fully-constant binaries are static terms. They do not allocate.
         Expr::Binary(segs) => {
             if !binary_all_const(segs) {
                 *base = true;
@@ -849,8 +866,9 @@ pub(crate) fn cond_may_gc(
                 *base = true;
                 return;
             }
-            // io:nl allocates its newline binary; unicode/re allocate results;
-            // file/gen_tcp/inet allocate result tuples and may suspend
+            // io:nl allocates its newline binary. unicode and re allocate
+            // their results. file, gen_tcp, and inet allocate result tuples
+            // and can suspend.
             if matches!(
                 module.as_str(),
                 "io" | "unicode" | "re" | "timer" | "file" | "prim_file"
@@ -874,8 +892,8 @@ pub(crate) fn cond_may_gc(
         Expr::PrimOp { name, args } if is_raise(name) => args
             .iter()
             .for_each(|a| cond_raise_arg_may_gc(a, cur_mod, letrec_bound, base, deps)),
-        // recv_wait_timeout suspends the process — other processes run and
-        // may collect the shared heap, so it is a GC point
+        // recv_wait_timeout suspends the process. Other processes run and
+        // can collect the shared heap, so it is a GC point.
         Expr::PrimOp { name, .. } if name == "recv_wait_timeout" => *base = true,
         Expr::PrimOp { args, .. } => args
             .iter()
@@ -914,7 +932,7 @@ pub(crate) fn cond_may_gc(
     }
 }
 
-/// Mirror of raise_arg_may_gc.
+/// Mirror of raise_arg_may_gc. Keep it in sync.
 pub(crate) fn cond_raise_arg_may_gc(
     e: &Expr,
     cur_mod: &str,
@@ -931,7 +949,7 @@ pub(crate) fn cond_raise_arg_may_gc(
             cond_raise_arg_may_gc(h, cur_mod, letrec_bound, base, deps);
             cond_raise_arg_may_gc(t, cur_mod, letrec_bound, base, deps);
         }
-        // anything with control flow or calls: fall back to the full analysis
+        // Every node with control flow or calls goes to the full analysis.
         other => cond_may_gc(other, cur_mod, letrec_bound, base, deps),
     }
 }

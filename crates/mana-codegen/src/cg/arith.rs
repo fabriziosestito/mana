@@ -11,7 +11,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .into_int_value())
     }
 
-    /// i1: is `a` (and `b`, when given) a small int?
+    /// Returns an i1 that is true when `a` is a small int. If `b` is given,
+    /// the i1 is true only when both are small ints.
     pub(crate) fn small_test(
         &self,
         a: IntValue<'ctx>,
@@ -34,7 +35,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         match b {
             None => tag_of(a, "sm.a"),
             Some(b) => {
-                // ((a^1) | (b^1)) & 7 == 0  ⇔  both tags are 001
+                // ((a^1) | (b^1)) & 7 == 0 holds exactly when both tags are 001.
                 let xa = self
                     .builder
                     .build_xor(a, self.i64t.const_int(TAG_SMALL, false), "sm.xa")
@@ -55,8 +56,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// Numeric op with a both-small inline path and the mana_rt_arith slow
-    /// path (floats / badarith). The slow path may raise but never GCs.
+    /// Numeric op with an inline path for two small ints and the mana_rt_arith
+    /// slow path (floats, badarith). The slow path can raise. It never runs a GC.
     pub(crate) fn arith_fastslow(
         &self,
         f: FunctionValue<'ctx>,
@@ -74,12 +75,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
 
         self.builder.position_at_end(fast);
-        // small results that can leave the 61-bit range go to the slow path
-        // (bignum promotion). +/-/* use overflow intrinsics ON TAGGED values:
-        // tagged(x) = 8x+1, so a + (b-1) and a - (b-1) are already-tagged
-        // sums whose i64 overflow flag fires EXACTLY when the true result
-        // leaves the small range (untagged 61-bit values can never overflow
-        // an i64 intrinsic).
+        // Small results that leave the 61-bit range go to the slow path for
+        // bignum promotion. The +, -, and * cases use overflow intrinsics on
+        // tagged values. Because tagged(x) = 8x+1, a + (b-1) and a - (b-1) are
+        // tagged sums. Their i64 overflow flag fires exactly when the true
+        // result leaves the small range. Untagged 61-bit values can never
+        // overflow an i64 intrinsic.
         let to_slow = |cond: IntValue<'ctx>, tag: &str| -> CgResult<()> {
             let cont = self.ctx.append_basic_block(f, tag);
             self.builder
@@ -115,7 +116,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             Ok((v, o))
         };
         let small_range_ok = |v: IntValue<'ctx>| -> CgResult<IntValue<'ctx>> {
-            // (v << 3) >> 3 == v  ⇔  v fits the 61-bit small range
+            // (v << 3) >> 3 == v holds exactly when v fits the 61-bit small range.
             let sh = self
                 .builder
                 .build_left_shift(v, self.i64t.const_int(3, false), "rng.l")
@@ -136,7 +137,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 let (v, o) = ovf(a, b1, "llvm.sadd.with.overflow")?;
                 to_slow(o, "add.k")?;
-                v // already tagged
+                v // The sum is already tagged.
             }
             ("-", Some(b)) => {
                 let b1 = self
@@ -145,7 +146,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 let (v, o) = ovf(a, b1, "llvm.ssub.with.overflow")?;
                 to_slow(o, "sub.k")?;
-                v // already tagged
+                v // The difference is already tagged.
             }
             ("*", Some(b)) => {
                 let ua = self.untag_int(a)?;
@@ -176,7 +177,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .builder
                     .build_int_signed_div(ua, ub, "div")
                     .map_err(be)?;
-                // -2^60 div -1 leaves the small range
+                // -2^60 div -1 leaves the small range.
                 let bad = small_range_ok(q)?;
                 to_slow(bad, "div.k2")?;
                 self.retag_int(q)?
@@ -229,7 +230,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .builder
                     .build_int_sub(self.i64t.const_zero(), ua, "neg")
                     .map_err(be)?;
-                let bad = small_range_ok(v)?; // -(-2^60) leaves the range
+                let bad = small_range_ok(v)?; // -(-2^60) leaves the small range.
                 to_slow(bad, "neg.k")?;
                 self.retag_int(v)?
             }
@@ -253,7 +254,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .build_select(neg, nv, ua, "abs")
                     .map_err(be)?
                     .into_int_value();
-                let bad = small_range_ok(v)?; // abs(-2^60) leaves the range
+                let bad = small_range_ok(v)?; // abs(-2^60) leaves the small range.
                 to_slow(bad, "abs.k")?;
                 self.retag_int(v)?
             }
@@ -263,7 +264,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.builder.build_unconditional_branch(merge).map_err(be)?;
 
         self.builder.position_at_end(slow);
-        let bb = b.unwrap_or(self.i64t.const_int(1, false)); // small 0 dummy
+        let bb = b.unwrap_or(self.i64t.const_int(1, false)); // For unary ops, the second argument is the small 0.
         let call = self
             .builder
             .build_call(
@@ -288,11 +289,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(phi.as_basic_value().into_int_value())
     }
 
-    /// `boxed(v) && header.kind == kind` as an i1, via control flow.
     /// Byte-data base address of a bin-kind subject (KIND_BIN or a
-    /// KIND_SUBBIN view). The subject must already be preflighted as a bin
-    /// kind; bit 3 of the header distinguishes 5 from 13. Emits pure loads —
-    /// callers must recompute after any GC point (the parent moves).
+    /// KIND_SUBBIN view). The caller must already preflight the subject as a
+    /// bin kind. Bit 3 of the header distinguishes 5 from 13. The function emits
+    /// pure loads. Callers must recompute after any GC point, because the parent
+    /// moves.
     pub(crate) fn bin_base_addr(
         &self,
         f: FunctionValue<'ctx>,
@@ -306,10 +307,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.builder.build_int_add(pdata, poff, "bba.base").map_err(be)
     }
 
-    /// (root binary term, byte offset into it) for a preflighted binary
-    /// subject: the subject itself with offset 0 for a plain KIND_BIN, or
-    /// the view's parent + stored offset for a KIND_SUBBIN. Inline branch
-    /// on the view bit (kinds 5/13 differ only in bit 3).
+    /// Returns (root binary term, byte offset into it) for a preflighted binary
+    /// subject. For a plain KIND_BIN, the result is the subject with offset 0.
+    /// For a KIND_SUBBIN, the result is the parent of the view and the stored
+    /// offset. The code branches inline on the view bit. Kinds 5 and 13 differ
+    /// only in bit 3.
     pub(crate) fn bin_parent_off(
         &self,
         f: FunctionValue<'ctx>,
@@ -378,6 +380,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         ))
     }
 
+    /// Computes `boxed(v) && header.kind == kind` as an i1, via control flow.
+    /// The `test` closure computes the header part of the condition.
     pub(crate) fn kind_test(
         &self,
         f: FunctionValue<'ctx>,

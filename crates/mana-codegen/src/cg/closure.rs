@@ -1,17 +1,29 @@
+//! Closures: free variable analysis, closure objects, lambda lifting of
+//! `fun` and `letrec` bodies, and shims for top-level functions.
+//!
+//! Contract: a fun value is a boxed `[header | code | captures...]` object.
+//! Every fun body takes the closure as its last argument, after the
+//! arguments of the fun. The `apply` path checks the tag, the kind, and
+//! the arity before it makes the indirect call.
+
 use crate::*;
 
-// ---- free variable analysis ----
-
-/// Collapse a directly-nested letrec chain (`letrec A in letrec B in ...`)
-/// into one mutually-visible group. The Erlang compiler emits nested
-/// single-member letrecs annotated `letrec_goto` for shared match
-/// continuations; an inner label's body calls an outer label. After
-/// lambda-lifting, a lifted inner body gets a fresh scope that no longer
-/// sees the outer label, so the call fails to resolve. Merging the chain
-/// into one group makes every label a sibling of every other, which is a
-/// superset of the original (outer-defined-first) visibility and thus
-/// safe. Only flattens while the bound names stay disjoint and nothing is
-/// bound between the letrecs (body is immediately another letrec).
+/// Collapse a directly nested letrec chain (`letrec A in letrec B in ...`)
+/// into one group. Every member of the group sees every other member.
+///
+/// The Erlang compiler emits nested single-member letrecs for shared match
+/// continuations. It annotates them `letrec_goto`. The body of an inner
+/// label calls an outer label. After lambda lifting, the lifted inner body
+/// gets a fresh scope. That scope does not see the outer label, so the
+/// call does not resolve.
+///
+/// The merged group makes every label a sibling of every other label.
+/// This visibility is a superset of the original visibility, where outer
+/// labels are defined first. Therefore the merge is safe.
+///
+/// The loop stops when a bound name collides with a name in the group. It
+/// also stops when the body is not directly another letrec, that is, when
+/// something is bound between the letrecs.
 pub(crate) fn flatten_letrec<'a>(
     defs: &[(FunName, Fun)],
     body: &'a Expr,
@@ -180,10 +192,10 @@ pub(crate) fn pattern_vars(p: &Pattern, out: &mut Vec<String>) {
 }
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    /// Compile any `apply`; `tail` pops the frame just before the call.
-    /// Returns the call site and whether the callee may raise (tail calls
-    /// propagate the sentinel for free via the return value; non-tail
-    /// callers must `check_exc`).
+    /// Compile any `apply`. If `tail` is set, this pops the frame just before
+    /// the call. Returns the call site and a flag that says if the callee can
+    /// raise. A tail call propagates the sentinel through the return value at
+    /// no cost. A non-tail caller must `check_exc`.
     pub(crate) fn compile_apply(
         &self,
         f: FunctionValue<'ctx>,
@@ -202,7 +214,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         self.pop_frame()?;
                     }
                     let call = self.call_compiled(lf, &argv, "call", tail)?;
-                    Ok((call, true)) // letrec bodies: conservatively may raise
+                    Ok((call, true)) // letrec bodies: assume that they can raise
                 } else {
                     let callee = self.local_fn(fname)?;
                     let may_raise = self
@@ -219,9 +231,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ApplyTarget::Var(v) => {
                 let argv = self.eval_args(f, args, scope)?;
                 let fun_val = self.read_var(scope, v)?;
-                // a musttail releases this frame before the callee runs:
-                // the root frame must be unlinked first (like the LocalFun
-                // arms above), else the callee's GC walks a dead alloca
+                // A musttail releases this frame before the callee runs. Unlink
+                // the root frame first, as in the LocalFun arms above. If not,
+                // the GC of the callee walks a dead alloca.
                 if tail {
                     self.pop_frame()?;
                 }
@@ -231,8 +243,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// Apply a fun value: check tag/kind/arity, indirect-call
-    /// `(ctx, args..., closure)`.
+    /// Apply a fun value. Check the tag, the kind, and the arity. Then make
+    /// an indirect call with `(ctx, args..., closure)`.
     pub(crate) fn compile_apply_value(
         &self,
         f: FunctionValue<'ctx>,
@@ -297,7 +309,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .builder
             .build_indirect_call(self.term_fn_type(nargs + 1), code_ptr, &packed, "apply")
             .map_err(be)?;
-        // fun bodies (lifts, shims) are tailcc with the uniform prototype
+        // Fun bodies (lifts and shims) are tailcc with the uniform prototype.
         call.set_call_convention(Self::TAILCC);
         if tail {
             self.mark_tail(call);
@@ -305,9 +317,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(call)
     }
 
-    /// `[header | code | captures...]`, boxed (tag 000). Allocates first,
-    /// then reads captures from their variable bindings — safe because the
-    /// allocation is the only GC point involved.
+    /// Build a boxed (tag 000) closure `[header | code | captures...]`. It
+    /// allocates first, then reads the captures from their variable bindings.
+    /// This order is safe because the allocation is the only GC point.
     pub(crate) fn make_closure(
         &self,
         code: FunctionValue<'ctx>,
@@ -319,8 +331,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ((capture_names.len() as u64) << 16) | ((arity as u64) << 8) | KIND_FUN,
             false,
         );
-        // captureless: a per-code-pointer static constant — no allocation
-        // (safe: forward_major/minor pass non-heap boxed terms through)
+        // A fun without captures is a static constant per code pointer, with
+        // no allocation. This is safe: forward_major/minor pass non-heap
+        // boxed terms through.
         if capture_names.is_empty() {
             let sym = format!("mana_fun.{}", code.get_name().to_string_lossy());
             let g = match self.module.get_global(&sym) {
@@ -384,8 +397,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         lifted.len() - 1
     }
 
-    /// Lift a letrec group: one shared capture environment, direct calls
-    /// among members. Returns the scope extended with the group's funs.
+    /// Lift a letrec group. The members share one capture environment and
+    /// call each other directly. Returns the scope extended with the funs of
+    /// the group.
     pub(crate) fn bind_letrec(
         &self,
         _f: FunctionValue<'ctx>,
@@ -414,8 +428,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .zip(indices.iter().copied())
             .collect();
 
-        // One closure object shared by the whole group for direct calls;
-        // its code pointer (first member) is never used via apply.
+        // The whole group shares one closure object for direct calls. Its
+        // code pointer (the first member) is never used through apply.
         let first = self.lifted.borrow()[indices[0]];
         let closure = self.make_closure(first, defs[0].1.params.len(), &free, scope)?;
         let cl_slot = self.spill(closure)?;
@@ -438,17 +452,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(inner)
     }
 
-    /// A shim adapting a plain top-level function to the closure calling
-    /// convention. Frameless: it holds no live terms across the call.
+    /// Build a shim that adapts a plain top-level function to the closure
+    /// calling convention. The shim is frameless: it holds no live terms
+    /// across the call.
     pub(crate) fn fun_shim(&self, module: Option<&str>, fname: &FunName) -> CgResult<FunctionValue<'ctx>> {
         let target_mod = module.unwrap_or(&self.module_name);
         let sym = format!("{}.shim", mangle(target_mod, fname));
         if let Some(existing) = self.module.get_function(&sym) {
             return Ok(existing);
         }
-        // a fun capture of a missing module: BEAM parity — build the shim
-        // as an abort-if-ever-called stub (the old Err path leaked a
-        // bodyless linkonce declaration AND poisoned the whole caller)
+        // A fun capture of a missing module follows BEAM: build the shim as
+        // a stub that aborts if it is ever called. An Err here leaks a
+        // bodyless linkonce declaration and poisons the whole caller.
         if module.is_some()
             && !is_bif_module(target_mod)
             && self.missing_modules.borrow().contains(target_mod)
@@ -469,8 +484,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let shim = self.declare_compiled(&sym, fname.arity + 1);
         shim.set_linkage(Linkage::LinkOnceODR);
 
-        // BIF-module targets have no symbol to forward to: give the shim a
-        // real (mini-compiled) body that invokes the BIF
+        // A BIF-module target has no symbol to forward to. Give the shim a
+        // real compiled body that calls the BIF.
         if module.is_some() && is_bif_module(target_mod) {
             let params: Vec<String> = (0..fname.arity).map(|i| format!("_bifshim{}", i)).collect();
             let body = Expr::Call {
@@ -498,7 +513,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.propagate_bb.set(None);
             self.setup_frame(&body, &params, &[])?;
             let mut scope = Scope::default();
-            // shim signature is `args + closure` (arity + 1 terms)
+            // The shim signature is `args + closure`, that is, arity + 1 terms.
             for (i, p) in params.iter().enumerate() {
                 let v = self.param_at(shim, i, fname.arity + 1)?;
                 self.bind_var(&mut scope, p, v)?;
@@ -518,8 +533,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.frame_len_store.set(saved_len_store);
             self.frame_skip.set(saved_skip);
             if let Err(e) = r {
-                // an unsupported BIF captured as a fun: the shim raises at
-                // runtime if the fun is ever called
+                // The fun captures an unsupported BIF. The shim raises at run
+                // time if the fun is ever called.
                 let msg = format!("fun {}:{}/{}: {}", target_mod, fname.name, fname.arity, e);
                 eprintln!("manac: warning: {} stubbed", msg);
                 self.emit_unsupported_stub(shim, &msg)?;
@@ -539,7 +554,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let saved = self.builder.get_insert_block();
         let bb = self.ctx.append_basic_block(shim, "entry");
         self.builder.position_at_end(bb);
-        // ctx + args, dropping the trailing closure param (shim arity+1)
+        // Pass ctx and the args. Drop the trailing closure param of the shim
+        // (the shim has arity+1 params).
         let mut argv: Vec<BasicMetadataValueEnum> = vec![shim.get_nth_param(0).unwrap().into()];
         for i in 0..fname.arity {
             argv.push(self.param_at(shim, i, fname.arity + 1)?.into());

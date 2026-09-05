@@ -1,7 +1,13 @@
+//! GC root frames and slots. A framed function keeps its live terms in an
+//! alloca `[prev | len | slots...]` and links it into `CTX_ROOTS` at entry.
+//! A prepass over the body decides the frame size. The function must unlink
+//! the frame before every return or tail call. A slot that holds 0 is
+//! empty, and the collector skips it.
+
 use crate::*;
 
-/// Does matching this pattern allocate? (binary patterns with binary-type
-/// segments build sub-binaries)
+/// Returns true if a match of this pattern can allocate. A binary pattern
+/// with binary-type segments builds sub-binaries.
 pub(crate) fn pattern_may_gc(p: &Pattern) -> bool {
     match p {
         Pattern::Binary(segs) => segs
@@ -15,8 +21,9 @@ pub(crate) fn pattern_may_gc(p: &Pattern) -> bool {
     }
 }
 
-/// Frame slots the match compiler will spill for this pattern (subjects
-/// parked across allocating sub-matches; see pattern_subject_slot).
+/// Count the frame slots that the match compiler will spill for this
+/// pattern. The subjects are parked across sub-matches that allocate.
+/// See pattern_subject_slot.
 pub(crate) fn pattern_spill_sites(p: &Pattern) -> usize {
     let own = pattern_may_gc(p) as usize;
     own + match p {
@@ -28,11 +35,16 @@ pub(crate) fn pattern_spill_sites(p: &Pattern) -> usize {
     }
 }
 
-/// Count bound variable names and *spill sites* for frame sizing. Spills
-/// only happen for children of allocations (eval_all_rooted), call/BIF
-/// arguments (eval_siblings), case scrutinees, and letrec closures — the
-/// sum over those sites bounds any execution path. Does not descend into
-/// Fun/LetRec definition bodies (they get their own frames when lifted).
+/// Count the bound variable names and the *spill sites* for frame sizing.
+/// Spills happen only at these sites:
+/// - children of allocations (eval_all_rooted)
+/// - call and BIF arguments (eval_siblings)
+/// - case scrutinees
+/// - letrec closures
+///
+/// The sum over those sites bounds any execution path. The prepass does not
+/// descend into Fun or LetRec definition bodies. Those bodies get their own
+/// frames when they are lifted.
 pub(crate) fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut usize) {
     match e {
         Expr::Var(_) | Expr::Lit(_) | Expr::FunRef { .. } | Expr::Fun(_) => {}
@@ -51,7 +63,7 @@ pub(crate) fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut u
             frame_prepass(body, vars, nodes);
         }
         Expr::LetRec { body, .. } => {
-            *nodes += 1; // shared closure slot
+            *nodes += 1; // the shared closure slot
             frame_prepass(body, vars, nodes);
         }
         Expr::Apply { args, .. } => {
@@ -78,7 +90,7 @@ pub(crate) fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut u
                 let mut pvars = Vec::new();
                 c.patterns.iter().for_each(|p| pattern_vars(p, &mut pvars));
                 vars.extend(pvars);
-                // allocating (binary) sub-patterns spill their subjects
+                // Binary sub-patterns that allocate spill their subjects.
                 c.patterns
                     .iter()
                     .for_each(|p| *nodes += pattern_spill_sites(p));
@@ -122,11 +134,10 @@ pub(crate) fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut u
 }
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    // ---- frames & slots ----
-
-    /// Set up the root frame for the function whose entry block the builder
-    /// is positioned in. `body` decides framedness; `var_names` are all
-    /// names that may be bound (params, captures, body binds).
+    /// Set up the root frame for the function that owns the current insert
+    /// block of the builder. `body` decides if the function is framed.
+    /// `var_names` lists all names that can be bound: params, captures, and
+    /// body binds.
     pub(crate) fn setup_frame(
         &self,
         body: &Expr,
@@ -149,9 +160,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let nvars = vars.len() as u64;
         let cap = nvars + nodes as u64 + 8;
 
-        // var_names (params/captures) take the leading slots: every caller
-        // stores them right after this returns, before the first GC point,
-        // so the zeroing memset can skip them
+        // var_names (params and captures) take the leading slots. Every caller
+        // stores them right after this returns, before the first GC point.
+        // Therefore the zeroing memset can skip them.
         let skip;
         {
             let mut slots = self.var_slots.borrow_mut();
@@ -182,8 +193,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let ctx = self.ctx_val();
         let prev = self.mem_load(ctx, CTX_ROOTS, MemKind::Ctx)?;
         self.mem_store(frame, 0, prev, MemKind::Frame)?;
-        // len: placeholder — patched down to the slot high-water mark once
-        // the body is compiled (see patch_frame)
+        // len is a placeholder. patch_frame lowers it to the slot high-water
+        // mark after the body is compiled.
         let len_slot = unsafe {
             self.builder
                 .build_in_bounds_gep(
@@ -200,9 +211,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
         let _ = len_store.set_metadata(self.tbaa_frame, self.tbaa_kind);
         self.frame_len_store.set(Some(len_store));
-        // zero-init the non-prebound slots with one memset — 0 marks an
-        // empty slot the collector skips (cheaper than storing NIL per
-        // slot). Size is a placeholder patched in patch_frame.
+        // One memset zeroes the slots that are not prebound. A 0 marks an
+        // empty slot that the collector skips. This is cheaper than a NIL
+        // store per slot. The size is a placeholder that patch_frame patches.
         let slots = unsafe {
             self.builder
                 .build_in_bounds_gep(
@@ -232,10 +243,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    /// After the body is compiled the true slot high-water mark is known:
-    /// shrink the frame len and the entry memset from the prepass cap
-    /// (an over-approximation) down to it. The alloca keeps the padded
-    /// size — untouched stack costs nothing.
+    /// Shrink the frame len and the entry memset to the true slot high-water
+    /// mark. The mark is known after the body is compiled. The prepass cap
+    /// is an over-approximation. The alloca keeps the padded size, because
+    /// untouched stack costs nothing.
     pub(crate) fn patch_frame(&self) {
         let peak = self.peak_slot.get();
         if let Some(ls) = self.frame_len_store.take() {
@@ -249,7 +260,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
     }
 
-    /// Unlink the frame (before any return or tail call).
+    /// Unlink the frame. Call this before any return or tail call.
     pub(crate) fn pop_frame(&self) -> CgResult<()> {
         if let Some(frame) = self.cur_frame.get() {
             let prev = self.mem_load(frame, 0, MemKind::Frame)?;

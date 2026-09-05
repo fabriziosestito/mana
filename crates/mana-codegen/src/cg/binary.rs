@@ -11,8 +11,8 @@ pub(crate) fn atom_list(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
-/// Coalesce runs of constant sub-byte integer segments into single
-/// byte-aligned synthetic segments (see compile_binary_construct).
+/// Coalesces each run of constant sub-byte integer segments into one
+/// byte-aligned synthetic segment. See compile_binary_construct.
 pub(crate) fn coalesce_bit_runs(
     segs: &[mana_syntax::BinSegment<Box<Expr>>],
     specs: &[SegSpec],
@@ -94,7 +94,7 @@ pub(crate) fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {
     };
     let unit = match &spec[1] {
         Expr::Lit(Literal::Int(u)) => *u,
-        // utf8/utf16/utf32 segments carry 'undefined' size and unit
+        // A utf8/utf16/utf32 segment carries 'undefined' as its size and unit.
         _ if ty == "utf8" => 0,
         _ => return Err("bitstring segment unit is not a constant".into()),
     };
@@ -140,8 +140,10 @@ pub(crate) fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {
     Ok(SegSpec { little, signed, kind })
 }
 
-/// Decimal digits → big-endian bytes, truncated (mod 2^(8n)) or left-padded
-/// to exactly `nbytes` — BEAM's truncating construction semantics.
+/// Converts a decimal digit string to exactly `nbytes` bytes. The function
+/// truncates the value (mod 2^(8n)) or pads it with zero bytes on the high
+/// side. The result is big-endian unless `little` is set. This is the BEAM
+/// truncating construction semantics.
 pub(crate) fn big_to_bytes(dec: &str, nbytes: usize, little: bool) -> Result<Vec<u8>, String> {
     let mut digits: Vec<u8> = Vec::with_capacity(dec.len());
     for c in dec.bytes() {
@@ -150,7 +152,7 @@ pub(crate) fn big_to_bytes(dec: &str, nbytes: usize, little: bool) -> Result<Vec
         }
         digits.push(c - b'0');
     }
-    // repeated long division by 256, remainders = little-endian bytes
+    // Repeated long division by 256. The remainders are the little-endian bytes.
     let mut le = Vec::new();
     while digits.iter().any(|&d| d != 0) {
         let mut rem: u32 = 0;
@@ -174,8 +176,8 @@ pub(crate) fn big_to_bytes(dec: &str, nbytes: usize, little: bool) -> Result<Vec
     Ok(le)
 }
 
-/// The constant bytes of an integer segment, when they can be computed at
-/// compile time. `None` = dynamic value.
+/// The constant bytes of an integer segment. `None` means that the value is
+/// dynamic and the compiler cannot compute the bytes at compile time.
 pub(crate) fn seg_const_bytes(value: &Expr, nbytes: u64, little: bool) -> Result<Option<Vec<u8>>, String> {
     match value {
         Expr::Lit(Literal::Int(n)) => {
@@ -184,7 +186,7 @@ pub(crate) fn seg_const_bytes(value: &Expr, nbytes: u64, little: bool) -> Result
             for i in 0..nbytes {
                 let shift = 8 * if little { i } else { nbytes - 1 - i };
                 out.push(if shift < 64 { (v >> shift) as u8 } else {
-                    // sign-extension bytes beyond 64 bits
+                    // Bytes beyond 64 bits are sign extension.
                     if *n < 0 { 0xff } else { 0 }
                 });
             }
@@ -195,9 +197,9 @@ pub(crate) fn seg_const_bytes(value: &Expr, nbytes: u64, little: bool) -> Result
     }
 }
 
-/// Every segment's bytes are known at compile time (mirrors the const
-/// extraction in compile_binary_construct) — such binaries compile to
-/// static terms: no allocation, no raise.
+/// True when the bytes of every segment are known at compile time. This
+/// mirrors the constant extraction in compile_binary_construct. Such a binary
+/// compiles to a static term with no allocation and no raise.
 pub(crate) fn binary_all_const(segs: &[mana_syntax::BinSegment<Box<Expr>>]) -> bool {
     segs.iter().all(|s| match parse_seg_spec(&s.spec) {
         Ok(spec) => match spec.kind {
@@ -215,9 +217,11 @@ pub(crate) fn binary_all_const(segs: &[mana_syntax::BinSegment<Box<Expr>>]) -> b
 }
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    /// A proper list from already-rooted child values. Nursery mode: one
-    /// block of headerless cons cells (single GC point). Eternal (raise
-    /// path) mode: per-cell allocs, chained in SSA (no GC there).
+    /// Builds a proper list from child values that are already rooted. In
+    /// nursery mode, it allocates one block of headerless cons cells. That
+    /// gives a single GC point. In eternal mode (the raise path), it
+    /// allocates each cell on its own and chains the cells in SSA. No GC
+    /// runs there.
     pub(crate) fn build_list_from_rooted(&self, rooted: &[Rooted<'ctx>]) -> CgResult<IntValue<'ctx>> {
         if rooted.is_empty() {
             return Ok(self.nil());
@@ -267,11 +271,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(head)
     }
 
-    /// Bitstring construction: evaluate all segment values and dynamic
-    /// sizes (rooted), compute the total byte size, allocate once, then
-    /// fill with non-allocating writers. Constant segments (integer
-    /// literals incl. erlc's wide folded strings, constant utf8) become
-    /// static byte arrays written with one memcpy.
+    /// Bitstring construction. The function evaluates all segment values and
+    /// dynamic sizes as rooted values. Then it computes the total byte size,
+    /// allocates once, and fills the binary with writers that do not
+    /// allocate. Constant segments become static byte arrays that one memcpy
+    /// writes. Constant segments are integer literals, the wide folded
+    /// strings from erlc, and constant utf8.
     pub(crate) fn compile_binary_construct(
         &self,
         f: FunctionValue<'ctx>,
@@ -282,12 +287,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .iter()
             .map(|s| parse_seg_spec(&s.spec))
             .collect::<Result<Vec<_>, _>>()?;
-        // sub-byte integer segments (Base's <<acc/binary, a::4, b::4, ...>>
-        // decode loops): coalesce each maximal run into ONE byte-aligned
-        // synthetic segment whose value is bsl/bor/band arithmetic over the
-        // original exprs (left-folded — original evaluation order; band =
-        // BEAM's truncation-to-size). Runs must end byte-aligned: a true
-        // sub-byte bitstring RESULT has no representation here.
+        // Sub-byte integer segments appear in the decode loops of Base, for
+        // example <<acc/binary, a::4, b::4, ...>>. Each maximal run becomes
+        // ONE byte-aligned synthetic segment. Its value is bsl/bor/band
+        // arithmetic over the original exprs, left-folded to keep the
+        // original evaluation order. The band is the BEAM truncation to size.
+        // A run must end byte-aligned: a true sub-byte bitstring RESULT has
+        // no representation here.
         if specs
             .iter()
             .any(|s| matches!(s.kind, SegKind::Int { size: SegSize::Bits(_) }))
@@ -295,7 +301,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let rewritten = coalesce_bit_runs(segs, &specs)?;
             return self.compile_binary_construct(f, &rewritten, scope);
         }
-        // compile-time-known segment bytes
         let mut const_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(specs.len());
         for (spec, seg) in specs.iter().zip(segs) {
             const_bytes.push(match &spec.kind {
@@ -323,8 +328,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 SegKind::Bin { .. } => None,
             });
         }
-        // every segment constant (string literals, <<>>): a static term —
-        // no allocation, no writes
+        // If every segment is constant (string literals, <<>>), the result is
+        // a static term. There is no allocation and no write.
         if const_bytes.iter().all(|c| c.is_some()) {
             let all: Vec<u8> = const_bytes
                 .iter()
@@ -332,8 +337,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .collect();
             return self.static_binary(&all);
         }
-        // evaluate values (skipping const segments) and dynamic sizes, all
-        // rooted — sizes are small ints but their exprs may allocate
+        // Evaluate the values and the dynamic sizes, all rooted. The loop
+        // skips constant segments. Sizes are small ints, but their exprs can
+        // allocate.
         let nil_expr = Expr::Lit(Literal::Nil);
         let mut children: Vec<&Expr> = Vec::new();
         for ((spec, seg), cb) in specs.iter().zip(segs).zip(&const_bytes) {
@@ -348,7 +354,6 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
         let rooted = self.eval_all_rooted(f, &children, scope)?;
         let value_of = |i: usize| &rooted[2 * i];
-        // total byte size
         let mut const_total: u64 = 0;
         for (i, spec) in specs.iter().enumerate() {
             match (&const_bytes[i], &spec.kind) {
@@ -384,8 +389,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
                 SegKind::Bin { size: sz @ SegSize::Dyn { .. } }
                 | SegKind::Int { size: sz @ SegSize::Dyn { .. } } => {
-                    // the size expr was pre-evaluated; re-wrap as a literal
-                    // read from its slot
+                    // The size expr was evaluated earlier. Read the value from
+                    // its rooted slot.
                     let szv = self.rooted_get(&rooted[2 * i + 1])?;
                     Some(self.seg_bytes_from_value(f, szv, sz)?)
                 }
@@ -419,7 +424,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 total = self.builder.build_int_add(total, a, "btot").map_err(be)?;
             }
         }
-        // single GC point: values rooted, sizes are raw ints in SSA
+        // This is the single GC point. The values are rooted. The sizes are
+        // raw ints in SSA.
         let alloc_name = if self.eternal_alloc.get() {
             "mana_rt_bin_alloc_eternal"
         } else {
@@ -439,9 +445,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_call(alloc_fn, &[self.ctx_val().into(), total.into()], "bin")
             .map_err(be)?;
         let bin = call_result(call)?.into_int_value();
-        // fill (writers never allocate); consecutive constant segments
-        // (erlc emits string literals byte-per-segment) coalesce into a
-        // single write
+        // Fill the binary. The writers never allocate. Consecutive constant
+        // segments coalesce into a single write, because erlc emits string
+        // literals as one segment per byte.
         let mut off = self.i64t.const_zero();
         let mut i = 0usize;
         while i < specs.len() {
@@ -528,7 +534,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     let (adv, len_arg) = match size {
                         SegSize::All => (
                             dyn_sizes[i].unwrap(),
-                            self.i64t.const_int(u64::MAX, false), // -1: whole
+                            self.i64t.const_int(u64::MAX, false), // -1: the whole binary
                         ),
                         SegSize::Bits(_) => {
                             return Err(
@@ -600,7 +606,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(bin)
     }
 
-    /// seg_bytes for a pre-evaluated size term (construction path).
+    /// The construction-path form of seg_bytes for a size term that was
+    /// evaluated earlier. The size must be a byte-aligned small int that is
+    /// not negative. Otherwise the code raises badarg.
     pub(crate) fn seg_bytes_from_value(
         &self,
         f: FunctionValue<'ctx>,
@@ -648,7 +656,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)
     }
 
-    /// A small constant binary term (e.g. io:nl's newline).
+    /// A small constant binary term, for example the newline of io:nl.
     pub(crate) fn compile_binary_const_term(
         &self,
         f: FunctionValue<'ctx>,

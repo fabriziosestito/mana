@@ -1,43 +1,59 @@
 //! LLVM codegen for the sequential Core Erlang subset.
 //!
-//! Term representation matches mana-rt (see its crate docs): i64 words,
-//! 3-bit tags — 001 small int, 010 atom ptr, 011 nil, 100 cons ptr,
-//! 000 boxed ptr (kinds: 0 tuple, 1 float, 2 fun). Tag 111 is the GC
-//! forwarding marker, never visible here.
+//! The term representation matches mana-rt (see its crate docs). A term is
+//! an i64 word with a 3-bit tag: 001 small int, 010 atom ptr, 011 nil,
+//! 100 cons ptr, 000 boxed ptr (kinds: 0 tuple, 1 float, 2 fun). Tag 111 is
+//! the GC forwarding marker. It is never visible here.
+//!
+//! # Modules
+//!
+//! `lib.rs` holds the `Cg` struct, the term constants that mirror the
+//! runtime, and shared small types. `driver.rs` holds `compile_program`, the
+//! object cache, and the action key. `effects.rs` holds the may-GC and
+//! may-raise analysis and its condensers. `reach.rs` holds reachability, the
+//! BIF module list, and the native manifest. `summary.rs` holds the analysis
+//! summaries (`<cache>/summary/`). The `cg/` directory holds the code
+//! emitters: `abi.rs`, `statics.rs`, `frame.rs`, `exc.rs`, `module.rs`,
+//! `expr.rs`, `closure.rs`, `arith.rs`, `case.rs`, `pattern.rs`,
+//! `binary.rs`, `bif.rs`, `bif_erlang.rs`, `bif_native.rs`, and `maps.rs`.
 //!
 //! # Process-context ABI
 //!
-//! Every compiled function takes `ctx: ptr` (mana-rt's `ProcCtx`) as its
-//! first argument. Codegen touches ctx only at word offset 2 (`roots_head`)
-//! for the root-frame chain; allocation goes through `mana_rt_alloc(ctx, n)`
-//! which may run a moving collection.
+//! Every compiled function takes `ctx: ptr` (the mana-rt `ProcCtx`) as its
+//! first argument. Codegen touches ctx at words 0 and 1 (the nursery bump),
+//! 2 (`roots_head`), 3 and 4 (the pending exception), 5 (reductions), and 6
+//! (`argv_spill`). Allocation goes through `mana_rt_alloc(ctx, n)`.
+//! This call can run a moving collection.
 //!
-//! # GC roots — effect analysis + frames + spills
+//! # GC roots: effect analysis, frames, and spills
 //!
-//! A term held in an SSA register is invalid after any *GC point* (a call
-//! into compiled code that may allocate, or an allocation). Three layers
-//! keep this sound without paying where it doesn't matter:
+//! A term held in an SSA register is invalid after any *GC point*. A GC
+//! point is a call into compiled code that can allocate, or an allocation.
+//! Three layers keep this sound and cost nothing where it does not matter:
 //!
-//! 1. Whole-program **may-GC analysis** (fixpoint over the call graph):
-//!    functions whose bodies can't reach an allocation get **no frame and
-//!    no spills** — pure register code (fib stays fast).
-//! 2. Framed functions alloca a root frame `[prev, len, slots...]`, link it
-//!    into `ctx.roots_head` on entry and unlink before every return
-//!    (including before tail calls). Slots are NIL-initialized; all named
-//!    variables live in slots; reads load, binds store.
-//! 3. Intermediates are spilled **structurally**: a sibling value is rooted
-//!    only if a later sibling's evaluation contains a GC point; children of
-//!    an allocation (tuple/cons/closure) are always rooted because the
-//!    allocation itself is a GC point. Call arguments consumed by a callee
-//!    need no rooting across that call (the callee roots its own params).
+//! 1. A whole-program **may-GC analysis** (a fixpoint over the call graph).
+//!    Functions whose bodies cannot reach an allocation get **no frame and
+//!    no spills**. They are pure register code (fib stays fast).
+//! 2. Framed functions alloca a root frame `[prev, len, slots...]`. They
+//!    link it into `ctx.roots_head` on entry. They unlink it before every
+//!    return, also before tail calls. Slots are NIL-initialized. All named
+//!    variables live in slots. A read loads the slot. A bind stores to it.
+//! 3. Codegen spills intermediates **structurally**. It roots a sibling
+//!    value only if the evaluation of a later sibling contains a GC point.
+//!    It always roots the children of an allocation (tuple/cons/closure),
+//!    because the allocation itself is a GC point. Call arguments that a
+//!    callee consumes need no root across that call. The callee roots its
+//!    own params.
 //!    TODO(liveness): per-variable liveness to shrink frames further.
 //!
-//! A program is one or more Core Erlang modules compiled to one object file
-//! per module. Atoms are `linkonce_odr` globals (linker-deduplicated,
-//! static, never collected). Closures are lambda-lifted in closure-passing
-//! style: lifted signature `(ctx, args..., closure)`.
+//! A program is one or more Core Erlang modules. Codegen compiles them to
+//! one object file per module. Atoms are `linkonce_odr` globals. The linker
+//! deduplicates them. They are static and never collected. Closures are
+//! lambda-lifted in closure-passing style. The lifted signature is
+//! `(ctx, args..., closure)`.
 //!
-//! Tail calls are guaranteed: uniform `tailcc` prototype + `musttail` (see NREG).
+//! Tail calls are guaranteed: a uniform `tailcc` prototype plus `musttail`
+//! (see NREG).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -77,10 +93,11 @@ pub(crate) use cg::*;
 pub(crate) use effects::*;
 pub(crate) use reach::*;
 
-/// One compilation input: its summary always present (from the summary
-/// cache or freshly computed); the AST only if this run parsed it. Codegen
-/// re-reads and re-parses on an object-cache miss when `ast` is None (the
-/// re-read verifies `source_hash` — modify-during-compile is a hard error).
+/// One compilation input. The summary is always present (from the summary
+/// cache or freshly computed). The AST is present only if this run parsed
+/// the file. On an object-cache miss with `ast` None, codegen reads and
+/// parses the file again. The re-read checks `source_hash`. A file that
+/// changed during the compile is a hard error.
 pub struct ModuleUnit {
     pub path: PathBuf,
     pub source_hash: [u8; 32],
@@ -110,7 +127,7 @@ pub(crate) const KIND_BIN: u64 = 5;
 
 pub(crate) const KIND_SUBBIN: u64 = 13;
 
-/// ctx word offsets (ProcCtx contract).
+/// ctx word offsets (the ProcCtx contract).
 pub(crate) const CTX_ROOTS: u64 = 2;
 
 pub(crate) const CTX_EXC_CLASS: u64 = 3;
@@ -119,30 +136,30 @@ pub(crate) const CTX_EXC_REASON: u64 = 4;
 
 pub(crate) const CTX_REDUCTIONS: u64 = 5;
 
-/// word 6: pointer to the per-scheduler argument spill area (uniform ABI)
+/// Word 6: pointer to the per-scheduler argument spill area (uniform ABI).
 pub(crate) const CTX_ARGV_SPILL: u64 = 6;
 
-/// Uniform compiled-function signature: `ctx` + NREG term words, and NREG
-/// is chosen so that EVERY parameter is register-passed on x86-64 SysV (6
-/// integer registers: ctx + 5). Every compiled function has exactly this
-/// LLVM prototype, so a `musttail` never needs stack argument space at
-/// all — which sidesteps both tailcc pitfalls we hit: (1) callee-cleanup
-/// popping more than a C entry reserved when the chain grows, and (2) the
-/// x86 backend emitting a bare `jmp` without storing a constant stack
+/// Uniform compiled-function signature: `ctx` + NREG term words. The value
+/// of NREG makes the ABI pass EVERY parameter in a register on x86-64 SysV
+/// (6 integer registers: ctx + 5). Every compiled function has exactly this
+/// LLVM prototype. So a `musttail` never needs stack argument space. This
+/// avoids both tailcc pitfalls that we hit. Pitfall (1): callee-cleanup
+/// popped more than a C entry reserved when the chain grew. Pitfall (2):
+/// the x86 backend emitted a bare `jmp` without a store of a constant stack
 /// argument (`c5(a,b,c,d,e) -> a6(a,b,c,d,e,[])` compiled to `jmp a6`).
-/// Arity > NREG passes args NREG-1.. through the ctx spill area, written
-/// by the caller right before the call and read by the callee prologue
-/// before anything else runs.
+/// Arity > NREG passes args NREG-1.. through the ctx spill area. The caller
+/// writes them right before the call. The callee prologue reads them before
+/// anything else runs.
 pub(crate) const NREG: usize = 5;
 
-/// Reserved non-term word (tag 0b101): "an exception is unwinding".
+/// Reserved non-term word (tag 0b101). It means "an exception is unwinding".
 pub(crate) const EXC_SENTINEL: u64 = 0b101;
 
 pub(crate) type CgResult<T> = Result<T, String>;
 
 pub(crate) type GcSet = HashSet<(String, FunName)>;
 
-/// Disjoint memory classes for TBAA (never alias each other).
+/// Disjoint memory classes for TBAA. They never alias each other.
 #[derive(Clone, Copy)]
 pub(crate) enum MemKind {
     Ctx,
@@ -150,23 +167,24 @@ pub(crate) enum MemKind {
     Heap,
 }
 
-/// Where a variable's current value lives.
+/// Where the current value of a variable lives.
 #[derive(Clone, Copy)]
 pub(crate) enum Binding<'ctx> {
-    /// Frame slot index (framed functions — survives GC).
+    /// A frame slot index (framed functions). It survives GC.
     Slot(u64),
-    /// SSA value (frameless functions — no GC can occur).
+    /// An SSA value (frameless functions). No GC can occur.
     Reg(IntValue<'ctx>),
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct Scope<'ctx> {
     pub(crate) vars: HashMap<String, Binding<'ctx>>,
-    /// letrec-bound funs: lifted function + frame slot of the shared closure.
+    /// letrec-bound funs: the lifted function and the frame slot of the
+    /// shared closure.
     pub(crate) funs: HashMap<FunName, (FunctionValue<'ctx>, u64)>,
 }
 
-/// A lambda-lifted function whose body still needs compiling.
+/// A lambda-lifted function. Codegen did not compile its body yet.
 pub(crate) struct Lift {
     pub(crate) f_index: usize,
     pub(crate) params: Vec<String>,
@@ -189,45 +207,49 @@ pub(crate) struct Cg<'ctx, 'p> {
     pub(crate) module_name: String,
     pub(crate) gc_set: &'p GcSet,
     pub(crate) raise_set: &'p GcSet,
-    // TBAA: ctx words / frame slots / heap objects never alias
+    // TBAA: ctx words, frame slots, and heap objects never alias.
     pub(crate) tbaa_kind: u32,
     pub(crate) tbaa_ctx: inkwell::values::MetadataValue<'ctx>,
     pub(crate) tbaa_frame: inkwell::values::MetadataValue<'ctx>,
     pub(crate) tbaa_heap: inkwell::values::MetadataValue<'ctx>,
-    // per-function state
+    // Per-function state.
     pub(crate) cur_ctx: Cell<Option<PointerValue<'ctx>>>,
     pub(crate) cur_frame: Cell<Option<PointerValue<'ctx>>>,
-    /// raise-path compilation: allocations go to the eternal allocator
+    /// Raise-path compilation: allocations go to the eternal allocator.
     pub(crate) eternal_alloc: Cell<bool>,
-    /// unique-name counter for static byte arrays (wide segment constants)
+    /// Unique-name counter for static byte arrays (wide segment constants).
     pub(crate) static_bytes_count: Cell<usize>,
-    /// exported functions compiled in this module → mana_exports entries
+    /// Exported functions compiled in this module. They become mana_exports
+    /// entries.
     pub(crate) exports: RefCell<Vec<(FunName, FunctionValue<'ctx>)>>,
-    /// modules the program references but that are not compiled: calls to
-    /// them poison the calling function (stub) instead of failing the build
+    /// Modules that the program references but that are not compiled. A call
+    /// to one of them poisons the calling function (stub). It does not fail
+    /// the build.
     pub(crate) missing_modules: RefCell<HashSet<String>>,
-    /// (module, behaviour) pairs for the mana_behaviours section
+    /// (module, behaviour) pairs for the mana_behaviours section.
     pub(crate) behaviours: RefCell<Vec<(String, String)>>,
     pub(crate) is_entry_module: Cell<bool>,
-    /// innermost enclosing try handler blocks (current function)
+    /// Innermost try handler blocks around the current point (current
+    /// function).
     pub(crate) handlers: RefCell<Vec<BasicBlock<'ctx>>>,
-    /// lazily created per-function "pop frame; return sentinel" block
+    /// Per-function "pop frame; return sentinel" block, created on first use.
     pub(crate) propagate_bb: Cell<Option<BasicBlock<'ctx>>>,
     pub(crate) var_slots: RefCell<HashMap<String, u64>>,
     pub(crate) next_slot: Cell<u64>,
     pub(crate) slot_cap: Cell<u64>,
-    /// slot high-water mark: frame len + memset are patched down to this
-    /// once the body is compiled (the prepass cap is an over-approximation)
+    /// Slot high-water mark. After the body compiles, codegen patches the
+    /// frame len and the memset down to this value. The prepass cap is an
+    /// over-approximation.
     pub(crate) peak_slot: Cell<u64>,
     pub(crate) frame_memset: Cell<Option<InstructionValue<'ctx>>>,
     pub(crate) frame_len_store: Cell<Option<InstructionValue<'ctx>>>,
-    /// leading slots holding params/captures — written before the first GC
-    /// point, so the entry memset skips them
+    /// Leading slots that hold params and captures. Codegen writes them
+    /// before the first GC point. So the entry memset skips them.
     pub(crate) frame_skip: Cell<u64>,
 }
 
-/// A child value of an allocation: rooted in a frame slot, or (raise-path /
-/// frameless) held in SSA.
+/// A child value of an allocation. It is rooted in a frame slot, or held in
+/// SSA (raise path or frameless).
 pub(crate) enum Rooted<'ctx> {
     Slot(u64),
     Val(IntValue<'ctx>),
@@ -235,9 +257,9 @@ pub(crate) enum Rooted<'ctx> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DiscKey {
-    /// immediate term word (small int, nil)
+    /// Immediate term word (small int, nil).
     Word(u64),
-    /// first byte of a binary subject
+    /// First byte of a binary subject.
     Byte0(u8),
 }
 
@@ -247,7 +269,7 @@ pub(crate) enum CaseVals<'ctx> {
 }
 
 /// A parsed bitstring segment spec `(size, unit, type, flags)`. Byte-aligned
-/// subset only; sub-byte sizes are TODO(bitstring).
+/// subset only. Sub-byte sizes are TODO(bitstring).
 pub(crate) struct SegSpec {
     pub(crate) little: bool,
     pub(crate) signed: bool,
@@ -260,12 +282,13 @@ pub(crate) enum SegKind {
     Utf8,
 }
 
-/// Size in BYTES: constant, 'all' (binary rest), or computed at runtime
-/// (`expr * unit` bits; the byte-alignment check happens at runtime).
+/// Size in BYTES: constant, 'all' (the binary rest), or computed at runtime
+/// (`expr * unit` bits). The byte-alignment check happens at runtime.
 pub(crate) enum SegSize {
     Bytes(u64),
-    /// constant bit count that is NOT a byte multiple (nibble reads in
-    /// Code.Identifier.escape etc.) — patterns only, static prefix only
+    /// A constant bit count that is NOT a byte multiple (for example the
+    /// nibble reads in Code.Identifier.escape). Patterns only. Static prefix
+    /// only.
     Bits(u64),
     All,
     Dyn { size: Expr, unit: i64 },
@@ -320,8 +343,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         raise_set: &'p GcSet,
     ) -> Self {
         let module = ctx.create_module(module_name);
-        // TBAA tree: three disjoint scalar classes under one root. Lets LLVM
-        // keep heap_top/frame slots in registers across heap stores.
+        // TBAA tree: three disjoint scalar classes under one root. This lets
+        // LLVM keep heap_top and frame slots in registers across heap stores.
         let i64t = ctx.i64_type();
         let root = ctx.metadata_node(&[ctx.metadata_string("mana-tbaa").into()]);
         let mk_tag = |name: &str| {
@@ -374,12 +397,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// `(ctx, term × arity) -> term`
-    /// Named compiled functions use LLVM's `tailcc`: with the C convention a
-    /// callee taking >6 integer args gets stack-passed arguments, and a
-    /// `tail` hint on such a call is NOT honored — the call stays a real
-    /// call and a self-recursive server loop (gen_server:loop/7) grows the
-    /// coroutine stack by one frame per iteration until it faults. `tailcc`
-    /// guarantees `musttail` regardless of arity. Pointers that escape to
-    /// the runtime (exports table, program entry) go through `ccc_wrapper`.
+    /// Named compiled functions use the LLVM `tailcc` convention. With the C
+    /// convention, a callee that takes >6 integer args gets stack-passed
+    /// arguments. LLVM does NOT honor a `tail` hint on such a call. The call
+    /// stays a real call. A self-recursive server loop (gen_server:loop/7)
+    /// then grows the coroutine stack by one frame per iteration until it
+    /// faults. `tailcc` guarantees `musttail` for every arity. Pointers that
+    /// escape to the runtime (exports table, program entry) go through
+    /// `ccc_wrapper`.
     pub(crate) const TAILCC: u32 = 18; // LLVMCallConv: tailcc
 }

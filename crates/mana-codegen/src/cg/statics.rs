@@ -1,11 +1,18 @@
+//! Static data of one object file. This module builds constant terms as LLVM
+//! globals: small ints, nil, atoms, binaries, and boxed constants. It also
+//! emits the closed-world atom table, the behaviours table, the export table,
+//! and the object file. Boxed constants are content-addressed linkonce_odr
+//! globals. The linker keeps one copy of each symbol in the program. The code
+//! never allocates a constant per evaluation, and the GC never copies one.
+
 use crate::*;
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    // ---- constants ----
+    // Constants
 
     pub(crate) fn small_int(&self, n: i64) -> IntValue<'ctx> {
-        // literals outside the small range arrive as Literal::Big (lexer
-        // threshold is 2^60); internal callers pass trusted small values
+        // Literals outside the small range arrive as Literal::Big. The lexer
+        // threshold is 2^60. Internal callers pass trusted small values.
         debug_assert!((-(1i64 << 60)..(1i64 << 60)).contains(&n));
         self.i64t.const_int(((n as u64) << 3) | TAG_SMALL, false)
     }
@@ -14,8 +21,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.i64t.const_int(NIL, false)
     }
 
-    /// The (deduped, linkonce_odr) atom struct global for `name`. Creating it
-    /// also puts the atom into the program's closed-world atom table.
+    /// The deduped linkonce_odr atom struct global for `name`. The first call
+    /// for a name also puts the atom into the closed-world atom table of the
+    /// program.
     pub(crate) fn atom_global(&self, name: &str) -> GlobalValue<'ctx> {
         let mut atoms = self.atoms.borrow_mut();
         match atoms.get(name) {
@@ -33,8 +41,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 g.set_initializer(&init);
                 g.set_constant(true);
                 g.set_alignment(8);
-                // Same atom name → same symbol in every object; the linker
-                // keeps exactly one, giving program-wide identity.
+                // The same atom name gives the same symbol in every object.
+                // The linker keeps exactly one. That gives program-wide
+                // identity.
                 g.set_linkage(Linkage::LinkOnceODR);
                 atoms.insert(name.to_string(), g);
                 g
@@ -53,10 +62,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)
     }
 
-    /// A fully-constant binary as a static term: [header | bytes], content-
-    /// addressed linkonce_odr symbol (deduped program-wide by the linker).
-    /// Never allocated, never copied — forward_major passes non-heap boxed
-    /// terms through.
+    /// A fully constant binary as a static term. The layout is [header | bytes]
+    /// in a content-addressed linkonce_odr symbol. The linker dedups the
+    /// symbol program-wide. The term is never allocated and never copied,
+    /// because forward_major leaves boxed terms that are not on the heap
+    /// unchanged.
     pub(crate) fn static_binary(&self, bytes: &[u8]) -> CgResult<IntValue<'ctx>> {
         let sym = format!(
             "mana_bin.{}",
@@ -83,15 +93,19 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)
     }
 
-    /// A fully-constant term (literal, or tuple/cons/binary whose parts are
-    /// all constant) as an LLVM constant `i64`. Boxed constants become
-    /// content-addressed linkonce_odr globals like `static_binary`: built
-    /// once at link time, never allocated per evaluation, never copied by
-    /// the GC (only nursery pointers are forwarded; constants hold only
-    /// immediates and other constants, so majors have nothing to scan).
-    /// Motivating shape: Elixir's `Base` reads `element(i, {4096 chars})`
-    /// four times per 6 input bytes — allocating that tuple each time made
-    /// url_encode64 150x slower than BEAM. None: not constant.
+    /// A fully constant term as an LLVM constant `i64`. The term is a literal,
+    /// or a tuple, cons, or binary whose parts are all constant. Boxed
+    /// constants become content-addressed linkonce_odr globals, like
+    /// `static_binary`. The linker builds them once. The code never allocates
+    /// them per evaluation, and the GC never copies them. The GC forwards only
+    /// nursery pointers. Constants hold only immediates and other constants,
+    /// so a major GC has nothing to scan in them.
+    ///
+    /// The motivating shape comes from the Elixir module `Base`. It reads
+    /// `element(i, {4096 chars})` four times per 6 input bytes. When the code
+    /// allocated that tuple each time, url_encode64 was 150x slower than BEAM.
+    ///
+    /// Returns None when the term is not constant.
     pub(crate) fn const_term(&self, f: FunctionValue<'ctx>, e: &Expr) -> CgResult<Option<IntValue<'ctx>>> {
         Ok(Some(match e {
             Expr::Lit(Literal::Int(n)) => self.small_int(*n),
@@ -100,7 +114,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let g = self.atom_global(a);
                 g.as_pointer_value()
                     .const_to_int(self.i64t)
-                    .const_add(self.i64t.const_int(TAG_ATOM, false)) // 8-aligned: add == or
+                    .const_add(self.i64t.const_int(TAG_ATOM, false)) // 8-aligned, so add == or
             }
             Expr::Lit(Literal::Float(x)) => {
                 let header = self.i64t.const_int((1 << 8) | KIND_FLOAT, false);
@@ -108,8 +122,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.const_boxed("mana_flt", &[header, bits], 0)
             }
             Expr::Binary(segs) if binary_all_const(segs) => {
-                // compile_binary_construct returns the static term for an
-                // all-constant binary (no builder instructions emitted)
+                // For an all-constant binary, compile_binary_construct returns
+                // the static term and emits no builder instructions.
                 let mut scope = Scope::default();
                 self.compile_binary_construct(f, segs, &mut scope)?
             }
@@ -135,9 +149,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }))
     }
 
-    /// Emit `words` as a constant global and return its address (| tag).
-    /// Keyed by the words' printed form so equal constants share a symbol
-    /// within the module; linkonce_odr dedups across modules.
+    /// Emits `words` as a constant global and returns its address combined
+    /// with `tag`. The symbol key is the printed form of the words, so equal
+    /// constants share a symbol within the module. The linkonce_odr linkage
+    /// dedups across modules.
     pub(crate) fn const_boxed(&self, prefix: &str, words: &[IntValue<'ctx>], tag: u64) -> IntValue<'ctx> {
         let key: String = words
             .iter()
@@ -161,11 +176,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         if tag == 0 {
             addr
         } else {
-            addr.const_add(self.i64t.const_int(tag, false)) // 8-aligned: add == or
+            addr.const_add(self.i64t.const_int(tag, false)) // 8-aligned, so add == or
         }
     }
 
-    /// An internal constant byte array; returns its pointer.
+    /// An internal constant byte array. Returns its pointer.
     pub(crate) fn static_bytes(&self, bytes: &[u8]) -> CgResult<PointerValue<'ctx>> {
         let data = self.ctx.const_string(bytes, false);
         let n = self.static_bytes_count.get();
@@ -179,22 +194,25 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(g.as_pointer_value())
     }
 
-    // ---- output ----
+    // Output
 
-    /// Closed-world atom table: one pointer per atom static in the
-    /// `mana_atoms` ELF section (linkonce_odr → linker-deduped program-wide,
-    /// like the atoms themselves). Pinned via llvm.used so O2 can't discard
-    /// the otherwise-unreferenced globals. The runtime walks
-    /// __start_mana_atoms..__stop_mana_atoms for binary_to_atom.
+    /// Emits the closed-world atom table: one pointer per atom in the
+    /// `mana_atoms` ELF section. The pointers are linkonce_odr, so the linker
+    /// dedups them program-wide, like the atoms themselves. The llvm.used list
+    /// pins the globals. Without the pin, O2 can discard them, because nothing
+    /// else references them. The runtime walks
+    /// __start_mana_atoms..__stop_mana_atoms for binary_to_atom. The function
+    /// also emits the behaviours table and the export table.
     pub(crate) fn emit_atom_table(&self) {
         let atoms = self.atoms.borrow();
         if atoms.is_empty() {
             return;
         }
-        // behaviours table: (module_atom, behaviour_atom) raw-pointer pairs
-        // in the `mana_behaviours` section, for module_info(:attributes)
-        // the entry module anchors the section so its __start/__stop
-        // symbols always exist (a zeroed pair the runtime skips)
+        // The behaviours table holds (module_atom, behaviour_atom) raw-pointer
+        // pairs in the `mana_behaviours` section, for module_info(:attributes).
+        // The entry module anchors the section, so its __start/__stop symbols
+        // always exist. The anchor is a self-referential pair that the runtime
+        // skips.
         if self.is_entry_module.get() && self.behaviours.borrow().is_empty() {
             self.behaviours
                 .borrow_mut()
@@ -228,12 +246,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         };
         let mut used: Vec<PointerValue<'ctx>> = Vec::with_capacity(atoms.len());
         used.extend(behaviour_refs);
-        // export table entries: {mod_atom, fun_atom, arity, code} in the
-        // `mana_exports` section (raw pointers; the runtime tags them)
+        // Export table entries are {mod_atom, fun_atom, arity, c_code, fun_code}
+        // in the `mana_exports` section. The atoms are raw pointers. The
+        // runtime tags them.
         let export_list: Vec<(FunName, FunctionValue<'ctx>)> = self.exports.borrow().clone();
         for (fname, code) in export_list.iter() {
             let c_code = self.ccc_wrapper(*code, fname.arity);
-            // the closure-convention body make_fun/3 hands out (args ++ [fun])
+            // The closure-convention body. Fun objects from make_fun/3 carry
+            // it. It takes (args ++ [fun]).
             let fun_code = self.fun_shim(None, fname).expect("fun shim for an export");
             let m = atoms
                 .get(self.module_name.as_str())

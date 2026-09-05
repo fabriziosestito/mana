@@ -15,9 +15,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     ) -> CgResult<Option<IntValue<'ctx>>> {
         let v: CgResult<IntValue<'ctx>> = match (name, argv.len()) {
             ("+", 2) | ("-", 2) | ("*", 2) | ("div", 2) | ("rem", 2) => {
-                // both-small inline (no allocation, no raise); anything else
-                // takes the runtime slow path (floats box without triggering
-                // GC — see box_float — so this is NOT a may-gc site)
+                // The inline path handles two small integers. It does not
+                // allocate and does not raise. All other operands take the
+                // runtime slow path. Floats box without a GC (see
+                // box_float), so this call is NOT a may-gc site.
                 let opcode = match name {
                     "+" => 0u64,   // AR_ADD
                     "-" => 1,      // AR_SUB
@@ -29,7 +30,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             ("-", 1) => self.arith_fastslow(f, "neg", 6, argv[0], None),
             ("+", 1) => {
-                // +X is a no-op for numbers; badarith otherwise
+                // +X returns a number unchanged. Any other term raises badarith.
                 let both = self.small_test(argv[0], None)?;
                 let slow = self.ctx.append_basic_block(f, "pos.slow");
                 let merge = self.ctx.append_basic_block(f, "pos.merge");
@@ -38,7 +39,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .build_conditional_branch(both, merge, slow)
                     .map_err(be)?;
                 self.builder.position_at_end(slow);
-                // float or junk: 0 + X coerces/validates
+                // The operand is a float or junk. The runtime computes 0 + X.
+                // This returns the float unchanged or raises badarith.
                 let zero = self.i64t.const_int(1, false); // small 0
                 let call = self
                     .builder
@@ -64,8 +66,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             ("<", 2) | ("=<", 2) | (">", 2) | (">=", 2) | ("==", 2) | ("/=", 2)
             | ("=:=", 2) | ("=/=", 2) => {
-                // fast path: both small ints (tagging is order-preserving);
-                // slow path: full Erlang term order in the runtime
+                // The fast path compares two small integers. The tag layout
+                // keeps the integer order. The slow path uses the full
+                // Erlang term order in the runtime.
                 let pred = match name {
                     "<" => IntPredicate::SLT,
                     "=<" => IntPredicate::SLE,
@@ -179,8 +182,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             ("bnot", 1) => self.arith_fastslow(f, "bnot", 13, argv[0], None),
             ("bsl", 2) | ("bsr", 2) => {
-                // no inline fast path: shift semantics (negative amounts,
-                // 61-bit overflow abort) live in the runtime
+                // Shifts have no inline fast path. The runtime holds the
+                // shift rules: negative amounts and the 61-bit overflow abort.
                 let opcode = if name == "bsl" { 11u64 } else { 12 }; // AR_BSL/AR_BSR
                 let call = self
                     .builder
@@ -315,8 +318,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     ) -> CgResult<Option<IntValue<'ctx>>> {
         let v: CgResult<IntValue<'ctx>> = match (name, argv.len()) {
             ("raise", 3) => {
-                // re-raise with a dynamic class; the stacktrace argument is
-                // dropped — TODO(stacktraces)
+                // raise/3 raises again with a class that the caller chooses at
+                // run time. TODO(stacktraces): the code ignores the
+                // stacktrace argument.
                 let ctx = self.ctx_val();
                 self.mem_store(ctx, CTX_EXC_CLASS, argv[0], MemKind::Ctx)?;
                 self.mem_store(ctx, CTX_EXC_REASON, argv[1], MemKind::Ctx)?;
@@ -343,7 +347,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     )
                     .map_err(be)?;
                 let pid = call_result(call)?.into_int_value();
-                // 0 = not an arity-0 fun
+                // The runtime returns 0 when the argument is not a fun of arity 0.
                 let bad = self
                     .builder
                     .build_int_compare(IntPredicate::EQ, pid, self.i64t.const_zero(), "spawn.bad")
@@ -392,7 +396,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.atom_term("true")
             }
             ("monitor", 2) => {
-                // monitor(process, Pid) — first arg assumed 'process'
+                // monitor(process, Pid). The code does not check the first
+                // argument. It assumes the atom 'process'.
                 let call = self
                     .builder
                     .build_call(
@@ -449,8 +454,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 Ok(r)
             }
             ("process_flag", 2) => {
-                // dispatch on the flag name: trap_exit is real, the rest
-                // are accepted no-ops returning a plausible old value
+                // The runtime dispatches on the flag name. Only trap_exit has
+                // an effect. The runtime accepts the other flags, does
+                // nothing, and returns a plausible old value.
                 let call = self
                     .builder
                     .build_call(
@@ -472,7 +478,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("system_flag", 2) => {
-                // VM tuning knobs: accepted no-ops (badarg on unknown flags)
+                // system_flag/2 sets VM tuning options. The runtime accepts
+                // the known flags and does nothing. An unknown flag raises badarg.
                 let call = self
                     .builder
                     .build_call(
@@ -515,8 +522,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.atom_term("true")
             }
             ("!", 2) | ("send", 2) | ("send", 3) => {
-                // send/3's options (noconnect/nosuspend) are distribution
-                // concerns — ignored; it returns ok instead of the message
+                // The options of send/3 (noconnect, nosuspend) only matter for
+                // distribution. The code ignores them. send/3 returns ok, not
+                // the message.
                 self.builder
                     .build_call(
                         self.rt_send(),
@@ -581,7 +589,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let opts = match name {
                     "spawn_opt" => argv[3],
                     "spawn_link" => {
-                        // [link]
+                        // spawn_link/3 passes the option list [link].
                         let p = self.alloc_words_kind(2, true)?;
                         let link = self.atom_term("link")?;
                         self.store_word(p, 0, link)?;
@@ -834,13 +842,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.bool_term(c)
             }
             ("is_binary", 1) | ("is_bitstring", 1) => {
-                // byte-aligned only: binary <=> bitstring
+                // All binaries are byte-aligned. So is_binary and
+                // is_bitstring give the same answer.
                 let c = self.kind_test(f, argv[0], |s, header| {
                     let k = s
                         .builder
                         .build_and(header, s.i64t.const_int(0xff, false), "k")
                         .map_err(be)?;
-                    // bin (5) or sub-binary view (13)
+                    // The test accepts kind 5 (binary) and kind 13 (sub-binary view).
                     let k2 = s
                         .builder
                         .build_or(k, s.i64t.const_int(8, false), "k2")
@@ -968,9 +977,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("demonitor", 2) => {
-                // options: [flush] (and/or info) — flush is honored, the
-                // info return value approximated; options list is constant
-                // in practice so it is not inspected
+                // The option list holds flush, or info, or both. The code
+                // does not inspect the list, because callers pass a constant
+                // list in practice. It always flushes. The return value for
+                // info is an approximation: it is always true.
                 let call = self
                     .builder
                     .build_call(
@@ -1311,7 +1321,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("memory", 0) => {
-                // allocator stats over OUR heaps (values diverge from BEAM)
+                // memory/0 reports allocator statistics for the heaps of this
+                // runtime. The values differ from the values that BEAM reports.
                 let call = self
                     .builder
                     .build_call(
@@ -1340,10 +1351,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("garbage_collect", 0) => self.atom_term("true"),
-            // garbage_collect(Pid) — collection is implicit; report success
+            // The runtime collects garbage on its own schedule. garbage_collect/1
+            // starts no collection and reports success.
             ("garbage_collect", 1) => self.atom_term("true"),
             ("is_port", 1) => self.atom_term("false"),
-            // no distribution: everything lives on nonode@nohost
+            // There is no distribution. Every process lives on nonode@nohost.
             ("node", 0) | ("node", 1) => self.atom_term("nonode@nohost"),
             ("nodes", 0) | ("nodes", 1) => Ok(self.nil()),
             ("is_alive", 0) => self.atom_term("false"),
@@ -1631,7 +1643,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             | ("binary_to_atom", 2)
             | ("binary_to_existing_atom", 1)
             | ("binary_to_existing_atom", 2) => {
-                // encoding args (latin1/utf8) are irrelevant: names are utf8
+                // The code ignores the encoding argument (latin1 or utf8).
+                // Atom names are always utf8.
                 if name == "binary_to_atom" || name == "binary_to_existing_atom" {
                     let call = self
                         .builder
@@ -1708,7 +1721,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.check_exc(f, v)
             }
             ("element", 2) => {
-                // element(I, Tuple), 1-based; badarg on any misuse
+                // element(I, Tuple) counts from 1. A bad index, a bad index
+                // type, or a non-tuple raises badarg.
                 let (i, t) = (argv[0], argv[1]);
                 let ti = self.tag_of(i)?;
                 let i_ok = self

@@ -1,16 +1,22 @@
+//! Module compilation: declare every included function, compile each body,
+//! and emit `main` for the entry module.
+//!
+//! Contract: a function that the compiler cannot compile becomes a stub
+//! that prints a message and exits. A call into a module that is not
+//! compiled aborts at the call site. Both choices keep the may-raise
+//! analysis consistent.
+
 use crate::*;
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
-    // ---- module compilation ----
-
     pub(crate) fn compile(
         &self,
         ast: &Module,
         include: &HashSet<FunName>,
         entry: Option<&FunName>,
     ) -> CgResult<()> {
-        // module and function names are atoms on BEAM (so they satisfy
-        // binary_to_existing_atom, and S4's export table will need them)
+        // Module and function names are atoms on BEAM. They must satisfy
+        // binary_to_existing_atom, and the S4 export table will need them.
         self.atom_global(&ast.name);
         for b in &ast.behaviours {
             self.atom_global(b);
@@ -44,10 +50,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             if let Err(e) = self.compile_fn(fname, fun) {
                 // Function-granular poisoning: stdlib modules contain
-                // corners we don't compile yet (sub-byte bitstrings, ...).
-                // The function becomes a stub that reports and exits if a
-                // program ever actually reaches it. Lifts it had already
-                // queued get stubbed too (they were declared).
+                // corners that we do not compile yet (sub-byte bitstrings,
+                // and more). The function becomes a stub that reports and
+                // exits if a program reaches it. Lifts that this function
+                // already queued get stubbed too, because they were declared.
                 eprintln!(
                     "manac: warning: {}:{}/{} stubbed (unsupported: {})",
                     self.module_name, fname.name, fname.arity, e
@@ -73,14 +79,16 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// Wipe a half-compiled function and replace its body with a loud
-    /// runtime failure (print + exit). Aborting rather than raising keeps
-    /// the may-raise analysis consistent (callers may not check).
+    /// runtime failure (print + exit). The stub aborts and does not raise.
+    /// This keeps the may-raise analysis consistent, because callers do not
+    /// always check.
     pub(crate) fn emit_unsupported_stub(&self, f: FunctionValue<'ctx>, msg: &str) -> CgResult<()> {
-        // Never delete half-built blocks: erasing a block that another
-        // block still branches to corrupts the module (LLVM erase does not
-        // fix up uses — this manifested as glibc heap corruption). Instead,
-        // terminate every unterminated block and prepend a fresh entry;
-        // the old body becomes unreachable garbage that O2 removes.
+        // Never delete half-built blocks. If you erase a block that another
+        // block still branches to, the module becomes corrupt. LLVM erase
+        // does not fix up uses. This fault appeared as glibc heap
+        // corruption. Instead, terminate every unterminated block and
+        // prepend a fresh entry. The old body becomes unreachable garbage
+        // that O2 removes.
         for bb in f.get_basic_blocks() {
             if bb.get_terminator().is_none() {
                 self.builder.position_at_end(bb);
@@ -118,12 +126,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    /// A call into a module that isn't compiled: BEAM loads such code fine
-    /// and fails only when the call executes, so abort at the CALL SITE
-    /// (print + exit, like unsupported stubs — aborting keeps the
-    /// may-raise analysis consistent) instead of stubbing the whole
-    /// caller. Guarded dead branches (`if mix_available?(), do: Mix...`)
-    /// stay live. Returns a dummy value positioned in a dead block.
+    /// A call into a module that is not compiled. BEAM loads such code and
+    /// fails only when the call executes. So the abort happens at the CALL
+    /// SITE (print + exit, like unsupported stubs), and the whole caller is
+    /// not stubbed. The abort keeps the may-raise analysis consistent.
+    /// Guarded dead branches (`if mix_available?(), do: Mix...`) stay live.
+    /// Returns a dummy value, positioned in a dead block.
     pub(crate) fn emit_missing_call_abort(
         &self,
         f: FunctionValue<'ctx>,
@@ -161,10 +169,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(self.i64t.const_int(NIL, false))
     }
 
-    /// Functions BEAM implements in C (nif_error stubs in lists.erl and
-    /// binary.erl) get native bodies; true if this definition was handled.
-    /// Plans: (helper, drop_trailing_args, extra_const_args); helper ""
-    /// means the identity function (compile_pattern).
+    /// Functions that BEAM implements in C (nif_error stubs in lists.erl and
+    /// binary.erl) get native bodies. Returns true if this function handled
+    /// the definition. A plan is (helper, drop_trailing_args,
+    /// extra_const_args). The helper "" means the identity function
+    /// (compile_pattern).
     pub(crate) fn emit_native_override(&self, fname: &FunName) -> CgResult<bool> {
         const NIL_C: u64 = 0b011;
         const SMALL0: u64 = 0b001;
@@ -196,20 +205,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 ("binary", "list_to_bin", 1) => ("mana_rt_list_to_binary", 0, &[]),
                 ("binary", "referenced_byte_size", 1) => ("mana_rt_byte_size", 0, &[]),
                 ("binary", "compile_pattern", 1) => ("", 0, &[]),
-                // Elixir.Float decomposes IEEE bits with sub-bit segments
-                // (TODO(bitstring)); precision ops go native instead
-                // os.erl's time functions are nif_error stubs (real BIFs
-                // on BEAM); 2^30... the /0 const is 1_000_000_000 Hz =
-                // our native unit (nanoseconds)
+                // TODO(bitstring): Elixir.Float decomposes IEEE bits with
+                // sub-bit segments, so the precision ops go native (see the
+                // Elixir.Float entries below).
+                // The time functions of os.erl are nif_error stubs (real BIFs
+                // on BEAM). The constant for the /0 form is 1_000_000_000 Hz,
+                // that is, the native unit (nanoseconds).
                 ("os", "system_time", 0) => {
                     ("mana_rt_system_time", 0, &[(1_000_000_000u64 << 3) | 0b001])
                 }
                 ("os", "system_time", 1) => ("mana_rt_system_time", 0, &[]),
                 ("os", "getenv", 1) => ("mana_rt_os_getenv", 0, &[]),
-                // Compiler-gap overrides (AGENTS.md "BIF rule" #3) — Elixir
-                // library code we cannot compile yet. Delete each when its
-                // gap closes; never add one for code that compiles today.
-                // TODO(port): System.cmd is built on Erlang ports.
+                // Compiler-gap overrides (AGENTS.md "BIF rule" #3): Elixir
+                // library code that we cannot compile yet. Delete each entry
+                // when its gap closes. Never add one for code that compiles
+                // today.
+                // TODO(port): System.cmd uses Erlang ports.
                 ("Elixir.System", "cmd", 2) => ("mana_rt_system_cmd", 0, &[NIL_C]),
                 ("Elixir.System", "cmd", 3) => ("mana_rt_system_cmd", 0, &[]),
                 // TODO(bitstring): Float.round/ceil/floor decompose IEEE
@@ -226,9 +237,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .set(Some(f.get_nth_param(0).unwrap().into_pointer_value()));
         self.handlers.borrow_mut().clear();
         self.propagate_bb.set(None);
-        self.cur_frame.set(None); // frameless: single forwarding call
+        self.cur_frame.set(None); // frameless: the body is a single forwarding call
         if plan.0.is_empty() {
-            // identity (compile_pattern: patterns are plain binaries here)
+            // identity: compile_pattern patterns are plain binaries here
             let v = self.param_at(f, 0, fname.arity)?;
             self.builder.build_return(Some(&v)).map_err(be)?;
             return Ok(true);
@@ -248,7 +259,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.i64t.fn_type(&ps, false)
         });
         let call = self.builder.build_call(callee, &cargs, "natbif").map_err(be)?;
-        // raising convention: the sentinel propagates through our return
+        // raising convention: the sentinel propagates through the return value
         let v = call_result(call)?;
         self.builder.build_return(Some(&v)).map_err(be)?;
         Ok(true)
@@ -262,7 +273,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .set(Some(f.get_nth_param(0).unwrap().into_pointer_value()));
         self.handlers.borrow_mut().clear();
         self.propagate_bb.set(None);
-        // args first (the spill area is only valid until the next call)
+        // Read the args first. The spill area is only valid until the next call.
         let n = fun.params.len();
         let vals: Vec<IntValue> = (0..n).map(|i| self.param_at(f, i, n)).collect::<CgResult<_>>()?;
         self.setup_frame(&fun.body, &fun.params, &[])?;
@@ -278,10 +289,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         r
     }
 
-    /// Preemption point: decrement the reduction budget, yield to the
-    /// scheduler on exhaustion. Only in framed functions AFTER params are
-    /// rooted — yield points are GC points, and everything live is already
-    /// in frame slots here, so preemption costs no extra spills.
+    /// Preemption point: decrement the reduction budget, and yield to the
+    /// scheduler when the budget is exhausted. Only framed functions get this
+    /// check, and only AFTER the params are rooted. Yield points are GC
+    /// points. Everything live is already in frame slots here, so preemption
+    /// costs no extra spills.
     pub(crate) fn emit_reduction_check(&self, f: FunctionValue<'ctx>) -> CgResult<()> {
         if !self.framed() {
             return Ok(());
@@ -316,16 +328,16 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    /// Compile bodies of lambda-lifted funs queued during compilation.
+    /// Compile the bodies of the lambda-lifted funs that compilation queued.
     pub(crate) fn drain_lifts(&self) -> CgResult<()> {
         loop {
-            // NB: pop in its own statement — a `while let` scrutinee would
-            // hold the RefMut across the body, and bodies push new lifts.
+            // Pop in its own statement. A `while let` scrutinee holds the
+            // RefMut across the body, and bodies push new lifts.
             let next = self.pending.borrow_mut().pop();
             let Some(l) = next else { break };
             let f = self.lifted.borrow()[l.f_index];
             if let Err(e) = self.compile_lift(f, &l) {
-                // function-granular poisoning, same as named functions
+                // Function-granular poisoning, the same as for named functions.
                 eprintln!(
                     "manac: warning: {} lifted fun stubbed (unsupported: {})",
                     self.module_name, e
@@ -353,8 +365,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 var_names.push(closure_slot_name.clone());
             }
             let sib_names: Vec<FunName> = l.sibs.iter().map(|(n, _)| n.clone()).collect();
-            // args (incl. the trailing closure) first: the spill area is only
-            // valid until the next call
+            // Read the args first, with the trailing closure. The spill area
+            // is only valid until the next call.
             let n = l.params.len() + 1;
             let vals: Vec<IntValue> = (0..n).map(|i| self.param_at(f, i, n)).collect::<CgResult<_>>()?;
             self.setup_frame(&l.body, &var_names, &sib_names)?;
@@ -368,7 +380,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let closure = vals[l.params.len()];
             closure.set_name("closure");
             if !l.captures.is_empty() {
-                // loads happen before any GC point (entry, no allocs yet)
+                // The loads happen before any GC point: this is the entry,
+                // with no allocations yet.
                 let p = self
                     .builder
                     .build_int_to_ptr(closure, self.ptrt, "env.ptr")
@@ -380,9 +393,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
             }
             if !l.sibs.is_empty() && self.framed() {
-                // the closure term itself must be rooted for sibling calls;
-                // a member that never calls siblings can be frameless, in
-                // which case no sibling binding is ever consulted.
+                // The closure term itself must be rooted for sibling calls.
+                // A member that never calls siblings can be frameless. Then
+                // no sibling binding is ever consulted.
                 self.bind_var(&mut scope, &closure_slot_name, closure)?;
                 let Binding::Slot(cl_slot) = scope.vars[&closure_slot_name] else {
                     unreachable!("framed bind produced a register");
@@ -400,14 +413,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         Ok(())
     }
 
-    /// `mana_call_fun(ctx, x0..x5, code) -> term`: the runtime's C-ABI door
-    /// into fun bodies, which are `tailcc` with the uniform prototype (the
-    /// runtime cannot call tailcc code directly: callee-pop vs caller-pop).
+    /// `mana_call_fun(ctx, x0..x4, code) -> term`: the C-ABI door of the
+    /// runtime into fun bodies. Fun bodies are `tailcc` with the uniform
+    /// prototype. The runtime cannot call tailcc code directly (callee-pop
+    /// versus caller-pop).
     pub(crate) fn emit_call_fun_trampoline(&self) -> CgResult<()> {
         let mut params: Vec<BasicMetadataTypeEnum> =
             vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
         params.extend((0..NREG).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
-        params.push(BasicMetadataTypeEnum::PointerType(self.ptrt)); // code
+        params.push(BasicMetadataTypeEnum::PointerType(self.ptrt)); // the code pointer
         let t = self.module.add_function("mana_call_fun", self.i64t.fn_type(&params, false), None);
         let bb = self.ctx.append_basic_block(t, "entry");
         self.builder.position_at_end(bb);
@@ -427,7 +441,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     pub(crate) fn emit_main(&self, entry: &FunName) -> CgResult<()> {
         self.emit_call_fun_trampoline()?;
         // make_fun/3 of an uncompiled function: a uniform tailcc body that
-        // raises undef when the fun is applied
+        // raises undef when the program applies the fun.
         let undef = self.declare_compiled("mana_fun_undef", 0);
         {
             let bb = self.ctx.append_basic_block(undef, "entry");
@@ -450,8 +464,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_call(self.rt_init(), &[], "ctx")
             .map_err(be)?;
         let ctx = call_result(init)?.into_pointer_value();
-        // the runtime builds exit/monitor messages: hand it the well-known
-        // atom terms (atoms are compiler statics)
+        // The runtime builds exit and monitor messages, so it needs the
+        // well-known atom terms. Atoms are compiler statics.
         let names = [
             "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
             "badarg", "error", "badmap", "badkey", "undef", "ok", "module", "nofile",
@@ -465,8 +479,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .build_call(self.rt_register_atoms(), &atom_args, "")
             .map_err(be)?;
 
-        // seed elixir_config's URI scheme → default-port table (BEAM does
-        // this in elixir:start/2; the closed world skips that boot)
+        // Seed the table in elixir_config that maps URI schemes to default
+        // ports. BEAM does this in elixir:start/2. The closed world skips
+        // that boot.
         self.builder
             .build_call(
                 self.rt_p_void("mana_rt_seed_uri_defaults"),
