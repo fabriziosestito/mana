@@ -1,18 +1,22 @@
-use super::*;
+//! The `:re` module: regular expressions on the `regex` crate.
+//!
+//! `:re.version/0` returns "mana". As a result, the Elixir `Regex` module
+//! always recompiles a regex from its source at run time. Sigil literals
+//! carry opaque PCRE blobs that the BEAM compiled. This runtime cannot read
+//! them.
+//!
+//! Known divergences from the BEAM: the crate does not support
+//! backreferences or lookaround. The runtime ignores the firstline and
+//! ungreedy options.
 
-// ---------------------------------------------------------------------------
-// :re — regular expressions on the `regex` crate. `:re.version/0` returns
-// "mana" so Elixir's Regex always recompiles from source at runtime
-// (sigil literals carry opaque BEAM-compiled PCRE blobs we can't read).
-// Known divergences: no backreferences/lookaround (crate limitation),
-// firstline/ungreedy options ignored.
+use super::*;
 
 pub(crate) struct ReTable {
     pub(crate) by_key: std::collections::HashMap<String, usize>,
-    // Arc, not Regex: a `Regex` clone gets a fresh lazy-DFA cache pool, so
-    // cloning out of the table per call re-determinized the DFA on every
-    // run (~190K instructions for a trivial pattern). Sharing one Regex
-    // value keeps its cache warm across calls and threads.
+    // Arc, not Regex: a `Regex` clone gets a fresh lazy-DFA cache pool.
+    // A clone out of the table on each call re-determinized the DFA on
+    // every run (~190K instructions for a trivial pattern). One shared
+    // Regex value keeps its cache warm across calls and threads.
     pub(crate) regexes: Vec<std::sync::Arc<regex::Regex>>,
 }
 
@@ -29,15 +33,15 @@ pub(crate) struct ReFlags {
 pub(crate) struct ReRunOpts {
     pub(crate) global: bool,
     pub(crate) offset: usize,
-    pub(crate) capture_spec: u64,   // term: atom all/first/none/all_but_first/all_names or list
-    pub(crate) capture_type: u8,    // 0 index, 1 binary, 2 list
+    pub(crate) capture_spec: u64,   // term: an atom (all, first, none, all_but_first, all_names) or a list
+    pub(crate) capture_type: u8,    // 0 = index, 1 = binary, 2 = list
 }
 
 pub(crate) fn term_to_source(t: u64) -> Option<Vec<u8>> {
     if bin_parts(t).is_some() {
         return Some(bin_bytes(t).to_vec());
     }
-    // charlist
+    // Not a binary: the term must be a charlist.
     let mut out = Vec::new();
     let mut cur = t;
     loop {
@@ -60,7 +64,8 @@ pub(crate) fn term_to_source(t: u64) -> Option<Vec<u8>> {
     }
 }
 
-/// Intern (or fetch) a compiled regex; Err(msg) on bad pattern.
+/// Interns a compiled regex, or fetches the existing one. Returns Err(msg)
+/// for a bad pattern.
 pub(crate) fn re_intern(source: &str, fl: ReFlags) -> Result<usize, String> {
     let key = format!(
         "{}{}{}{}\0{}",
@@ -87,8 +92,9 @@ pub(crate) fn re_intern(source: &str, fl: ReFlags) -> Result<usize, String> {
     Ok(idx)
 }
 
-/// Options list → (compile flags, run opts). Unknown atoms are ignored
-/// (BEAM accepts many run options that don't apply here).
+/// Converts an options list to (compile flags, run opts). This function
+/// ignores unknown atoms. The BEAM accepts many run options that do not
+/// apply here.
 pub(crate) fn parse_re_opts(opts: u64) -> Result<(ReFlags, ReRunOpts), ()> {
     let mut fl = ReFlags::default();
     let mut run = ReRunOpts {
@@ -111,8 +117,9 @@ pub(crate) fn parse_re_opts(opts: u64) -> Result<(ReFlags, ReRunOpts), ()> {
                 b"dotall" => fl.dotall = true,
                 b"extended" => fl.extended = true,
                 b"global" => run.global = true,
-                // unicode/ucp are the crate default; the rest are accepted
-                // and ignored (firstline, ungreedy, anchored variations...)
+                // unicode and ucp are the crate default. This function
+                // accepts and ignores the rest (firstline, ungreedy, and
+                // the anchored variations).
                 _ => {}
             }
         } else if opt & TAG_MASK == TAG_BOXED && opt != 0 {
@@ -152,8 +159,9 @@ pub(crate) fn parse_re_opts(opts: u64) -> Result<(ReFlags, ReRunOpts), ()> {
     Ok((fl, run))
 }
 
-/// The subject pattern argument of run/compile: an interned handle
-/// {mana_re, Idx} or a source binary/charlist compiled with `fl`.
+/// Resolves the pattern argument of run/compile. The pattern is an interned
+/// handle {mana_re, Idx}, or a source binary or charlist that this function
+/// compiles with `fl`.
 pub(crate) fn re_resolve(pat: u64, fl: ReFlags) -> Result<usize, String> {
     if pat & TAG_MASK == TAG_BOXED && pat != 0 {
         let hp = pat as *const u64;
@@ -171,7 +179,8 @@ pub(crate) fn re_resolve(pat: u64, fl: ReFlags) -> Result<usize, String> {
     re_intern(&s, fl)
 }
 
-/// One capture group as a term per capture_type. Unmatched: {-1,0} / <<>> / [].
+/// Builds one capture group as a term, per capture_type. An unmatched group
+/// becomes {-1,0}, <<>>, or [].
 pub(crate) fn cap_term(ctx: &mut ProcCtx, hay: &[u8], g: Option<(usize, usize)>, ty: u8) -> u64 {
     match ty {
         0 => {
@@ -199,7 +208,7 @@ pub(crate) fn cap_term(ctx: &mut ProcCtx, hay: &[u8], g: Option<(usize, usize)>,
 }
 
 /// :re.run/3. Returns {match, Caps} | {match, [Caps]} (global) | match |
-/// nomatch, or raises badarg on bad patterns/options.
+/// nomatch. Raises badarg for a bad pattern or bad options.
 #[no_mangle]
 pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -223,7 +232,6 @@ pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts
     };
     let none_a = || find_atom("none").unwrap_or(NIL);
     let _ = none_a;
-    // collect matches
     let mut all: Vec<Vec<Option<(usize, usize)>>> = Vec::new();
     let mut pos = run.offset.min(hay_str.len());
     loop {
@@ -241,7 +249,7 @@ pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts
         pos = if whole.end() > whole.start() {
             whole.end()
         } else {
-            // empty match: advance one char
+            // An empty match: advance by one char.
             match hay_str[whole.end()..].chars().next() {
                 Some(c) => whole.end() + c.len_utf8(),
                 None => break,
@@ -251,11 +259,10 @@ pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts
     if all.is_empty() {
         return find_atom("nomatch").expect("nomatch atom");
     }
-    // capture :none → bare 'match'
+    // With capture :none, the result is the bare atom 'match'.
     if run.capture_spec & TAG_MASK == TAG_ATOM && atom_bytes(run.capture_spec) == b"none" {
         return find_atom("match").expect("match atom");
     }
-    // select groups per spec
     let names: Vec<Option<String>> = re
         .capture_names()
         .map(|n| n.map(|s| s.to_string()))
@@ -275,12 +282,12 @@ pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts
                     named.sort_by(|a, b| a.0.cmp(&b.0));
                     named.into_iter().map(|(_, g)| g).collect()
                 }
-                _ => groups.clone(), // all (and default)
+                _ => groups.clone(), // all, and the default
             }
         } else if spec == 0 {
             groups.clone()
         } else {
-            // list of names (binaries/atoms) or indices
+            // The spec is a list of names (binaries or atoms) or indices.
             let mut out = Vec::new();
             let mut cur = spec;
             while cur != NIL && cur & TAG_MASK == TAG_CONS {
@@ -305,7 +312,8 @@ pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts
             out
         }
     };
-    // build result list(s) back-to-front with rooting
+    // Build the result lists back to front. The partial list stays rooted
+    // across each allocation.
     let build_caps = |ctx: &mut ProcCtx, groups: &Vec<Option<(usize, usize)>>| -> u64 {
         let sel = select(groups);
         let saved = ctx.roots_head;
@@ -347,7 +355,6 @@ pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts
     } else {
         build_caps(ctx, &all[0])
     };
-    // {match, Payload}
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, payload];
     fr[0] = saved;
@@ -362,7 +369,7 @@ pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts
     t as u64
 }
 
-/// :re.compile/2 → {ok, {mana_re, Idx}} | {error, {Reason, 0}}.
+/// :re.compile/2. Returns {ok, {mana_re, Idx}} | {error, {Reason, 0}}.
 #[no_mangle]
 pub extern "C" fn mana_rt_re_compile(ctx: *mut ProcCtx, pat: u64, opts: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -377,7 +384,6 @@ pub extern "C" fn mana_rt_re_compile(ctx: *mut ProcCtx, pat: u64, opts: u64) -> 
     };
     match re_intern(&srcs, fl) {
         Ok(idx) => {
-            // {ok, {mana_re, Idx}}
             let inner = alloc_nursery(ctx, 3);
             unsafe {
                 *inner = (2 << 8) | KIND_TUPLE;
@@ -398,7 +404,7 @@ pub extern "C" fn mana_rt_re_compile(ctx: *mut ProcCtx, pat: u64, opts: u64) -> 
             t as u64
         }
         Err(msg) => {
-            // {error, {ErrString(charlist), 0}}
+            // The error reason is a charlist, not a binary.
             let saved = ctx.roots_head;
             let mut fr = [0u64, 2, 0, 0];
             fr[0] = saved;
@@ -423,7 +429,8 @@ pub extern "C" fn mana_rt_re_compile(ctx: *mut ProcCtx, pat: u64, opts: u64) -> 
     }
 }
 
-/// :re.inspect/2 (:namelist) → {namelist, [<<name>>]} sorted.
+/// :re.inspect/2 with :namelist. Returns {namelist, [<<name>>]} with the
+/// names sorted.
 #[no_mangle]
 pub extern "C" fn mana_rt_re_inspect(ctx: *mut ProcCtx, pat: u64, _what: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };

@@ -1,9 +1,13 @@
+//! Number terms: bignums (`KIND_BIGNUM`), boxed floats, and the arithmetic
+//! slow path. The limb math lives in `mod bigint`. Every constructor in this
+//! module allocates in the nursery or in the shared old space. No function
+//! in this module is a GC point.
+
 use super::*;
 
-// ---------------------------------------------------------------------------
-// bignums (KIND_BIGNUM) — limb math lives in mod bigint
+// Bignums
 
-/// (negative, limbs) of a bignum term.
+/// Returns (negative, limbs) of a bignum term.
 pub(crate) fn bignum_parts(t: u64) -> Option<(bool, &'static [u64])> {
     if t & TAG_MASK != TAG_BOXED || t == 0 {
         return None;
@@ -19,12 +23,12 @@ pub(crate) fn bignum_parts(t: u64) -> Option<(bool, &'static [u64])> {
     ))
 }
 
-/// Is this term an integer (small or bignum)?
+/// Returns true if the term is an integer (small or bignum).
 pub(crate) fn is_int_term(t: u64) -> bool {
     t & TAG_MASK == TAG_SMALL || bignum_parts(t).is_some()
 }
 
-/// (negative, magnitude) of any integer term.
+/// Returns (negative, magnitude) of any integer term.
 pub(crate) fn int_mag(t: u64) -> Option<(bool, Vec<u64>)> {
     if t & TAG_MASK == TAG_SMALL {
         let v = t as i64 >> 3;
@@ -37,11 +41,12 @@ pub(crate) fn int_mag(t: u64) -> Option<(bool, Vec<u64>)> {
     bignum_parts(t).map(|(neg, l)| (neg, l.to_vec()))
 }
 
-/// THE integer constructor: small when it fits (the small range is
-/// -2^60 ..= 2^60-1), shared-old-space bignum otherwise. Never a GC point.
+/// The single integer constructor. The result is a small when the value fits
+/// the small range -2^60 ..= 2^60-1. Otherwise the result is a bignum in the
+/// shared old space. This function is never a GC point.
 pub(crate) fn make_int_mag(ctx: &mut ProcCtx, negative: bool, mag: &[u64]) -> u64 {
     if mag.is_empty() {
-        return TAG_SMALL; // zero
+        return TAG_SMALL; // the small integer zero
     }
     if mag.len() == 1 {
         let v = mag[0];
@@ -60,7 +65,7 @@ pub(crate) fn make_int_mag(ctx: &mut ProcCtx, negative: bool, mag: &[u64]) -> u6
     p as u64
 }
 
-/// Eternal bignum (literals, no ctx available).
+/// Builds an eternal bignum for literals. No `ctx` is available at that point.
 pub(crate) fn make_int_mag_eternal(negative: bool, mag: &[u64]) -> u64 {
     debug_assert!(!mag.is_empty());
     let p = alloc_space(1 + mag.len());
@@ -73,7 +78,8 @@ pub(crate) fn make_int_mag_eternal(negative: bool, mag: &[u64]) -> u64 {
     p as u64
 }
 
-/// Interned eternal big-literal terms, keyed by their decimal text.
+/// Returns the interned eternal term of a big literal. The key is the decimal
+/// text of the literal.
 #[no_mangle]
 pub extern "C" fn mana_rt_big_literal(ptr: *const u8, len: u64) -> u64 {
     static TABLE: std::sync::Mutex<
@@ -96,7 +102,7 @@ pub extern "C" fn mana_rt_big_literal(ptr: *const u8, len: u64) -> u64 {
     t
 }
 
-/// Exact comparison of two INTEGER terms (small or bignum).
+/// Exact comparison of two integer terms (small or bignum).
 pub(crate) fn int_cmp_exact(a: u64, b: u64) -> i64 {
     if a & TAG_MASK == TAG_SMALL && b & TAG_MASK == TAG_SMALL {
         let (x, y) = (a as i64 >> 3, b as i64 >> 3);
@@ -104,7 +110,7 @@ pub(crate) fn int_cmp_exact(a: u64, b: u64) -> i64 {
     }
     let (na, ma) = int_mag(a).expect("int_cmp_exact: not an integer");
     let (nb, mb) = int_mag(b).expect("int_cmp_exact: not an integer");
-    // normalized zero has an empty magnitude and negative=false
+    // A normalized zero has an empty magnitude and negative=false.
     if na != nb {
         return if na { -1 } else { 1 };
     }
@@ -116,8 +122,7 @@ pub(crate) fn int_cmp_exact(a: u64, b: u64) -> i64 {
     if na { -r } else { r }
 }
 
-// ---------------------------------------------------------------------------
-// floats & arithmetic
+// Floats and arithmetic
 
 pub(crate) fn raise_badarith(ctx: &mut ProcCtx) -> u64 {
     ctx.exc_class = atom_error();
@@ -125,11 +130,12 @@ pub(crate) fn raise_badarith(ctx: &mut ProcCtx) -> u64 {
     EXC_SENTINEL
 }
 
-/// Box an f64 WITHOUT ever triggering a collection: nursery bump if there
-/// is room, otherwise the shared old space (non-moving; majors only run at
-/// safepoints, which a BIF call is not). This keeps arithmetic out of the
-/// may-GC effect set — integer loops stay frameless. Cost: floats born
-/// while the nursery is full live until the next major.
+/// Boxes an f64 and never starts a collection. The float goes in the nursery
+/// if there is room. Otherwise it goes in the shared old space. The old space
+/// does not move. Majors run only at safepoints, and a BIF call is not a
+/// safepoint. This keeps arithmetic out of the may-GC effect set, so integer
+/// loops stay frameless. Cost: a float born while the nursery is full lives
+/// until the next major.
 pub(crate) fn box_float(ctx: &mut ProcCtx, f: f64) -> u64 {
     let p = unsafe {
         if ctx.heap_top.add(2) <= ctx.heap_end {
@@ -149,8 +155,9 @@ pub(crate) fn box_float(ctx: &mut ProcCtx, f: f64) -> u64 {
     p as u64
 }
 
-/// Float literal pattern test: is `t` a float with exactly these bits?
-/// Non-allocating (safe inside match contexts).
+/// Float literal pattern test. Returns 1 if `t` is a float with exactly the
+/// bits `bits`. This function does not allocate, so it is safe inside match
+/// contexts.
 #[no_mangle]
 pub extern "C" fn mana_rt_float_pat(t: u64, bits: u64) -> u64 {
     if t & TAG_MASK != TAG_BOXED || t == 0 {
@@ -160,8 +167,9 @@ pub extern "C" fn mana_rt_float_pat(t: u64, bits: u64) -> u64 {
     unsafe { (*p & 0xff == KIND_FLOAT && *p.add(1) == bits) as u64 }
 }
 
-/// Numeric coercion for arithmetic; None = not a number → badarith.
-/// Bignums coerce to their (possibly rounded) f64 for float-mixed ops.
+/// Numeric coercion for arithmetic. `None` means the term is not a number,
+/// and the caller raises badarith. A bignum coerces to its f64 for
+/// float-mixed operations. That f64 can be rounded.
 pub(crate) fn num_of(t: u64) -> Option<(f64, bool)> {
     if t & TAG_MASK == TAG_SMALL {
         return Some(((t as i64 >> 3) as f64, true));
@@ -179,12 +187,12 @@ pub(crate) fn num_of(t: u64) -> Option<(f64, bool)> {
     None
 }
 
-// arithmetic opcodes for mana_rt_arith
 pub(crate) fn abort_bignum(what: &str) -> ! {
     eprintln!("mana: TODO(bignum): {}", what);
     std::process::exit(1);
 }
 
+// Arithmetic opcodes for mana_rt_arith.
 pub const AR_ADD: u64 = 0;
 
 pub const AR_SUB: u64 = 1;
@@ -213,7 +221,7 @@ pub const AR_BSR: u64 = 12;
 
 pub const AR_BNOT: u64 = 13;
 
-/// Signed magnitude addition helper: (na, ma) + (nb, mb).
+/// Signed magnitude addition: (na, ma) + (nb, mb).
 pub(crate) fn int_signed_add(na: bool, ma: &[u64], nb: bool, mb: &[u64]) -> (bool, Vec<u64>) {
     if na == nb {
         return (na, bigint::mag_add(ma, mb));
@@ -225,15 +233,16 @@ pub(crate) fn int_signed_add(na: bool, ma: &[u64], nb: bool, mb: &[u64]) -> (boo
     }
 }
 
-/// Integer arithmetic (small or bignum operands) with promotion/demotion.
-/// Results allocate in shared old space — never a GC point.
+/// Integer arithmetic on small or bignum operands, with promotion and
+/// demotion. Results allocate in the shared old space. This function is never
+/// a GC point.
 pub(crate) fn int_arith(ctx: &mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
     let (na, ma) = int_mag(a).unwrap();
     match op {
         AR_NEG => return make_int_mag(ctx, !na && !ma.is_empty(), &ma),
         AR_ABS => return make_int_mag(ctx, false, &ma),
         AR_BNOT => {
-            // bnot(x) = -x - 1
+            // bnot(x) = -x - 1.
             return if na {
                 make_int_mag(ctx, false, &bigint::mag_sub(&ma, &[1]))
             } else {
@@ -260,7 +269,7 @@ pub(crate) fn int_arith(ctx: &mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
             if mb.is_empty() {
                 return raise_badarith(ctx);
             }
-            // truncating division; rem takes the dividend's sign (Erlang)
+            // The division truncates. In Erlang, rem takes the sign of the dividend.
             let (q, r) = bigint::mag_divrem(&ma, &mb);
             if op == AR_IDIV {
                 make_int_mag(ctx, (na != nb) && !q.is_empty(), &q)
@@ -277,7 +286,7 @@ pub(crate) fn int_arith(ctx: &mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
         }
         AR_BAND | AR_BOR | AR_BXOR => {
             if a & TAG_MASK == TAG_SMALL && b & TAG_MASK == TAG_SMALL {
-                // exact for all smalls (results never leave the small range)
+                // Exact for all smalls. The results never leave the small range.
                 let (x, y) = (a as i64 >> 3, b as i64 >> 3);
                 let r = match op {
                     AR_BAND => x & y,
@@ -287,8 +296,8 @@ pub(crate) fn int_arith(ctx: &mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
                 return ((r << 3) as u64) | TAG_SMALL;
             }
             if na || nb {
-                // infinite-two's-complement on negative bignums: the fiddly
-                // corner nothing on our paths needs yet
+                // A negative bignum needs infinite two's-complement bit
+                // operations. No current path needs this corner.
                 abort_bignum("bit op on a negative bignum (TODO(bignum-bitops))");
             }
             let n = std::cmp::max(ma.len(), mb.len());
@@ -304,13 +313,13 @@ pub(crate) fn int_arith(ctx: &mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
             make_int_mag(ctx, false, &bigint::normalize(out))
         }
         AR_BSL | AR_BSR => {
-            // shift counts must be smalls (a bignum-sized shift would be an
-            // absurd allocation; BEAM raises system_limit far earlier)
+            // The shift count must be a small. A bignum-sized shift is an
+            // absurd allocation. BEAM raises system_limit far earlier.
             if b & TAG_MASK != TAG_SMALL {
                 return raise_badarith(ctx);
             }
             let y = b as i64 >> 3;
-            // Erlang: a negative count reverses direction
+            // In Erlang, a negative count reverses the direction.
             let n = if op == AR_BSR { -y } else { y };
             if n >= 0 {
                 let m = bigint::mag_shl(&ma, n as u64);
@@ -318,7 +327,7 @@ pub(crate) fn int_arith(ctx: &mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
             } else {
                 let k = (-n) as u64;
                 if na {
-                    // floor semantics: x >> k = -((|x| - 1) >> k) - 1
+                    // Floor semantics: x >> k = -((|x| - 1) >> k) - 1.
                     let m = bigint::mag_shr(&bigint::mag_sub(&ma, &[1]), k);
                     make_int_mag(ctx, true, &bigint::mag_add(&m, &[1]))
                 } else {
@@ -331,10 +340,11 @@ pub(crate) fn int_arith(ctx: &mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
     }
 }
 
-/// Arithmetic slow path: anything that isn't the inline both-small-int
-/// fast case (including small overflow, which promotes to bignums here).
-/// Mixed/float ops produce boxed floats; non-numbers and integer-only ops
-/// on floats raise badarith like BEAM.
+/// Arithmetic slow path. It handles every case that is not the inline
+/// both-small-int fast case. This includes small overflow, which promotes to
+/// a bignum here. Mixed and float operations produce boxed floats. A
+/// non-number raises badarith. An integer-only operation on a float raises
+/// badarith. This matches BEAM.
 #[no_mangle]
 pub extern "C" fn mana_rt_arith(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -342,7 +352,7 @@ pub extern "C" fn mana_rt_arith(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u
     if is_int_term(a) && (unary || is_int_term(b)) {
         return int_arith(ctx, op, a, b);
     }
-    // bit ops are integer-only: no float coercion
+    // Bit operations are integer-only. There is no float coercion.
     if let AR_BAND | AR_BOR | AR_BXOR | AR_BSL | AR_BSR | AR_BNOT = op {
         return raise_badarith(ctx);
     }
@@ -367,13 +377,14 @@ pub extern "C" fn mana_rt_arith(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u
             }
             box_float(ctx, x / y)
         }
-        // div/rem are integer-only → at least one float here → badarith
+        // div and rem are integer-only. At least one operand is a float here.
         AR_IDIV | AR_REM => raise_badarith(ctx),
         _ => raise_badarith(ctx),
     }
 }
 
-/// math module (all f64; domain errors are badarith like BEAM).
+/// The math module. All operations work on f64. A domain error raises
+/// badarith, like BEAM.
 #[no_mangle]
 pub extern "C" fn mana_rt_math(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -382,7 +393,7 @@ pub extern "C" fn mana_rt_math(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u6
     };
     let y = match num_of(b) {
         Some((y, _)) => y,
-        None => 0.0, // unary ops pass a dummy small 0
+        None => 0.0, // Unary operations pass a dummy small 0.
     };
     let r = match op {
         0 => x.sqrt(),
@@ -421,7 +432,7 @@ pub extern "C" fn mana_rt_to_float(ctx: *mut ProcCtx, t: u64) -> u64 {
     }
 }
 
-/// trunc/round/floor/ceil → integers (mode 0..3).
+/// trunc, round, floor, and ceil to an integer. `mode` is 0..3 in that order.
 #[no_mangle]
 pub extern "C" fn mana_rt_f2i(ctx: *mut ProcCtx, mode: u64, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -444,10 +455,12 @@ pub extern "C" fn mana_rt_f2i(ctx: *mut ProcCtx, mode: u64, t: u64) -> u64 {
     make_int_mag(ctx, r < 0.0 && !mag.is_empty(), &mag)
 }
 
-/// Elixir.Float round/ceil/floor with decimal precision (mode 0/1/2).
-/// Elixir operates on the shortest decimal representation of the float;
-/// formatting at the target precision reproduces that (half-to-even ties,
-/// matching Rust's formatter and Elixir's documented behavior).
+/// Elixir.Float round, ceil, and floor with a decimal precision. `mode` is
+/// 0, 1, or 2 in that order. Elixir operates on the shortest decimal
+/// representation of the float. This function formats the float at the
+/// target precision, and that reproduces the Elixir result. Ties round half
+/// to even. This matches the Rust formatter and the documented Elixir
+/// behavior.
 #[no_mangle]
 pub extern "C" fn mana_rt_float_prec(ctx: *mut ProcCtx, t: u64, prec: u64, mode: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -478,10 +491,11 @@ pub extern "C" fn mana_rt_float_prec(ctx: *mut ProcCtx, t: u64, prec: u64, mode:
     box_float(ctx, r)
 }
 
-/// erlang:display's float format: C-style %e with 6 fractional digits and
-/// a signed two-digit exponent (1.000000e+00, 1.234568e+05, 1.000000e-05).
+/// The float format of erlang:display. It is C-style %e with 6 fractional
+/// digits and a signed two-digit exponent. Examples: 1.000000e+00,
+/// 1.234568e+05, 1.000000e-05.
 pub(crate) fn display_float(f: f64) -> String {
-    let s = format!("{:.6e}", f); // Rust: "1.000000e0" / "1.234568e5"
+    let s = format!("{:.6e}", f); // Rust writes "1.000000e0" or "1.234568e5".
     match s.split_once('e') {
         Some((mant, exp)) => {
             let (sign, digits) = match exp.strip_prefix('-') {
@@ -494,16 +508,16 @@ pub(crate) fn display_float(f: f64) -> String {
     }
 }
 
-/// BEAM-parity float text: shortest round-trip with a mandatory decimal
-/// point, exponent form matching OTP's Ryu-based printer (1.0, 0.1,
-/// 1.0e20, 1.0e-5, -0.0).
+/// BEAM-parity float text: the shortest round-trip form with a mandatory
+/// decimal point. The exponent form matches the Ryu-based printer of OTP.
+/// Examples: 1.0, 0.1, 1.0e20, 1.0e-5, -0.0.
 pub(crate) fn fmt_float(f: f64) -> String {
     if f == f64::INFINITY || f == f64::NEG_INFINITY || f.is_nan() {
-        return "nan_or_inf".into(); // unreachable: terms never hold these
+        return "nan_or_inf".into(); // Unreachable. Terms never hold these values.
     }
-    let s = format!("{:?}", f); // Rust shortest round-trip
+    let s = format!("{:?}", f); // The Rust shortest round-trip form.
     if let Some(epos) = s.find(['e', 'E']) {
-        // Rust: "1e20"; Erlang: "1.0e20"
+        // Rust writes "1e20". Erlang writes "1.0e20".
         let (m, e) = s.split_at(epos);
         let mant = if m.contains('.') { m.to_string() } else { format!("{}.0", m) };
         return format!("{}{}", mant, e);
@@ -514,9 +528,10 @@ pub(crate) fn fmt_float(f: f64) -> String {
     s
 }
 
-/// erlang:float_to_binary/1,2 and float_to_list — options: [:short]
-/// (shortest round-trip), {:decimals, N} (+ :compact trims zeros); no
-/// options = %e like BEAM.
+/// erlang:float_to_binary/1,2 and float_to_list. The options are: [:short]
+/// for the shortest round-trip form, and {:decimals, N}. With {:decimals, N},
+/// :compact trims the zeros at the end. With no options, the output is %e like
+/// BEAM.
 #[no_mangle]
 pub extern "C" fn mana_rt_float_to_binary(ctx: *mut ProcCtx, t: u64, opts: u64, as_list: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -575,7 +590,8 @@ pub extern "C" fn mana_rt_float_to_binary(ctx: *mut ProcCtx, t: u64, opts: u64, 
     }
 }
 
-/// erlang:binary_to_float/1 and list_to_float/1 (bytes pre-flattened).
+/// erlang:binary_to_float/1 and list_to_float/1. The caller flattens the bytes
+/// first.
 #[no_mangle]
 pub extern "C" fn mana_rt_parse_float(ctx: *mut ProcCtx, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -605,7 +621,7 @@ pub extern "C" fn mana_rt_parse_float(ctx: *mut ProcCtx, t: u64) -> u64 {
         Ok(s) => s,
         Err(_) => return raise_badarg(ctx),
     };
-    // BEAM requires a decimal point ("1" is badarg for binary_to_float)
+    // BEAM requires a decimal point. For binary_to_float, "1" is badarg.
     if !s.contains('.') {
         return raise_badarg(ctx);
     }

@@ -1,7 +1,15 @@
+//! Garbage collection: promotion at send time, scheduler-local minor
+//! collection, and stop-the-world major collection.
+//!
+//! The contract: no scheduler holds a reference into the nursery of another
+//! scheduler. Send-time promotion keeps this true. As a result, a minor
+//! collection needs only the old-space lock. A major collection parks every
+//! other scheduler at a safepoint, evacuates all nurseries, and compacts the
+//! old space into one fresh chunk.
+
 use super::*;
 
-// ---------------------------------------------------------------------------
-// promotion: copy young parts of a term into the shared old space
+// Promotion
 
 pub(crate) fn term_in_nursery(ctx: &ProcCtx, t: u64) -> bool {
     match t & TAG_MASK {
@@ -11,11 +19,13 @@ pub(crate) fn term_in_nursery(ctx: &ProcCtx, t: u64) -> bool {
     }
 }
 
-/// Deep-copy every part of `t` living in this scheduler's nursery into the
-/// shared old space. Old/eternal/immediate parts pass zero-copy. The source
-/// is not mutated (no forwarding), so sharing within one message flattens —
-/// the same trade BEAM's copying send makes. Iterative: payloads can be
-/// arbitrarily deep and this runs on a small coroutine stack.
+/// Deep-copy every part of `t` that lives in the nursery of this scheduler
+/// into the shared old space. Old, eternal, and immediate parts pass with no
+/// copy. The function does not write to the source (no forwarding). As a
+/// result, the copy duplicates a part that is shared inside one message.
+/// The copying send of BEAM makes the same trade. The loop is iterative
+/// because a payload can be very deep and this code runs on a small
+/// coroutine stack.
 pub(crate) fn promote_term(ctx: &mut ProcCtx, t: u64) -> u64 {
     if !term_in_nursery(ctx, t) {
         return t;
@@ -53,7 +63,7 @@ pub(crate) fn promote_term(ctx: &mut ProcCtx, t: u64) -> u64 {
     root
 }
 
-/// Copy one object (shallow) into old space, preserving the tag.
+/// Shallow-copy one object into the old space. The result keeps the tag of `t`.
 pub(crate) fn promote_copy(ctx: &ProcCtx, old: &mut OldSpace, t: u64) -> u64 {
     let g = ctx.global;
     unsafe {
@@ -77,10 +87,9 @@ pub(crate) fn promote_copy(ctx: &ProcCtx, old: &mut OldSpace, t: u64) -> u64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// allocation & GC
+// Allocation and GC
 
-/// Allocation slow path (compiled code bumps the nursery inline).
+/// The allocation slow path. Compiled code bumps the nursery inline.
 #[no_mangle]
 pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 {
     let ctx = unsafe { &mut *ctx };
@@ -91,7 +100,7 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
     if g.old_used.load(Ordering::Relaxed) > g.old_limit.load(Ordering::Relaxed) {
         stw_major(ctx);
     }
-    // adaptive nursery: grow until minors rarely promote
+    // Adaptive nursery: grow it until minor collections rarely promote.
     let grow_to = if words > ctx.nursery_words {
         usize::max(ctx.nursery_words * 2, words * 2)
     } else if promoted > ctx.nursery_words / 16 {
@@ -99,8 +108,8 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
     } else {
         0
     };
-    // the stress pin (MANA_NURSERY_WORDS) suppresses adaptive growth but
-    // must still honor requests that cannot fit the pinned nursery
+    // The stress pin (MANA_NURSERY_WORDS) stops adaptive growth. A request
+    // that cannot fit the pinned nursery must still grow it.
     let must_grow = words * 2 > ctx.nursery_words;
     if grow_to > 0 && (nursery_words_override().is_none() || must_grow) {
         unsafe { free_space(ctx.nursery_start, ctx.nursery_words) };
@@ -117,16 +126,18 @@ pub extern "C" fn mana_rt_alloc_slow(ctx: *mut ProcCtx, words: u64) -> *mut u64 
     }
 }
 
-/// Eternal objects are write-once: their fields can reference the
-/// ALLOCATING scheduler's current nursery only until that scheduler's next
-/// minor forwards them — afterwards they point old/static forever. Minors
-/// therefore scan only the fresh ones (this list); the permanent registry
-/// is walked at majors (old-space compaction). Scanning the whole registry
-/// per minor made keepalive GC quadratic (eternals accrue per request).
+/// Eternal objects are write-once. Their fields can reference the current
+/// nursery of the ALLOCATING scheduler only until the next minor collection
+/// of that scheduler forwards them. After that, they point to old or static
+/// terms forever. A minor collection therefore scans only the fresh eternals
+/// (this list). A major collection (old-space compaction) walks the
+/// permanent registry. A scan of the whole registry per minor collection
+/// made keepalive GC quadratic, because eternals accrue per request.
 pub(crate) static FRESH_ETERNALS: std::sync::Mutex<Vec<(usize, bool, usize)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Raise-path allocations: never moved; fields scanned by collections.
+/// Allocation for the raise path. The object never moves. Collections scan
+/// its fields.
 #[no_mangle]
 pub extern "C" fn mana_rt_alloc_eternal(ctx: *mut ProcCtx, words: u64, is_cons: u64) -> *mut u64 {
     let ctx = unsafe { &*ctx };
@@ -139,7 +150,7 @@ pub extern "C" fn mana_rt_alloc_eternal(ctx: *mut ProcCtx, words: u64, is_cons: 
     p
 }
 
-/// Walk one process's saved GC root slots with `f`.
+/// Apply `f` to each saved GC root slot of one process.
 pub(crate) unsafe fn walk_proc_roots(p: &mut Process, mut f: impl FnMut(*mut u64)) {
     unsafe {
         let mut frame = p.saved_roots as *mut u64;
@@ -157,10 +168,11 @@ pub(crate) unsafe fn walk_proc_roots(p: &mut Process, mut f: impl FnMut(*mut u64
     walk_proc_shared_roots(p, f);
 }
 
-/// Live shared state that stays valid even while the process is swapped in:
-/// the pdict and a pending exit reason. Unlike the saved_* fields these must
-/// be forwarded for RUNNING processes too — majors free every old chunk, and
-/// pd_put promotes into old space.
+/// Apply `f` to the live shared state of one process: the pdict and a
+/// pending exit reason. This state stays valid while the process is swapped
+/// in. Unlike the saved_* fields, a collection must forward it for RUNNING
+/// processes too. A major collection frees every old chunk, and pd_put
+/// promotes into the old space.
 pub(crate) fn walk_proc_shared_roots(p: &mut Process, mut f: impl FnMut(*mut u64)) {
     {
         let mut pd = p.pdict.lock();
@@ -175,10 +187,10 @@ pub(crate) fn walk_proc_shared_roots(p: &mut Process, mut f: impl FnMut(*mut u64
     }
 }
 
-/// Scheduler-local minor collection: copy live nursery objects into the
+/// Scheduler-local minor collection: copy the live nursery objects into the
 /// shared old space. Nothing outside this scheduler references its nursery
-/// (send-time promotion), so the only synchronization is the old-space
-/// lock held for the duration.
+/// (send-time promotion). As a result, the only synchronization is the
+/// old-space lock, held for the whole collection.
 pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
     let g = ctx.global;
     let used_before = g.old_used.load(Ordering::Relaxed);
@@ -186,7 +198,7 @@ pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
     let mut old = g.old.lock();
 
     unsafe {
-        // current process: live chain is in ctx
+        // The live root chain of the current process is in ctx.
         let mut frame = ctx.roots_head as *mut u64;
         while !frame.is_null() {
             let len = *frame.add(1) as usize;
@@ -199,10 +211,11 @@ pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
         ctx.exc_class = forward_minor(ctx, &mut old, ctx.exc_class, &mut worklist);
         ctx.exc_reason = forward_minor(ctx, &mut old, ctx.exc_reason, &mut worklist);
 
-        // suspended processes pinned to this scheduler. Messages: drain
-        // ingress into private first, then scan private. Anything arriving
-        // concurrently from another scheduler is old (send promotes), so it
-        // is safe to leave in ingress unscanned.
+        // Suspended processes pinned to this scheduler. For messages, drain
+        // ingress into private first, then scan private. A message that
+        // arrives from another scheduler during the scan is old (send
+        // promotes). It is safe to leave that message in ingress without a
+        // scan.
         {
             let tab = g.procs.read();
             for (id, slot) in tab.iter().enumerate() {
@@ -212,11 +225,12 @@ pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
                     continue;
                 }
                 if id != ctx.current {
-                    // clean parked processes cannot reference this nursery:
-                    // their roots were forwarded by the minor that cleared
-                    // the flag, and gaining new refs (running / receiving a
-                    // message) re-sets it. This keeps minors O(active
-                    // processes), not O(all processes).
+                    // A clean parked process cannot reference this nursery.
+                    // The minor collection that cleared the flag forwarded
+                    // its roots. A new reference (the process runs, or it
+                    // receives a message) sets the flag again. This keeps a
+                    // minor collection O(active processes), not O(all
+                    // processes).
                     if !p.dirty.swap(false, Ordering::AcqRel) {
                         continue;
                     }
@@ -224,9 +238,9 @@ pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
                         *s = forward_minor(ctx, &mut old, *s, &mut worklist);
                     });
                 } else {
-                    // pd_put promotes, so this is normally a pass-through;
-                    // it keeps the pdict correct even if a nursery term ever
-                    // lands there.
+                    // pd_put promotes, so this walk is normally a
+                    // pass-through. It keeps the pdict correct if a nursery
+                    // term ever lands there.
                     walk_proc_shared_roots(p, |s| {
                         *s = forward_minor(ctx, &mut old, *s, &mut worklist);
                     });
@@ -238,10 +252,11 @@ pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
             }
         }
 
-        // eternal objects (exception reasons) may reference this nursery —
-        // but only the ones allocated on THIS scheduler since its last
-        // minor (write-once: after one forwarding pass their fields are
-        // old/static forever). The full registry is majors-only.
+        // Eternal objects (exception reasons) can reference this nursery, but
+        // only the ones allocated on THIS scheduler since its last minor
+        // collection. Eternals are write-once: after one forwarding pass,
+        // their fields are old or static forever. Only a major collection
+        // walks the full registry.
         {
             let mut fresh = FRESH_ETERNALS.lock().unwrap();
             fresh.retain(|&(pa, is_cons, sid)| {
@@ -279,8 +294,9 @@ pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
     promoted
 }
 
-/// Apply `f` to each term-field slot of the object at `p`.
-/// For cons cells pass `is_cons` (no header); boxed objects self-describe.
+/// Apply `f` to each term-field slot of the object at `p`. A cons cell has
+/// no header, so pass `is_cons` for it. A boxed object describes itself in
+/// its header.
 pub(crate) unsafe fn scan_fields(p: *mut u64, is_cons: bool, f: &mut impl FnMut(*mut u64)) {
     unsafe {
         if is_cons {
@@ -305,7 +321,7 @@ pub(crate) unsafe fn scan_fields(p: *mut u64, is_cons: bool, f: &mut impl FnMut(
                     f(p.add(1 + i));
                 }
             }
-            // sub-binary views: the parent binary is a term field
+            // Sub-binary view: the parent binary is a term field.
             KIND_SUBBIN => f(p.add(1)),
             _ => {}
         }
@@ -364,7 +380,7 @@ pub(crate) unsafe fn forward_minor(
     }
 }
 
-// ---- stop-the-world major collection ----
+// Stop-the-world major collection
 
 /// Park at a safepoint while another scheduler runs a major collection.
 pub(crate) fn park_if_stw(ctx: &mut ProcCtx) {
@@ -384,15 +400,15 @@ pub(crate) fn park_if_stw(ctx: &mut ProcCtx) {
     }
 }
 
-/// Request a stop-the-world major collection; runs once every other
-/// scheduler has parked at a safepoint.
+/// Request a stop-the-world major collection. The collection runs after
+/// every other scheduler parked at a safepoint.
 pub(crate) fn stw_major(ctx: &mut ProcCtx) {
     let g = ctx.global;
     {
         let mut stw = g.stw.lock();
         if stw.collecting {
             drop(stw);
-            park_if_stw(ctx); // someone else is collecting: follow
+            park_if_stw(ctx); // Another scheduler collects. Park with it.
             return;
         }
         stw.collecting = true;
@@ -416,13 +432,13 @@ pub(crate) fn stw_major(ctx: &mut ProcCtx) {
     g.stw_cv.notify_all();
 }
 
-/// All other schedulers are parked: evacuate every nursery, then compact
+/// All other schedulers are parked. Evacuate every nursery, then compact
 /// the old space into one fresh chunk.
 pub(crate) fn major_collect_stw(ctx: &mut ProcCtx) {
     let g = ctx.global;
     let used_before = g.old_used.load(Ordering::Relaxed);
 
-    // 1. evacuate every scheduler's nursery (their ctxs are quiescent)
+    // 1. Evacuate the nursery of every scheduler. Their ctxs are quiescent.
     for id in 0..g.n_scheds {
         let octx = g.scheds[id].ctx_addr.load(Ordering::Acquire) as *mut ProcCtx;
         if octx.is_null() {
@@ -431,15 +447,15 @@ pub(crate) fn major_collect_stw(ctx: &mut ProcCtx) {
         minor_collect(unsafe { &mut *octx });
     }
 
-    // 2. full copy of the old space, single-threaded
+    // 2. Full copy of the old space, on one thread.
     let mut old = g.old.lock();
     let live_bound = g.old_used.load(Ordering::Relaxed);
     let to_words = usize::max(live_bound, OLD_CHUNK_WORDS);
     let to_space = alloc_space(to_words);
     let mut top = to_space;
     let mut worklist: Vec<u64> = Vec::new();
-    // from-space extents: only terms inside these move; everything else
-    // (eternals, compiler statics) passes through untouched
+    // From-space extents. Only terms inside these move. Everything else
+    // (eternals, compiler statics) passes through untouched.
     let from: Vec<(usize, usize)> = old
         .chunks
         .iter()
@@ -447,9 +463,9 @@ pub(crate) fn major_collect_stw(ctx: &mut ProcCtx) {
         .collect();
     let from = &from[..];
 
-    // pids currently swapped into a scheduler: their LIVE state is in the
-    // ctx (walked below); their saved_* fields are stale from the last
-    // yield and must not be scanned.
+    // Pids that are swapped into a scheduler now. Their LIVE state is in the
+    // ctx (walked below). Their saved_* fields are stale from the last yield
+    // and must not be scanned.
     let mut running: Vec<usize> = Vec::new();
 
     unsafe {
@@ -484,14 +500,14 @@ pub(crate) fn major_collect_stw(ctx: &mut ProcCtx) {
                         *s = forward_major(*s, from, &mut top, &mut worklist);
                     });
                 } else {
-                    // running: saved_* fields are stale, but the pdict and
-                    // pending_kill are live and hold old-space terms — the
-                    // from-space is about to be freed.
+                    // Running process: the saved_* fields are stale, but the
+                    // pdict and pending_kill are live and hold old-space
+                    // terms. The from-space is about to be freed.
                     walk_proc_shared_roots(p, |s| {
                         *s = forward_major(*s, from, &mut top, &mut worklist);
                     });
                 }
-                drain_ingress(p); // everyone is parked: no concurrent pushes
+                drain_ingress(p); // Everyone is parked: no concurrent pushes.
                 for m in p.private.iter_mut() {
                     *m = forward_major(*m, from, &mut top, &mut worklist);
                 }
@@ -537,11 +553,11 @@ pub(crate) fn major_collect_stw(ctx: &mut ProcCtx) {
     }
 }
 
-/// Boxed/cons terms outside the from-space chunks — eternal mallocs and
-/// compiler statics (binaries, funs) — are never moved and never get a
-/// forwarding header written into them: writes to `.rodata` fault, and the
-/// eternal registry scan must keep seeing real headers. Their fields are
-/// updated via the eternal registry walk instead.
+/// Boxed and cons terms outside the from-space chunks are eternal mallocs
+/// and compiler statics (binaries, funs). They never move, and this function
+/// never writes a forwarding header into them. A write to `.rodata` faults,
+/// and the eternal registry scan must keep seeing real headers. The eternal
+/// registry walk updates their fields instead.
 pub(crate) unsafe fn forward_major(
     t: u64,
     from: &[(usize, usize)],

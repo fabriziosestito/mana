@@ -1,12 +1,13 @@
+//! erlang:decode_packet/3 for the http_bin and httph_bin packet types only.
+//! The HTTP/1 parser of Bandit uses these types. Each call is stateless. The
+//! result shapes match the erts packet_parser. The Conf.DecodePacket
+//! conformance program checks every shape against BEAM.
+
 use super::*;
 
-// ---------------------------------------------------------------------------
-// erlang:decode_packet/3 — http_bin/httph_bin only (Bandit's HTTP/1 parser).
-// Stateless per call, mirroring erts packet_parser shapes; the
-// Conf.DecodePacket conformance program pins every shape against BEAM.
-
-/// erts' known-header table: atom text + the index reported in the
-/// http_header tuple's second element.
+/// The known-header table of erts. Each entry holds the atom text. The
+/// position of an entry gives the index in the second element of the
+/// http_header tuple.
 pub(crate) const HTTP_FIELDS: &[&str] = &[
     "Cache-Control",
     "Connection",
@@ -64,8 +65,9 @@ pub(crate) const HTTP_FIELDS: &[&str] = &[
 
 pub(crate) const HTTP_METHODS: &[&str] = &["OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE"];
 
-/// Canonical-case a header name the way erts does: capitalize the first
-/// letter of every dash-separated token, lowercase the rest.
+/// Convert a header name to canonical case the way erts does. The function
+/// capitalizes the first letter of every dash-separated token. It lowercases
+/// the other letters.
 pub(crate) fn canonical_field(name: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len());
     let mut start_of_token = true;
@@ -97,9 +99,10 @@ pub extern "C" fn mana_rt_decode_packet(ctx: *mut ProcCtx, ty: u64, bin: u64, _o
         return raise_badarg(ctx);
     };
     let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(bp, blen) }.to_vec();
-    // root the input binary across the parse: dp_ok slices the REST out of
-    // it (a view for large tails — Bandit re-feeds ever-shrinking buffers,
-    // and copying every rest made header parsing O(lines x buffer))
+    // Root the input binary across the parse. dp_ok slices the REST out of
+    // the input. For a large tail, the slice is a view, not a copy. Bandit
+    // feeds a shorter buffer on every call. A copy of every rest made header
+    // parsing O(lines x buffer).
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, bin];
     fr[0] = saved;
@@ -122,10 +125,10 @@ pub(crate) fn dp_more(ctx: &mut ProcCtx) -> u64 {
     pair_term(ctx, b"more", atom_intern(b"undefined"))
 }
 
-/// {ok, Packet, Rest} with Packet rooted across the Rest allocation.
-/// `bin_slot` points at the GC-rooted original input term; `base` is the
-/// scratch copy's start — Rest becomes a slice of the ORIGINAL binary
-/// (zero-copy view when large).
+/// Build {ok, Packet, Rest}. Packet stays rooted across the Rest allocation.
+/// `bin_slot` points at the GC-rooted original input term. `base` is the
+/// start of the scratch copy. Rest becomes a slice of the ORIGINAL binary.
+/// For a large tail, the slice is a zero-copy view.
 pub(crate) fn dp_ok(
     ctx: &mut ProcCtx,
     packet: u64,
@@ -161,12 +164,13 @@ pub(crate) fn dp_http_error(
     rest: &[u8],
 ) -> u64 {
     let lb = bytes_to_new_bin(ctx, line);
-    let err = pair_term(ctx, b"http_error", lb); // roots lb internally
+    let err = pair_term(ctx, b"http_error", lb); // pair_term roots lb internally
     dp_ok(ctx, err, bin_slot, base, rest)
 }
 
-/// Take one line (up to and including \r\n or \n). Returns (line_without
-/// terminator, rest_index) or None if incomplete.
+/// Take one line, up to and including \r\n or \n. The function returns
+/// (line_without terminator, rest_index). If the line is incomplete, it
+/// returns None.
 pub(crate) fn dp_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
     let nl = bytes.iter().position(|&b| b == b'\n')?;
     let line = if nl > 0 && bytes[nl - 1] == b'\r' {
@@ -183,11 +187,10 @@ pub(crate) fn dp_http(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8, 
     };
     let rest = &bytes[rest_at..];
     let full_line = &bytes[..rest_at];
-    // response line?
     if line.starts_with(b"HTTP/") {
         return dp_response(ctx, bin_slot, base, line, full_line, rest);
     }
-    // request line: METHOD SP URI [SP HTTP/x.y]
+    // Request line: METHOD SP URI [SP HTTP/x.y]
     let mut parts = line.splitn(3, |&b| b == b' ');
     let method = parts.next().unwrap_or(b"");
     let Some(uri) = parts.next() else {
@@ -208,7 +211,6 @@ pub(crate) fn dp_http(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8, 
     let mut fr = [0u64, 3, NIL, NIL, NIL];
     fr[0] = saved;
     ctx.roots_head = fr.as_ptr() as u64;
-    // method: known atom or binary
     fr[2] = if let Some(name) = HTTP_METHODS.iter().find(|&&m| m.as_bytes() == method) {
         atom_intern(name.as_bytes())
     } else {
@@ -352,7 +354,8 @@ pub(crate) fn dp_uri(ctx: &mut ProcCtx, uri: &[u8]) -> u64 {
         let p = bytes_to_new_bin(ctx, uri);
         return pair_term(ctx, b"abs_path", p);
     }
-    // anything else (unknown methods' tokens etc.): the bare binary
+    // Any other URI form, for example the token of an unknown method, is the
+    // bare binary.
     bytes_to_new_bin(ctx, uri)
 }
 
@@ -364,8 +367,8 @@ pub(crate) fn dp_httph(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8,
         return dp_ok(ctx, atom_intern(b"http_eoh"), bin_slot, base, &bytes[rest_at..]);
     }
     if rest_at == bytes.len() {
-        // a complete header line could still be extended by an obs-fold
-        // continuation — BEAM waits for at least one more byte
+        // An obs-fold continuation can still extend a complete header line.
+        // BEAM waits for at least one more byte.
         return dp_more(ctx);
     }
     let full_line = &bytes[..rest_at];
@@ -378,8 +381,8 @@ pub(crate) fn dp_httph(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8,
         .copied()
         .skip_while(|&b| b == b' ' || b == b'\t')
         .collect();
-    // obs-fold: continuation lines start with SP/HT and extend the value
-    // RAW — BEAM preserves the CRLF and the leading whitespace verbatim
+    // obs-fold: a continuation line starts with SP or HT and extends the value
+    // RAW. BEAM keeps the CRLF and the leading whitespace unchanged.
     while rest_at < bytes.len() && (bytes[rest_at] == b' ' || bytes[rest_at] == b'\t') {
         let Some((cont, next_at)) = dp_line(&bytes[rest_at..]) else {
             return dp_more(ctx);
@@ -407,7 +410,8 @@ pub(crate) fn dp_httph(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8,
         bytes_to_new_bin(ctx, &canon)
     };
     fr[3] = bytes_to_new_bin(ctx, &value);
-    // 4th element: the field name as received (original case) — OTP 26+
+    // The 4th element is the field name as received, in the original case
+    // (OTP 26+).
     let orig = bytes_to_new_bin(ctx, name);
     let mut fr2 = [0u64, 1, orig];
     fr2[0] = ctx.roots_head;

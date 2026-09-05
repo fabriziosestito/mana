@@ -1,12 +1,12 @@
-use super::*;
+//! Native `file` operations. The OTP modules file.erl and prim_file are never
+//! compiled.
+//!
+//! Every operation is a direct blocking syscall on the scheduler thread, the
+//! same as stdout today. Local-disk operations take microseconds. A scheduler
+//! that is stuck in a slow syscall (for example NFS) stalls STW for that
+//! duration. TODO(io-pool): move the syscalls to a blocking pool.
 
-// ---------------------------------------------------------------------------
-// file (native cut: OTP's file.erl/prim_file are never compiled)
-//
-// Direct blocking syscalls on the scheduler thread — same as stdout today.
-// Local-disk ops are µs-scale; the honest fix is a blocking pool
-// (TODO(io-pool)): a scheduler stuck in a slow syscall (NFS...) stalls STW
-// for its duration.
+use super::*;
 
 pub(crate) struct FileEntry {
     pub(crate) file: std::fs::File,
@@ -23,7 +23,7 @@ pub(crate) static FILES: std::sync::Mutex<FileTable> = std::sync::Mutex::new(Fil
     free: Vec::new(),
 });
 
-/// Raw byte list (no utf8 decoding — file:read in list mode is bytes).
+/// Builds a raw byte list without utf8 decoding. In list mode, file:read returns bytes.
 pub(crate) fn bytes_to_byte_list(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, NIL];
@@ -41,7 +41,7 @@ pub(crate) fn bytes_to_byte_list(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     fr[2]
 }
 
-/// posix error atom for an io::Error (BEAM's file:posix() names).
+/// Maps an io::Error to a posix error atom. The names match the BEAM file:posix() type.
 pub(crate) fn posix_atom(e: &std::io::Error) -> u64 {
     let name: &[u8] = match e.raw_os_error() {
         Some(libc) => match libc {
@@ -56,7 +56,7 @@ pub(crate) fn posix_atom(e: &std::io::Error) -> u64 {
             22 => b"einval",
             28 => b"enospc",
             36 => b"enametoolong",
-            // BEAM's efile maps ENOTEMPTY to eexist (ancient compat quirk)
+            // BEAM efile maps ENOTEMPTY to eexist. This is an old compatibility quirk.
             39 => b"eexist",
             _ => b"einval",
         },
@@ -70,7 +70,7 @@ pub(crate) fn posix_atom(e: &std::io::Error) -> u64 {
     atom_intern(name)
 }
 
-/// Extract a filesystem path from chardata / an atom.
+/// Extracts a filesystem path from chardata or from an atom.
 pub(crate) fn path_of(t: u64) -> Result<std::path::PathBuf, ()> {
     let mut bytes = Vec::new();
     if t & TAG_MASK == TAG_ATOM {
@@ -82,7 +82,7 @@ pub(crate) fn path_of(t: u64) -> Result<std::path::PathBuf, ()> {
     Ok(std::path::PathBuf::from(s))
 }
 
-/// {Tag, Value} in the nursery, rooting Value across the alloc.
+/// Builds {Tag, Value} in the nursery and roots Value across the allocation.
 pub(crate) fn pair_term(ctx: &mut ProcCtx, tag: &[u8], v: u64) -> u64 {
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, v];
@@ -134,13 +134,14 @@ pub(crate) fn file_resolve(t: u64) -> Option<usize> {
     }
 }
 
-/// posix seconds → {{Y,M,D},{H,Mi,S}} (UTC; 'local' is answered as UTC —
-/// documented divergence, conformance uses {time, posix}).
+/// Converts posix seconds to {{Y,M,D},{H,Mi,S}} in UTC. The 'local' option also
+/// returns UTC. This is a documented divergence. The conformance tests use
+/// {time, posix}.
 pub(crate) fn civil_datetime(ctx: &mut ProcCtx, secs: i64) -> u64 {
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // Howard Hinnant's civil_from_days
+    // The civil_from_days algorithm of Howard Hinnant.
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -182,7 +183,7 @@ pub(crate) fn civil_datetime(ctx: &mut ProcCtx, secs: i64) -> u64 {
     pair as u64
 }
 
-// file op codes (codegen compile_file_bif mirrors these)
+// File op codes. The codegen function compile_file_bif mirrors these values.
 pub const F_READ_FILE: u64 = 0;
 
 pub const F_WRITE_FILE: u64 = 1;
@@ -267,8 +268,8 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
         }
         F_OPEN => {
             let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
-            // modes list: read | write | append | exclusive | binary
-            // (raw/read_ahead/delayed_write accepted and ignored)
+            // The modes list holds read | write | append | exclusive | binary.
+            // The code accepts and ignores raw, read_ahead, and delayed_write.
             let (mut read, mut write, mut append, mut excl, mut binary) =
                 (false, false, false, false, false);
             let mut cur = b;
@@ -384,7 +385,7 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
         }
         F_POSITION => {
             let Some(idx) = file_resolve(a) else { return raise_badarg(ctx) };
-            // N | bof | cur | eof | {bof, N} | {cur, N} | {eof, N}
+            // The location is N | bof | cur | eof | {bof, N} | {cur, N} | {eof, N}.
             let seek = |whence: &[u8], n: i64| -> Option<std::io::SeekFrom> {
                 match whence {
                     b"bof" => u64::try_from(n).ok().map(std::io::SeekFrom::Start),
@@ -468,7 +469,8 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
                     Err(e) => return err_tuple(ctx, &e),
                 }
             }
-            // charlists, list built back-to-front with the acc rooted
+            // Each name becomes a charlist. The loop builds the list back to front
+            // and roots the accumulator.
             let saved = ctx.roots_head;
             let mut fr = [0u64, 2, NIL, NIL];
             fr[0] = saved;
@@ -489,9 +491,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
         F_FILE_INFO | F_FILE_INFO2 => {
             use std::os::unix::fs::MetadataExt;
             let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
-            // {time, posix} is the only option honored; universal/local
-            // answer UTC calendar tuples (local-as-UTC is a documented
-            // divergence)
+            // {time, posix} is the only option that the code honors. The universal
+            // and local options return UTC calendar tuples. Local as UTC is a
+            // documented divergence.
             let mut posix_time = false;
             if op == F_FILE_INFO2 {
                 let mut cur = b;
@@ -540,7 +542,7 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
                     civil_datetime(ctx, secs)
                 }
             };
-            // root the three time terms across the record alloc
+            // Root the three time terms across the record allocation.
             let saved = ctx.roots_head;
             let mut fr = [0u64, 3, NIL, NIL, NIL];
             fr[0] = saved;

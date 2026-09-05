@@ -1,9 +1,9 @@
-//! mana runtime — SMP scheduler with per-scheduler nurseries and a shared
-//! old generation.
+//! The mana runtime. It is an SMP scheduler with one nursery per scheduler
+//! and one shared old generation.
 //!
 //! # Term representation (contract with mana-codegen)
 //!
-//! Terms are 64-bit words. The low 3 bits are the primary tag:
+//! A term is one 64-bit word. The low 3 bits are the primary tag:
 //!
 //! | tag   | meaning                                                        |
 //! |-------|----------------------------------------------------------------|
@@ -16,41 +16,74 @@
 //! | 0b110 | pid (process id << 3)                                          |
 //! | 0b111 | GC forwarding marker (never visible to compiled code)          |
 //!
-//! Boxed header word: low 8 bits = kind (0 tuple, 1 float, 2 fun); tuples
-//! keep arity in bits 8+, funs keep arity in bits 8-15 and capture count in
-//! bits 16+ (payload: code pointer, then captures).
+//! The boxed header word holds the kind in its low 8 bits (0 tuple, 1 float,
+//! 2 fun). A tuple keeps its arity in bits 8 and up. A fun keeps its arity
+//! in bits 8-15 and its capture count in bits 16 and up. The fun payload is
+//! the code pointer, then the captures. `term.rs` defines the full list of
+//! kinds and their layouts.
 //!
 //! # Process context (ABI contract with mana-codegen)
 //!
-//! One ProcCtx per scheduler thread; compiled code reads/writes fixed word
-//! offsets: 0 `heap_top` (nursery bump, inline fast path), 1 `heap_end`,
-//! 2 `roots_head` (frame chain `[prev, len, slots...]`, zero = empty slot),
-//! 3 `exc_class`, 4 `exc_reason`, 5 `reductions`.
+//! Each scheduler thread owns one ProcCtx. Compiled code reads and writes
+//! these fixed word offsets:
+//!
+//! | word | field        | meaning                                                  |
+//! |------|--------------|----------------------------------------------------------|
+//! | 0    | `heap_top`   | nursery bump pointer (inline allocation fast path)       |
+//! | 1    | `heap_end`   | nursery end                                              |
+//! | 2    | `roots_head` | root frame chain `[prev, len, slots...]`, zero = empty slot |
+//! | 3    | `exc_class`  | class of the pending exception                           |
+//! | 4    | `exc_reason` | reason of the pending exception                          |
+//! | 5    | `reductions` | reduction counter                                        |
+//! | 6    | `argv_spill` | argument spill for calls of arity > 6, valid across one call edge only |
 //!
 //! # Heap organization (SMP)
 //!
-//! Each scheduler owns a private nursery; the old generation is shared,
-//! chunked, and non-moving between majors. The invariants that make this
-//! work without barriers or hot-path locks:
+//! Each scheduler owns a private nursery. The old generation is shared and
+//! chunked. It does not move between major collections. These invariants
+//! make this work with no write barriers and no locks on the hot path:
 //!
-//! * Terms are immutable and only reference older terms — no old→young
-//!   pointers, so **minor collections are entirely scheduler-local**.
-//! * Anything that crosses processes (message payloads, spawn closures) is
-//!   **promoted to the shared old space at send time** (young parts copied
-//!   once; a long-lived payload becomes old at the sender's next minor and
-//!   then transfers zero-copy forever; old parts always pass by pointer).
-//!   Hence no scheduler ever holds references into another's nursery.
-//! * Major collections (old space over limit) stop the world: schedulers
-//!   park at safepoints (scheduler loop, allocation slow path); the
-//!   requester evacuates all nurseries, then compacts the old space.
+//! * Terms are immutable and reference only older terms. There are no
+//!   old-to-young pointers. As a result, **a minor collection is local to
+//!   one scheduler**.
+//! * The sender **promotes every term that crosses processes to the shared
+//!   old space at send time**. This covers message payloads and spawn
+//!   closures. The runtime copies the young parts once. A long-lived payload
+//!   becomes old at the next minor collection of the sender. After that, it
+//!   transfers by pointer forever. Old parts always pass by pointer. As a
+//!   result, no scheduler holds a reference into the nursery of another
+//!   scheduler.
+//! * A major collection (old space over its limit) stops the world. The
+//!   schedulers park at safepoints (the scheduler loop, the allocation slow
+//!   path). The requester evacuates all nurseries, then compacts the old
+//!   space.
 //!
-//! Processes are corosensei coroutines **pinned to their home scheduler**;
-//! only the home thread touches a process's coroutine/cursor/saved state.
-//! Cross-thread interaction is limited to mailbox pushes, state flips, and
-//! condvar wakes.
+//! A process is a corosensei coroutine **pinned to its home scheduler**.
+//! Only the home thread touches the coroutine, the cursor, and the saved
+//! state of a process. Only mailbox pushes, state flips, and condvar wakes
+//! cross threads.
+//!
+//! # Modules
+//!
+//! * `term.rs` holds tags, kinds, atoms, allocation primitives, and error
+//!   helpers.
+//! * `sched.rs` holds `ProcCtx`, processes, and schedulers. `gc.rs` holds
+//!   minor and major collection, and promotion.
+//! * `signals.rs` holds links, monitors, and exit signals. `proc.rs` holds
+//!   the spawn, send, and receive primops, the process dictionary, and the
+//!   name registry.
+//! * `arith.rs` holds numbers, and `bigint.rs` holds the limb math.
+//!   `compare.rs` holds term order, equality, and the list and tuple BIFs.
+//!   `maps.rs`, `binary.rs`, `convert.rs`, `io.rs`, `etf.rs`, `re.rs`, and
+//!   `codec.rs` (crypto, zlib) hold the other data BIFs.
+//! * `reactor.rs` holds the mio thread. `tcp.rs`, `file.rs`, and
+//!   `decode_packet.rs` hold sockets, files, and packet decoding.
+//! * `system.rs` holds time, timers, and system info. `ets.rs` holds ets,
+//!   persistent_term, and the application env. `apply.rs` holds the export
+//!   table, apply, and the code BIFs. `native.rs` holds the ABI for
+//!   `Mana.Native` packages.
 //!
 //! TODO(stacks): process stacks are fixed (root 32MB, spawned 1MB).
-//! TODO(split): this file wants to become term.rs / gc.rs / sched.rs.
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;

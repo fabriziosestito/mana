@@ -1,10 +1,11 @@
-use super::*;
+//! The External Term Format for term_to_binary/binary_to_term.
+//!
+//! This module covers the data subset: smalls, atoms, nil, lists, tuples,
+//! maps, floats, and binaries. Byte lists encode as STRING_EXT, as on the
+//! BEAM. Pids, refs, and funs raise badarg (TODO(etf)). This encoder is
+//! also the planned wire format for mana_dist.
 
-// ---------------------------------------------------------------------------
-// External Term Format (term_to_binary/binary_to_term) — the data subset:
-// smalls, atoms, nil, lists (byte lists as STRING_EXT like BEAM), tuples,
-// maps, floats, binaries. Pids/refs/funs are badarg (TODO(etf)); this
-// encoder is also the wire format planned for mana_dist.
+use super::*;
 
 pub(crate) fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
     match t & TAG_MASK {
@@ -17,7 +18,7 @@ pub(crate) fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
                 out.push(98);
                 out.extend_from_slice(&(v as i32).to_be_bytes());
             } else {
-                // SMALL_BIG_EXT for the 61-bit smalls beyond i32
+                // SMALL_BIG_EXT for the 61-bit smalls outside the i32 range
                 let (sign, mag) = if v < 0 { (1u8, (-(v as i128)) as u64) } else { (0, v as u64) };
                 let bytes = mag.to_le_bytes();
                 let n = bytes.iter().rposition(|&b| b != 0).map_or(1, |i| i + 1);
@@ -40,7 +41,8 @@ pub(crate) fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
         }
         _ if t == NIL => out.push(106),
         TAG_CONS => {
-            // proper byte lists ≤ 65535 encode as STRING_EXT (BEAM parity)
+            // A proper byte list of length ≤ 65535 encodes as STRING_EXT, as on
+            // the BEAM.
             let mut bytes: Vec<u8> = Vec::new();
             let mut cur = t;
             let mut is_string = true;
@@ -70,7 +72,7 @@ pub(crate) fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
                 etf_encode(unsafe { *p }, out)?;
                 cur = unsafe { *p.add(1) };
             }
-            etf_encode(cur, out)?; // tail (NIL for proper lists)
+            etf_encode(cur, out)?; // the tail (NIL for a proper list)
         }
         TAG_BOXED if t != 0 => unsafe {
             let p = t as *const u64;
@@ -124,7 +126,7 @@ pub(crate) fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
                 _ => return Err(()),
             }
         },
-        _ => return Err(()), // pids/refs — TODO(etf)
+        _ => return Err(()), // TODO(etf): pids and refs
     }
     Ok(())
 }
@@ -154,13 +156,14 @@ impl<'a> EtfDec<'a> {
     }
 }
 
-/// Decode one term. `safe` refuses atoms not already interned. All heap
-/// results are built with the partial term rooted via a caller frame —
-/// here we allocate bottom-up and root intermediates in Rust Vecs of
-/// ETERNAL-safe? No: we allocate in the nursery; every recursive result
-/// is immediately stored into its parent allocation, and parents are
-/// allocated AFTER children — children must be rooted across the parent
-/// alloc. We use a per-call stack frame for the child list.
+/// Decodes one term. With `safe`, an atom that is not already interned is
+/// an error.
+///
+/// Allocation is bottom-up in the nursery. This function decodes the
+/// children of a container first. Then it allocates the parent and stores
+/// each child result into the parent allocation. The children must stay
+/// rooted across the parent allocation. A per-call root frame holds the
+/// child list.
 pub(crate) fn etf_decode(ctx: &mut ProcCtx, d: &mut EtfDec, safe: bool) -> Result<u64, ()> {
     let tag = d.u8()?;
     match tag {
@@ -200,8 +203,9 @@ pub(crate) fn etf_decode(ctx: &mut ProcCtx, d: &mut EtfDec, safe: bool) -> Resul
         }
         108 => {
             let n = d.u32()? as usize;
-            // per-call root frame: [prev, len, children...] in a Vec whose
-            // capacity is fixed up front (the buffer must never move)
+            // The per-call root frame [prev, len, children...] lives in a Vec
+            // with its full capacity reserved up front. The buffer must never
+            // move.
             let saved = ctx.roots_head;
             let mut fr: Vec<u64> = Vec::with_capacity(3 + n);
             fr.push(saved);

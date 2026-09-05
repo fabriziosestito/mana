@@ -1,9 +1,16 @@
+//! Term output and the native `io` BIFs.
+//!
+//! This module holds `erlang:display/1`, the uncaught-exception printer,
+//! the `io` and `io_lib` format engine, the `unicode` conversions, and the
+//! term writer. The runtime never compiles the OTP `io.erl` or the
+//! group-leader protocol. The BIFs write to stdout directly. The term writer
+//! must print terms in the same form as BEAM.
+
 use super::*;
 
-// ---------------------------------------------------------------------------
-// term output
+// Term output
 
-/// `erlang:display/1` — print a term followed by newline.
+/// `erlang:display/1`. Prints a term and then a newline.
 #[no_mangle]
 pub extern "C" fn mana_rt_display(term: u64) {
     let mut out = String::new();
@@ -12,7 +19,8 @@ pub extern "C" fn mana_rt_display(term: u64) {
     let _ = std::io::stdout().write_all(out.as_bytes());
 }
 
-/// An exception unwound past the entry function (uncaught).
+/// Reports an exception that unwound past the entry function. The process
+/// exits with status 1.
 #[no_mangle]
 pub extern "C" fn mana_rt_uncaught(ctx: *mut ProcCtx) -> ! {
     let ctx = unsafe { &*ctx };
@@ -24,11 +32,10 @@ pub extern "C" fn mana_rt_uncaught(ctx: *mut ProcCtx) -> ! {
     std::process::exit(1);
 }
 
-// ---------------------------------------------------------------------------
-// io (native cut: we never compile OTP's io.erl / group-leader protocol)
+// io BIFs
 
-/// io:put_chars/1 — write iodata (chardata restricted to bytes; unicode
-/// code points beyond latin-1 are TODO(unicode)) to stdout. Returns ok.
+/// `io:put_chars/1`. Writes iodata to stdout and returns `ok`. The chardata
+/// is restricted to bytes. TODO(unicode): code points beyond latin-1.
 #[no_mangle]
 pub extern "C" fn mana_rt_io_put_chars(ctx: *mut ProcCtx, data: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -45,8 +52,9 @@ pub extern "C" fn mana_rt_io_put_chars(ctx: *mut ProcCtx, data: u64) -> u64 {
     known().ok
 }
 
-/// Flatten chardata: like an iolist, but integers are Unicode code points
-/// (utf8-encoded), not bytes. Binaries splice raw (assumed utf8).
+/// Flattens chardata. The walk is like an iolist walk, but each integer is a
+/// Unicode code point and is written as utf8, not as a byte. Binaries are
+/// copied raw. The function assumes that binaries hold utf8.
 pub(crate) fn chardata_flatten(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
     if let Some((p, n)) = bin_parts(t) {
         out.extend_from_slice(unsafe { std::slice::from_raw_parts(p, n) });
@@ -77,8 +85,8 @@ pub(crate) fn chardata_flatten(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
     }
 }
 
-/// unicode:characters_to_nfc_list/1 — NFC-normalized code point list
-/// (String.Tokenizer validates identifiers through this).
+/// `unicode:characters_to_nfc_list/1`. Returns the NFC-normalized code point
+/// list. `String.Tokenizer` validates identifiers through this BIF.
 #[no_mangle]
 pub extern "C" fn mana_rt_unicode_to_nfc_list(ctx: *mut ProcCtx, t: u64) -> u64 {
     use unicode_normalization::UnicodeNormalization;
@@ -94,7 +102,7 @@ pub extern "C" fn mana_rt_unicode_to_nfc_list(ctx: *mut ProcCtx, t: u64) -> u64 
     utf8_to_codepoint_list(ctx, nfc.as_bytes())
 }
 
-/// unicode:characters_to_binary/1 (utf8 in, utf8 out).
+/// `unicode:characters_to_binary/1`. The input is utf8 and the output is utf8.
 #[no_mangle]
 pub extern "C" fn mana_rt_unicode_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -105,7 +113,7 @@ pub extern "C" fn mana_rt_unicode_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
     }
 }
 
-/// unicode:characters_to_list/1 — code point list from utf8 chardata.
+/// `unicode:characters_to_list/1`. Returns the code point list of utf8 chardata.
 #[no_mangle]
 pub extern "C" fn mana_rt_unicode_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -117,8 +125,8 @@ pub extern "C" fn mana_rt_unicode_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
         return raise_badarg(ctx);
     };
     let cps: Vec<u64> = s.chars().map(|c| ((c as u64) << 3) | TAG_SMALL).collect();
-    // build the list back-to-front; the code points are immediates so only
-    // the partial list needs rooting
+    // The loop builds the list from the tail to the head. The code points are
+    // immediates. Only the partial list needs a GC root.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, NIL];
     fr[0] = saved;
@@ -135,10 +143,10 @@ pub extern "C" fn mana_rt_unicode_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
     fr[2]
 }
 
-/// The io_lib format engine: ~[F][.P][t]C for C in s f e p w n ~, with
-/// `*` widths/precisions taken from the argument list and negative widths
-/// meaning left-alignment (the benchee console subset). Unknown directives
-/// print their raw text.
+/// The `io_lib` format engine. It accepts `~[F][.P][t]C` for `C` in
+/// `s f e p w n ~`. A `*` width or precision takes its value from the
+/// argument list. A negative width means left alignment. This is the subset
+/// that the benchee console uses. Unknown directives print their raw text.
 pub(crate) fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
     let mut fbytes = Vec::new();
     chardata_flatten(fmt, &mut fbytes)?;
@@ -170,7 +178,7 @@ pub(crate) fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
             continue;
         }
         let mut j = i + 1;
-        // field width: [-]digits or *
+        // Field width: `[-]digits` or `*`.
         let mut width: Option<i64> = None;
         let mut neg = false;
         if fbytes.get(j) == Some(&b'-') {
@@ -199,7 +207,7 @@ pub(crate) fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
                 width = Some(if neg { -digits } else { digits });
             }
         }
-        // precision: .digits or .*
+        // Precision: `.digits` or `.*`.
         let mut prec: Option<usize> = None;
         if fbytes.get(j) == Some(&b'.') {
             j += 1;
@@ -222,7 +230,7 @@ pub(crate) fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
                 prec = Some(digits);
             }
         }
-        // modifiers
+        // The `t` and `l` modifiers are accepted and ignored.
         while matches!(fbytes.get(j), Some(b't') | Some(b'l')) {
             j += 1;
         }
@@ -288,7 +296,7 @@ pub(crate) fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-/// io:format/2.
+/// `io:format/2`.
 #[no_mangle]
 pub extern "C" fn mana_rt_io_format(ctx: *mut ProcCtx, fmt: u64, args: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -304,7 +312,8 @@ pub extern "C" fn mana_rt_io_format(ctx: *mut ProcCtx, fmt: u64, args: u64) -> u
     known().ok
 }
 
-/// Byte vec → charlist (nursery); bytes already copied off-heap.
+/// Builds a charlist of bytes in the nursery. The caller must copy the bytes
+/// off the heap first.
 pub(crate) fn bytes_to_charlist(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, NIL];
@@ -322,8 +331,8 @@ pub(crate) fn bytes_to_charlist(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     fr[2]
 }
 
-/// utf8 bytes → CODEPOINT charlist (io_lib semantics; binary_to_list's
-/// byte semantics live in bytes_to_charlist).
+/// Builds a charlist of code points from utf8 bytes. This is the `io_lib`
+/// behavior. The byte behavior of `binary_to_list` is in `bytes_to_charlist`.
 pub(crate) fn utf8_to_codepoint_list(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     let s = String::from_utf8_lossy(bytes);
     let cps: Vec<u64> = s.chars().map(|c| ((c as u64) << 3) | TAG_SMALL).collect();
@@ -343,7 +352,7 @@ pub(crate) fn utf8_to_codepoint_list(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     fr[2]
 }
 
-/// io_lib:format/2 — the formatted codepoint charlist.
+/// `io_lib:format/2`. Returns the formatted text as a code point charlist.
 #[no_mangle]
 pub extern "C" fn mana_rt_io_lib_format(ctx: *mut ProcCtx, fmt: u64, args: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -353,7 +362,8 @@ pub extern "C" fn mana_rt_io_lib_format(ctx: *mut ProcCtx, fmt: u64, args: u64) 
     utf8_to_codepoint_list(ctx, &out)
 }
 
-/// io_lib:write/1 (and write/2 with depth ignored) — display text of a term.
+/// `io_lib:write/1`. Returns the display text of a term. `io_lib:write/2`
+/// also maps here and ignores the depth argument.
 #[no_mangle]
 pub extern "C" fn mana_rt_io_lib_write(ctx: *mut ProcCtx, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -382,7 +392,7 @@ pub(crate) fn write_term(t: u64, out: &mut String) {
             }
         }
         TAG_CONS => {
-            // BEAM displays proper lists of printable chars as strings
+            // BEAM prints a proper list of printable characters as a string.
             if let Some(s) = printable_list(t) {
                 out.push('"');
                 out.push_str(&s);
@@ -453,12 +463,13 @@ pub(crate) fn write_term(t: u64, out: &mut String) {
                 KIND_BIN | KIND_SUBBIN => {
                     let bytes = bin_bytes(t);
                     out.push_str("<<");
-                    // all-printable-ascii binaries render as a string; unlike
-                    // char lists, control chars do NOT qualify
+                    // A binary of printable ASCII bytes prints as a string.
+                    // Control characters do not qualify here. This differs
+                    // from the rule for charlists.
                     if !bytes.is_empty() && bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
                         out.push('"');
                         for &b in bytes {
-                            // only the quote is escaped (backslash prints raw)
+                            // Only the quote gets an escape. A backslash prints raw.
                             if b == b'"' {
                                 out.push('\\');
                             }
@@ -482,9 +493,10 @@ pub(crate) fn write_term(t: u64, out: &mut String) {
     }
 }
 
-/// BEAM quotes atoms that are not plain identifiers ([a-z][a-zA-Z0-9_@]*)
-/// or that collide with Erlang reserved words. `'` and `\` are escaped;
-/// other chars print raw (matching display, not ~p).
+/// Writes an atom in the form that BEAM uses. BEAM quotes an atom that is not
+/// a plain identifier (`[a-z][a-zA-Z0-9_@]*`). BEAM also quotes an atom that
+/// is an Erlang reserved word. `'` and `\` get an escape. Other characters
+/// print raw. This matches `display`, not `~p`.
 pub(crate) fn write_atom(name: &str, out: &mut String) {
     const RESERVED: &[&str] = &[
         "after", "and", "andalso", "band", "begin", "bnot", "bor", "bsl", "bsr",
@@ -512,8 +524,9 @@ pub(crate) fn write_atom(name: &str, out: &mut String) {
     out.push('\'');
 }
 
-/// BEAM's display heuristic: a proper list of printable latin-1 chars (or
-/// their escapes) renders as a quoted string. Returns the escaped body.
+/// The display rule of BEAM for lists. A proper list of printable latin-1
+/// characters, or of their escapes, prints as a quoted string. Returns the
+/// escaped body of the string, or `None` if the list does not qualify.
 pub(crate) fn printable_list(t: u64) -> Option<String> {
     let mut s = String::new();
     let mut cur = t;
@@ -538,7 +551,7 @@ pub(crate) fn printable_list(t: u64) -> Option<String> {
                 }
                 s.push(ch);
             }
-            // BEAM writes these raw inside the quotes
+            // BEAM writes these characters raw inside the quotes.
             8..=13 | 27 => s.push(c as u8 as char),
             _ => return None,
         }

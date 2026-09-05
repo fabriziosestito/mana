@@ -1,7 +1,9 @@
-use super::*;
+//! Binary terms and the `erlang` and `binary` BIFs that operate on them.
+//! All binaries are byte-aligned. Sub-byte bitstrings are TODO(bitstring).
+//! A `KIND_SUBBIN` view holds a parent term and an offset. GC moves the
+//! parent, so code must read the data pointer from the parent on every call.
 
-// ---------------------------------------------------------------------------
-// binaries (byte-aligned; sub-byte bitstrings are TODO(bitstring))
+use super::*;
 
 pub(crate) fn bin_parts(t: u64) -> Option<(*const u8, usize)> {
     if t & TAG_MASK != TAG_BOXED || t == 0 {
@@ -11,8 +13,8 @@ pub(crate) fn bin_parts(t: u64) -> Option<(*const u8, usize)> {
     let header = unsafe { *p };
     match header & 0xff {
         KIND_BIN => Some((unsafe { p.add(1) } as *const u8, (header >> 8) as usize)),
-        // view: recompute from the parent TERM every call — the parent
-        // moves under GC, so the data pointer must never be cached
+        // A view recomputes the data pointer from the parent TERM on every
+        // call. The parent moves under GC, so the pointer must never be cached.
         KIND_SUBBIN => {
             let parent = unsafe { *p.add(1) };
             let off = unsafe { *p.add(2) } as usize;
@@ -38,31 +40,31 @@ pub(crate) fn bin_bytes(t: u64) -> &'static [u8] {
     }
 }
 
-/// Allocate an uninitialized binary of `bytes` in the nursery. Padding in
-/// the last data word is zeroed so word-granular copies stay deterministic.
-/// Caller must have rooted every live term (may GC).
+/// Allocate an uninitialized binary of `bytes` in the nursery. The padding in
+/// the last data word is zero, so word-granular copies stay deterministic.
+/// This function can GC. The caller must root every live term first.
 pub(crate) fn alloc_bin(ctx: &mut ProcCtx, bytes: usize) -> *mut u64 {
     let words = 1 + (bytes + 7) / 8;
     let p = alloc_nursery(ctx, words);
     unsafe {
         *p = ((bytes as u64) << 8) | KIND_BIN;
         if bytes % 8 != 0 {
-            // zero the final data word's padding (never the header)
+            // Zero only the padding of the final data word, never the header.
             *p.add(words - 1) = 0;
         }
     }
     p
 }
 
-/// Codegen entry: allocate a zero-padded binary; construction writers fill
-/// it in. All live terms must be rooted by the caller (may GC).
+/// Codegen entry: allocate a zero-padded binary. The construction writers
+/// fill it. This function can GC. The caller must root all live terms first.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_alloc(ctx: *mut ProcCtx, nbytes: u64) -> u64 {
     alloc_bin(unsafe { &mut *ctx }, nbytes as usize) as u64
 }
 
-/// Raise-path construction: eternal (malloc) binary, registered so majors
-/// keep it alive; never moves, so no rooting needed.
+/// Raise-path construction: an eternal (malloc) binary. It is registered so
+/// that major collections keep it alive. It never moves, so it needs no root.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_alloc_eternal(ctx: *mut ProcCtx, nbytes: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -79,8 +81,9 @@ pub extern "C" fn mana_rt_bin_alloc_eternal(ctx: *mut ProcCtx, nbytes: u64) -> u
     p as u64
 }
 
-/// Pattern preflight: is `t` a binary of exactly `n` bytes (`at_least` = 0)
-/// or at least `n` bytes (`at_least` = 1)?
+/// Pattern preflight. If `at_least` = 0, the check is: `t` is a binary of
+/// exactly `n` bytes. If `at_least` = 1, the check is: `t` is a binary of
+/// at least `n` bytes.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_len_check(t: u64, n: u64, at_least: u64) -> u64 {
     match bin_parts(t) {
@@ -91,9 +94,10 @@ pub extern "C" fn mana_rt_bin_len_check(t: u64, n: u64, at_least: u64) -> u64 {
     }
 }
 
-/// Pattern extraction of an integer segment. flags: bit0 little-endian,
-/// bit1 signed. Returns the sentinel for out-of-bounds / non-binary —
-/// pattern-match failure, NOT an exception. Non-allocating.
+/// Pattern extraction of an integer segment. Flags: bit0 is little-endian,
+/// bit1 is signed. An out-of-bounds offset or a non-binary returns the
+/// sentinel. The sentinel means pattern-match failure, NOT an exception.
+/// This function does not allocate.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u64) -> u64 {
     let Some((p, len)) = bin_parts(bin) else {
@@ -104,8 +108,8 @@ pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u
         return EXC_SENTINEL;
     }
     if nbytes > 8 {
-        // dynamic sizes beyond 64 bits would need bignums — fail the match
-        // (TODO(bignum-segments): BEAM would succeed)
+        // Dynamic sizes beyond 64 bits need bignums, so the match fails.
+        // TODO(bignum-segments): BEAM succeeds here.
         return EXC_SENTINEL;
     }
     let mut v: u64 = 0;
@@ -126,8 +130,8 @@ pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u
     } else {
         v as i64
     };
-    // small ints hold 61 bits; 64-bit segments with larger values need
-    // bignums we don't have
+    // Small ints hold 61 bits. A 64-bit segment with a larger value needs a
+    // bignum, and the runtime does not have one here.
     if nbytes >= 8 && (sv >> 60 != 0 && sv >> 60 != -1) {
         eprintln!("mana: TODO(bignum-segments): 64-bit binary segment value out of small-int range");
         std::process::abort();
@@ -136,7 +140,7 @@ pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u
 }
 
 /// Pattern extraction of a utf8 segment: decode one code point at `off`.
-/// Returns -1 for fail, else (width_bytes << 32) | code_point.
+/// On failure, the result is -1. Otherwise it is (width_bytes << 32) | code_point.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_read_utf8(bin: u64, off: u64) -> i64 {
     let Some((p, len)) = bin_parts(bin) else {
@@ -166,7 +170,8 @@ pub extern "C" fn mana_rt_bin_read_utf8(bin: u64, off: u64) -> i64 {
     }
 }
 
-/// Construction: utf8 width of a code point term (0 = invalid → badarg).
+/// Construction: the utf8 width of a code point term. A result of 0 means
+/// that the code point is invalid, and the caller raises badarg.
 #[no_mangle]
 pub extern "C" fn mana_rt_utf8_width(cp: u64) -> u64 {
     if cp & TAG_MASK != TAG_SMALL {
@@ -179,8 +184,8 @@ pub extern "C" fn mana_rt_utf8_width(cp: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// Construction writer: utf8-encode a code point; returns bytes written
-/// (the width was already validated by mana_rt_utf8_width).
+/// Construction writer: encode a code point as utf8. The result is the number
+/// of bytes written. mana_rt_utf8_width already checked the width.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_write_utf8(bin: u64, off: u64, cp: u64) -> u64 {
     let c = char::from_u32((cp as i64 >> 3) as u32).unwrap();
@@ -193,11 +198,11 @@ pub extern "C" fn mana_rt_bin_write_utf8(bin: u64, off: u64, cp: u64) -> u64 {
     s.len() as u64
 }
 
-/// Pattern extraction of a binary segment: `len < 0` means the whole rest.
-/// Sentinel = match failure. Small slices copy (BEAM's heap-binary
-/// heuristic — cheap and they don't pin the parent); larger ones become
-/// zero-copy KIND_SUBBIN views over the ROOT binary (slicing a view folds
-/// offsets, so views never chain).
+/// Pattern extraction of a binary segment. `len < 0` means the whole rest.
+/// The sentinel means match failure. Small slices copy their bytes. This is
+/// the heap-binary heuristic of BEAM: a copy is cheap and does not pin the
+/// parent. Larger slices become zero-copy KIND_SUBBIN views over the ROOT
+/// binary. A slice of a view folds the offsets, so views never chain.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_slice(ctx: *mut ProcCtx, bin: u64, off: u64, len: i64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -247,7 +252,7 @@ pub extern "C" fn mana_rt_bin_slice(ctx: *mut ProcCtx, bin: u64, off: u64, len: 
     vp as u64
 }
 
-/// Construction writer: constant segment bytes from a static array.
+/// Construction writer: copy constant segment bytes from a static array.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_write_bytes(bin: u64, off: u64, ptr: *const u8, len: u64) {
     let (p, _) = bin_parts(bin).unwrap();
@@ -256,8 +261,9 @@ pub extern "C" fn mana_rt_bin_write_bytes(bin: u64, off: u64, ptr: *const u8, le
     }
 }
 
-/// Pattern check: do the bytes at `off` equal a constant array? 0 for
-/// non-binary / out of bounds / mismatch. Non-allocating.
+/// Pattern check: the bytes at `off` must equal a constant array. The result
+/// is 0 for a non-binary, an out-of-bounds offset, or a mismatch. This
+/// function does not allocate.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_match_bytes(bin: u64, off: u64, ptr: *const u8, len: u64) -> u64 {
     let Some((p, total)) = bin_parts(bin) else {
@@ -272,8 +278,9 @@ pub extern "C" fn mana_rt_bin_match_bytes(bin: u64, off: u64, ptr: *const u8, le
     (a == b) as u64
 }
 
-/// Construction writer: store an integer segment (truncating, like BEAM).
-/// Non-allocating; badarg if the value is not a small int.
+/// Construction writer: store an integer segment. The value is truncated,
+/// like BEAM. This function does not allocate. If the value is not an
+/// integer, it raises badarg.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_write_int(
     ctx: *mut ProcCtx,
@@ -284,11 +291,11 @@ pub extern "C" fn mana_rt_bin_write_int(
     little: u64,
 ) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    // BEAM truncates integer segments to the low bits — bignums included
+    // BEAM truncates integer segments to the low bits. This includes bignums.
     let v: u64 = if val & TAG_MASK == TAG_SMALL {
         (val as i64 >> 3) as u64
     } else if let Some((neg, mag)) = bignum_parts(val) {
-        // low 64 bits, two's complement for negatives (nbytes <= 8)
+        // The low 64 bits, in two's complement for negatives (nbytes <= 8).
         let lo = mag[0];
         if neg { lo.wrapping_neg() } else { lo }
     } else {
@@ -306,9 +313,10 @@ pub extern "C" fn mana_rt_bin_write_int(
     0
 }
 
-/// Construction writer: splice a binary. `len < 0` copies all of it; a
-/// non-negative len copies the first len bytes (badarg if src is shorter,
-/// like BEAM's fixed-size binary segments). Non-allocating.
+/// Construction writer: splice a binary. `len < 0` copies all of `src`. A
+/// non-negative `len` copies the first `len` bytes. If `src` is shorter, the
+/// function raises badarg, like the fixed-size binary segments of BEAM. This
+/// function does not allocate.
 #[no_mangle]
 pub extern "C" fn mana_rt_bin_write_bin(
     ctx: *mut ProcCtx,
@@ -345,7 +353,7 @@ pub extern "C" fn mana_rt_byte_size(ctx: *mut ProcCtx, t: u64) -> u64 {
     }
 }
 
-/// erlang:binary_part/3 — negative length reaches backwards (BEAM).
+/// erlang:binary_part/3. A negative length reaches backwards, like BEAM.
 #[no_mangle]
 pub extern "C" fn mana_rt_binary_part(ctx: *mut ProcCtx, bin: u64, pos: u64, len: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -371,7 +379,7 @@ pub extern "C" fn mana_rt_binary_part(ctx: *mut ProcCtx, bin: u64, pos: u64, len
 #[no_mangle]
 pub extern "C" fn mana_rt_list_to_tuple(ctx: *mut ProcCtx, l: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    // count first (validates properness)
+    // The first pass counts the cells and checks that the list is proper.
     let mut n = 0usize;
     let mut cur = l;
     while cur != NIL {
@@ -427,7 +435,7 @@ pub extern "C" fn mana_rt_tuple_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
     fr[3]
 }
 
-/// erlang:split_binary/2 → {Prefix, Suffix}.
+/// erlang:split_binary/2. The result is {Prefix, Suffix}.
 #[no_mangle]
 pub extern "C" fn mana_rt_split_binary(ctx: *mut ProcCtx, bin: u64, pos: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -481,8 +489,8 @@ pub extern "C" fn mana_rt_binary_to_list(ctx: *mut ProcCtx, bin: u64) -> u64 {
     fr[3]
 }
 
-/// Flatten an iolist (nested lists of bytes and binaries, binary tails
-/// allowed) into `out`. Err = badarg.
+/// Flatten an iolist into `out`. An iolist is a nested list of bytes and
+/// binaries. A binary tail is allowed. Err means badarg.
 pub(crate) fn iolist_flatten(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
     if let Some((p, n)) = bin_parts(t) {
         out.extend_from_slice(unsafe { std::slice::from_raw_parts(p, n) });
@@ -494,7 +502,7 @@ pub(crate) fn iolist_flatten(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
             return Ok(());
         }
         if cur & TAG_MASK != TAG_CONS {
-            // a binary tail terminates an iolist
+            // A binary tail ends an iolist.
             if bin_parts(cur).is_some() {
                 return iolist_flatten(cur, out);
             }
@@ -516,7 +524,7 @@ pub(crate) fn iolist_flatten(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
 }
 
 pub(crate) fn bytes_to_new_bin(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
-    // bytes are already copied out of the heap — nothing to root
+    // The bytes are already outside the heap, so there is nothing to root.
     let p = alloc_bin(ctx, bytes.len());
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(1) as *mut u8, bytes.len());
@@ -524,7 +532,7 @@ pub(crate) fn bytes_to_new_bin(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     p as u64
 }
 
-/// erlang:list_to_binary/1 (accepts iolists, like BEAM).
+/// erlang:list_to_binary/1. It accepts iolists, like BEAM.
 #[no_mangle]
 pub extern "C" fn mana_rt_list_to_binary(ctx: *mut ProcCtx, l: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -538,7 +546,7 @@ pub extern "C" fn mana_rt_list_to_binary(ctx: *mut ProcCtx, l: u64) -> u64 {
     }
 }
 
-/// erlang:iolist_to_binary/1 — also accepts a bare binary.
+/// erlang:iolist_to_binary/1. It also accepts a bare binary.
 #[no_mangle]
 pub extern "C" fn mana_rt_iolist_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -549,8 +557,9 @@ pub extern "C" fn mana_rt_iolist_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
     }
 }
 
-/// Patterns: a binary or a non-empty list of binaries (compile_pattern is
-/// the identity in our world). Byte vectors returned for searching.
+/// Patterns: a binary, or a non-empty list of binaries. In this runtime,
+/// compile_pattern is the identity. The result holds byte vectors for the
+/// search.
 pub(crate) fn pattern_bins(pat: u64) -> Result<Vec<&'static [u8]>, ()> {
     if bin_parts(pat).is_some() {
         return Ok(vec![bin_bytes(pat)]);
@@ -575,12 +584,12 @@ pub(crate) fn pattern_bins(pat: u64) -> Result<Vec<&'static [u8]>, ()> {
     Ok(out)
 }
 
-/// Leftmost match at or after `from`; longest pattern wins ties.
+/// Leftmost match at or after `from`. The longest pattern wins ties. This is
+/// the binary:match rule of BEAM.
 pub(crate) fn bin_search(hay: &[u8], pats: &[&[u8]], from: usize) -> Option<(usize, usize)> {
-    // longest match at the leftmost position (BEAM's binary:match rule).
-    // Single pattern: scan for its first byte, then one slice compare — the
-    // per-position starts_with loop was ~15% of a Phoenix request across
-    // binary:split/match on header lines.
+    // Single pattern: scan for its first byte, then do one slice compare.
+    // The old per-position starts_with loop was ~15% of a Phoenix request
+    // across binary:split/match on header lines.
     if let [p] = pats {
         if p.is_empty() {
             return None;
@@ -610,7 +619,7 @@ pub(crate) fn bin_search(hay: &[u8], pats: &[&[u8]], from: usize) -> Option<(usi
     None
 }
 
-/// binary:split/2,3. opts term: nil or list of global/trim/trim_all.
+/// binary:split/2,3. The opts term is nil or a list of global/trim/trim_all.
 #[no_mangle]
 pub extern "C" fn mana_rt_binary_split(ctx: *mut ProcCtx, bin: u64, pat: u64, opts: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -636,10 +645,10 @@ pub extern "C" fn mana_rt_binary_split(ctx: *mut ProcCtx, bin: u64, pat: u64, op
         }
         cur = unsafe { *p.add(1) };
     }
-    // search over the live bytes (no allocation happens until the result is
-    // built), recording part RANGES; the parts then become zero-copy views
-    // of the subject via bin_slice (BEAM returns sub-binaries here too), so
-    // a split copies nothing but its list cells
+    // The search runs over the live bytes and records part RANGES. No
+    // allocation happens before the result is built. The parts then become
+    // zero-copy views of the subject via bin_slice. BEAM also returns
+    // sub-binaries here. A split copies nothing but its list cells.
     let hay: &[u8] = bin_bytes(bin);
     let mut parts: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
@@ -663,8 +672,8 @@ pub extern "C" fn mana_rt_binary_split(ctx: *mut ProcCtx, bin: u64, pat: u64, op
             parts.pop();
         }
     }
-    // build the result list back-to-front, rooting the subject, the
-    // partial list and the fresh part across each allocation
+    // Build the result list back to front. The subject, the partial list,
+    // and the fresh part stay rooted across each allocation.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 3, bin, NIL, 0];
     fr[0] = saved;
@@ -683,7 +692,8 @@ pub extern "C" fn mana_rt_binary_split(ctx: *mut ProcCtx, bin: u64, pat: u64, op
     fr[3]
 }
 
-/// binary:match/2,3 (mode 0: {S,L}|nomatch) and matches (mode 1: list).
+/// binary:match/2,3 and binary:matches/2,3. Mode 0 returns {S,L} or nomatch.
+/// Mode 1 returns a list.
 #[no_mangle]
 pub extern "C" fn mana_rt_binary_match(ctx: *mut ProcCtx, bin: u64, pat: u64, mode: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -735,7 +745,7 @@ pub extern "C" fn mana_rt_binary_match(ctx: *mut ProcCtx, bin: u64, pat: u64, mo
     fr[2]
 }
 
-/// binary:copy/2 (copy/1 passes n = 1).
+/// binary:copy/2. binary:copy/1 passes n = 1.
 #[no_mangle]
 pub extern "C" fn mana_rt_binary_copy(ctx: *mut ProcCtx, bin: u64, n: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -747,8 +757,8 @@ pub extern "C" fn mana_rt_binary_copy(ctx: *mut ProcCtx, bin: u64, n: u64) -> u6
     bytes_to_new_bin(ctx, &bytes)
 }
 
-/// binary:at/2 (pos is a term); `last` != 0 → last byte (binary:last/1),
-/// ignoring pos.
+/// binary:at/2. The pos argument is a term. If `last` != 0, the result is the
+/// last byte (binary:last/1) and pos is ignored.
 #[no_mangle]
 pub extern "C" fn mana_rt_binary_at(ctx: *mut ProcCtx, bin: u64, pos: u64, last: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -773,7 +783,7 @@ pub extern "C" fn mana_rt_binary_at(ctx: *mut ProcCtx, bin: u64, pos: u64, last:
     ((b as u64) << 3) | TAG_SMALL
 }
 
-/// binary:encode_unsigned/1,2 (little != 0 → little-endian).
+/// binary:encode_unsigned/1,2. If `little` != 0, the result is little-endian.
 #[no_mangle]
 pub extern "C" fn mana_rt_binary_encode_unsigned(ctx: *mut ProcCtx, n: u64, little: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -803,7 +813,7 @@ pub extern "C" fn mana_rt_binary_decode_unsigned(ctx: *mut ProcCtx, bin: u64, li
     if bin_parts(bin).is_none() {
         return raise_badarg(ctx);
     }
-    // `little` is 0 (the /1 default) or the endianness atom from /2
+    // `little` is 0 (the /1 default) or the endianness atom from /2.
     let is_little =
         little & TAG_MASK == TAG_ATOM && atom_bytes(little) == b"little";
     let bytes = bin_bytes(bin).to_vec();
@@ -816,7 +826,8 @@ pub extern "C" fn mana_rt_binary_decode_unsigned(ctx: *mut ProcCtx, bin: u64, li
     make_int_mag(ctx, false, &mag)
 }
 
-/// binary:longest_common_prefix/1 (suffix != 0 → suffix variant).
+/// binary:longest_common_prefix/1. If `suffix` != 0, the function computes
+/// binary:longest_common_suffix/1 instead.
 #[no_mangle]
 pub extern "C" fn mana_rt_binary_lcp(ctx: *mut ProcCtx, list: u64, suffix: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };

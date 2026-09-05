@@ -1,7 +1,14 @@
+//! Term comparison and the list BIFs that build on it. This module holds
+//! the Erlang term order, exact equality, and the native `lists` functions
+//! that `lists.erl` declares as `nif_error` stubs. Codegen overrides the
+//! `lists.erl` definitions with these natives, so local and remote callers
+//! agree.
+
 use super::*;
 
-/// Erlang term order with numeric coercion (== semantics for numbers).
-/// Lists compared iteratively (payloads can be arbitrarily long).
+/// Erlang term order with numeric coercion. Numbers compare with `==`
+/// semantics. List spines compare in a loop, because a list can be
+/// arbitrarily long.
 #[no_mangle]
 pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
     if a == b {
@@ -14,14 +21,15 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
     match ra {
         0 => {
             if bignum_parts(a).is_some() || bignum_parts(b).is_some() {
-                // int vs int: exact; int vs float: f64 (num_val knows bigs)
+                // Int against int is exact. Int against float compares as
+                // f64. `num_val` knows bignums.
                 if is_int_term(a) && is_int_term(b) {
                     return int_cmp_exact(a, b);
                 }
                 let (x, y) = (num_val(a), num_val(b));
                 return (x > y) as i64 - (x < y) as i64;
             }
-            // numbers, possibly mixed int/float
+            // Numbers. The two can be a mix of int and float.
             if a & TAG_MASK == TAG_SMALL && b & TAG_MASK == TAG_SMALL {
                 let (x, y) = ((a as i64) >> 3, (b as i64) >> 3);
                 return (x > y) as i64 - (x < y) as i64;
@@ -30,7 +38,7 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
             (x > y) as i64 - (x < y) as i64
         }
         1 => {
-            // atoms: by text
+            // Atoms compare by their text.
             let (x, y) = (atom_bytes(a), atom_bytes(b));
             match x.cmp(y) {
                 std::cmp::Ordering::Less => -1,
@@ -43,11 +51,13 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
             (x > y) as i64 - (x < y) as i64
         }
         3 => {
-            // funs: arbitrary but consistent (address order)
+            // Funs have no natural order. Address order is arbitrary but
+            // consistent.
             (a > b) as i64 - (a < b) as i64
         }
         6 => unsafe {
-            // maps: size, then keys pairwise, then values pairwise
+            // Maps compare by size, then by keys pairwise, then by values
+            // pairwise.
             let (pa, pb) = (a as *const u64, b as *const u64);
             let (na, nb) = ((*pa >> 8) as usize, (*pb >> 8) as usize);
             if na != nb {
@@ -68,7 +78,7 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
             0
         },
         5 => unsafe {
-            // tuples: size first, then elements
+            // Tuples compare by size first, then by elements.
             let (pa, pb) = (a as *const u64, b as *const u64);
             let (na, nb) = ((*pa >> 8) as usize, (*pb >> 8) as usize);
             if na != nb {
@@ -83,7 +93,7 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
             0
         },
         9 => {
-            // binaries: byte-lexicographic, prefix is smaller
+            // Binaries compare byte by byte. A prefix is smaller.
             let (xa, xb) = (bin_bytes(a), bin_bytes(b));
             match xa.cmp(xb) {
                 std::cmp::Ordering::Less => -1,
@@ -92,7 +102,7 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
             }
         }
         8 => unsafe {
-            // lists: heads recursively, tails iteratively
+            // Lists compare the heads with recursion and the tails in a loop.
             let (mut x, mut y) = (a, b);
             loop {
                 let (px, py) = ((x & !TAG_MASK) as *const u64, (y & !TAG_MASK) as *const u64);
@@ -108,7 +118,8 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
                 let (tx, ty) = (x & TAG_MASK == TAG_CONS, y & TAG_MASK == TAG_CONS);
                 match (tx, ty) {
                     (true, true) => continue,
-                    // improper/ended tails: fall back to general compare
+                    // An improper tail or an ended tail goes to the general
+                    // compare.
                     _ => return mana_rt_compare(x, y),
                 }
             }
@@ -117,7 +128,8 @@ pub extern "C" fn mana_rt_compare(a: u64, b: u64) -> i64 {
     }
 }
 
-/// Exact equality (`=:=`): like compare == 0, but 1 =:= 1.0 is false.
+/// Exact equality (`=:=`). This is like compare == 0, but 1 =:= 1.0 is
+/// false.
 #[no_mangle]
 pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
     if a == b {
@@ -125,10 +137,10 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
     }
     let (ta, tb) = (a & TAG_MASK, b & TAG_MASK);
     if ta != tb {
-        return 0; // exact: int never equals float (different tags)
+        return 0; // An int never equals a float. The tags differ.
     }
     match ta {
-        TAG_SMALL | TAG_ATOM | TAG_PID => 0, // immediates: raw inequality is final
+        TAG_SMALL | TAG_ATOM | TAG_PID => 0, // Immediates: raw inequality is final.
         _ if a == NIL || b == NIL => 0,
         TAG_CONS => unsafe {
             let (mut x, mut y) = (a, b);
@@ -150,9 +162,9 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
         TAG_BOXED => unsafe {
             let (pa, pb) = (a as *const u64, b as *const u64);
             let (ha, hb) = (*pa, *pb);
-            // bin kinds first: a view and a plain binary with equal bytes
-            // are =:= even though their headers differ, so the header
-            // fast-reject below must not see them
+            // Check the binary kinds first. A view and a plain binary with
+            // equal bytes are =:= even though their headers differ. The
+            // header fast-reject below must not see them.
             let bin_kind = |h: u64| matches!(h & 0xff, KIND_BIN | KIND_SUBBIN);
             if bin_kind(ha) || bin_kind(hb) {
                 return (bin_kind(ha) && bin_kind(hb) && bin_bytes(a) == bin_bytes(b)) as i64;
@@ -179,7 +191,7 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
                     1
                 }
                 KIND_BIGNUM => {
-                    // headers equal ⇒ same sign and limb count
+                    // Equal headers mean the same sign and the same limb count.
                     for i in 0..(ha >> 9) as usize {
                         if *pa.add(1 + i) != *pb.add(1 + i) {
                             return 0;
@@ -187,14 +199,14 @@ pub extern "C" fn mana_rt_eq_exact(a: u64, b: u64) -> i64 {
                     }
                     1
                 }
-                _ => 0, // funs: identity only (raw-equal handled above)
+                _ => 0, // Funs are equal by identity only. The raw-equal case returned above.
             }
         },
         _ => 0,
     }
 }
 
-/// erlang:setelement/3 (1-based index).
+/// erlang:setelement/3. The index is 1-based.
 #[no_mangle]
 pub extern "C" fn mana_rt_setelement(ctx: *mut ProcCtx, i: u64, tup: u64, v: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -212,7 +224,7 @@ pub extern "C" fn mana_rt_setelement(ctx: *mut ProcCtx, i: u64, tup: u64, v: u64
         if idx < 1 || idx > n {
             return raise_badarg(ctx);
         }
-        // root the inputs across a potential collection
+        // Root the inputs. The allocation can collect.
         let frame = [0u64, 2, tup, v];
         let saved = ctx.roots_head;
         let mut fr = frame;
@@ -245,14 +257,14 @@ pub extern "C" fn mana_rt_length(ctx: *mut ProcCtx, list: u64) -> u64 {
     }
 }
 
-/// erlang:'++'/2 — copy the left list onto the right.
+/// erlang:'++'/2. Copies the left list onto the right.
 #[no_mangle]
 pub extern "C" fn mana_rt_append(ctx: *mut ProcCtx, left: u64, right: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
     if left == NIL {
         return right;
     }
-    // count (and validate) left
+    // Count the left list. This pass also checks that it is proper.
     let mut n = 0usize;
     let mut t = left;
     while t != NIL {
@@ -262,7 +274,7 @@ pub extern "C" fn mana_rt_append(ctx: *mut ProcCtx, left: u64, right: u64) -> u6
         n += 1;
         t = unsafe { *((t & !TAG_MASK) as *const u64).add(1) };
     }
-    // root left/right across allocation
+    // Root left and right. The allocation can collect.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 2, left, right];
     fr[0] = saved;
@@ -289,11 +301,10 @@ pub extern "C" fn mana_rt_append(ctx: *mut ProcCtx, left: u64, right: u64) -> u6
     block as u64 | TAG_CONS
 }
 
-/// erlang:'--'/2 (quadratic, like small-input BEAM).
+/// erlang:'--'/2. The algorithm is quadratic, like BEAM on small inputs.
 #[no_mangle]
 pub extern "C" fn mana_rt_subtract(ctx: *mut ProcCtx, left: u64, right: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    // collect right into a scratch vec
     let mut rem: Vec<u64> = Vec::new();
     let mut t = right;
     while t != NIL {
@@ -306,7 +317,6 @@ pub extern "C" fn mana_rt_subtract(ctx: *mut ProcCtx, left: u64, right: u64) -> 
             t = *p.add(1);
         }
     }
-    // collect kept elements of left
     let mut kept: Vec<u64> = Vec::new();
     let mut t = left;
     while t != NIL {
@@ -325,11 +335,10 @@ pub extern "C" fn mana_rt_subtract(ctx: *mut ProcCtx, left: u64, right: u64) -> 
     if kept.is_empty() {
         return NIL;
     }
-    // scratch vecs are not GC roots: allocate first, then build (kept holds
-    // terms that could move if alloc collects!) — root them via a frame on
-    // the Rust stack sized dynamically: simplest is one allocation for the
-    // whole spine, done before any element is re-read... but kept already
-    // holds the terms as values. Rooting: temporary frame over the vec.
+    // Scratch vecs are not GC roots. `kept` holds terms that can move if the
+    // allocation collects. A temporary root frame copies `kept` before the
+    // allocation. The loop below reads the elements back from that frame,
+    // not from `kept`.
     let saved = ctx.roots_head;
     let mut fr: Vec<u64> = Vec::with_capacity(2 + kept.len());
     fr.push(saved);
@@ -352,9 +361,7 @@ pub extern "C" fn mana_rt_subtract(ctx: *mut ProcCtx, left: u64, right: u64) -> 
     block as u64 | TAG_CONS
 }
 
-// ---------------------------------------------------------------------------
-// lists C BIFs (nif_error stubs in lists.erl; native here, definitions
-// overridden at codegen so local and remote callers agree)
+// lists BIFs
 
 /// lists:reverse/2.
 #[no_mangle]
@@ -382,7 +389,7 @@ pub extern "C" fn mana_rt_lists_reverse(ctx: *mut ProcCtx, l: u64, acc0: u64) ->
     fr[3]
 }
 
-/// lists:member/2 (=:= comparison). Non-allocating.
+/// lists:member/2. Uses =:= comparison. Does not allocate.
 #[no_mangle]
 pub extern "C" fn mana_rt_lists_member(ctx: *mut ProcCtx, x: u64, l: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -402,8 +409,9 @@ pub extern "C" fn mana_rt_lists_member(ctx: *mut ProcCtx, x: u64, l: u64) -> u64
     known().false_a
 }
 
-/// lists:keyfind/3 (== comparison, like BEAM's CMP). `mode`: 0 = keyfind
-/// (tuple | false), 1 = keymember (bool), 2 = keysearch ({value, T} | false).
+/// lists:keyfind/3. Uses == comparison, like BEAM's CMP. `mode` selects the
+/// result: 0 = keyfind (tuple | false), 1 = keymember (bool),
+/// 2 = keysearch ({value, T} | false).
 #[no_mangle]
 pub extern "C" fn mana_rt_lists_keyfind(
     ctx: *mut ProcCtx,
@@ -433,7 +441,7 @@ pub extern "C" fn mana_rt_lists_keyfind(
                     return match mode {
                         1 => known().true_a,
                         2 => {
-                            // {value, Tuple}: h may be young — root it
+                            // Build {value, Tuple}. `h` can be young, so root it.
                             let saved = ctx.roots_head;
                             let mut fr = [0u64, 1, h];
                             fr[0] = saved;

@@ -1,6 +1,11 @@
+//! Process BIFs: spawn with its link and monitor variants, the process
+//! dictionary, the name registry, send, process_info/2, and the receive
+//! primops. The runtime promotes terms that cross to another scheduler. No
+//! scheduler ever sees the nursery of another.
+
 use super::*;
 
-/// spawn_link/1 — link is established before the child first runs.
+/// spawn_link/1. The runtime creates the link before the child first runs.
 #[no_mangle]
 pub extern "C" fn mana_rt_spawn_link(ctx: *mut ProcCtx, closure: u64) -> u64 {
     let pid = mana_rt_spawn(ctx, closure);
@@ -11,7 +16,7 @@ pub extern "C" fn mana_rt_spawn_link(ctx: *mut ProcCtx, closure: u64) -> u64 {
     pid
 }
 
-/// spawn_monitor/1 — returns the {Pid, Ref} tuple.
+/// spawn_monitor/1. Returns the {Pid, Ref} tuple.
 #[no_mangle]
 pub extern "C" fn mana_rt_spawn_monitor(ctx: *mut ProcCtx, closure: u64) -> u64 {
     let pid = mana_rt_spawn(ctx, closure);
@@ -23,13 +28,14 @@ pub extern "C" fn mana_rt_spawn_monitor(ctx: *mut ProcCtx, closure: u64) -> u64 
     shared_tuple(ctxr, &[pid, r])
 }
 
-/// Shared spawn machinery for MFA-shaped spawns: builds the {M, F, Args}
+/// Shared spawn machinery for MFA-shaped spawns. Builds the {M, F, Args}
 /// pending tuple in the shared old space and registers the process.
 pub(crate) fn spawn_mfa_inner(ctx: &mut ProcCtx, m: u64, f: u64, args: u64) -> u64 {
     let global = ctx.global;
-    // deep-promote the args first: shared_tuple requires old/eternal/immediate
-    // items, and a young args list referenced from the old-space pending tuple
-    // would be missed by minors (no remembered set) and dangle.
+    // Deep-promote the args first. shared_tuple requires old, eternal, or
+    // immediate items. Minors do not see a young args list that the
+    // old-space pending tuple references (there is no remembered set). The
+    // list then dangles.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 3, m, f, args];
     fr[0] = saved;
@@ -72,9 +78,10 @@ pub(crate) fn spawn_mfa_inner(ctx: &mut ProcCtx, m: u64, f: u64, args: u64) -> u
     make_pid(pid)
 }
 
-/// erlang:spawn_opt/4 (and spawn/3, spawn_link/3 with fixed opts).
-/// Understood options: link, monitor, {monitor, _}; sizing/priority hints
-/// are ignored. Returns pid, or {Pid, Ref} when monitoring.
+/// erlang:spawn_opt/4 (also spawn/3 and spawn_link/3 with fixed opts).
+/// Understood options: link, monitor, {monitor, _}. The runtime ignores
+/// sizing and priority hints. Returns the pid, or {Pid, Ref} when it
+/// monitors.
 #[no_mangle]
 pub extern "C" fn mana_rt_spawn_opt_mfa(
     ctx: *mut ProcCtx,
@@ -99,7 +106,7 @@ pub extern "C" fn mana_rt_spawn_opt_mfa(
             match atom_bytes(opt) {
                 b"link" => link = true,
                 b"monitor" => monitor = true,
-                _ => {} // priority etc. — hints we ignore
+                _ => {} // The runtime ignores priority and the other hints.
             }
         } else if opt & TAG_MASK == TAG_BOXED && opt != 0 {
             let hp = opt as *const u64;
@@ -124,11 +131,11 @@ pub extern "C" fn mana_rt_spawn_opt_mfa(
     pid
 }
 
-// ---------------------------------------------------------------------------
-// process dictionary + name registry
+// Process dictionary and name registry
 
-/// put/2 — returns the previous value or undefined. Both key and value are
-/// promoted so the entry is safe for cross-thread readers and minors.
+/// put/2. Returns the previous value or undefined. The function promotes
+/// both the key and the value. Then the entry is safe for cross-thread
+/// readers and minors.
 #[no_mangle]
 pub extern "C" fn mana_rt_pd_put(ctx: *mut ProcCtx, k: u64, v: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -176,16 +183,15 @@ pub extern "C" fn mana_rt_pd_erase(ctx: *mut ProcCtx, k: u64) -> u64 {
     }
 }
 
-/// The whole dictionary as [{K, V}] — for get/0 and process_info.
-/// erlang:get_keys/0 — list of pdict keys.
+/// erlang:get_keys/0. Returns the list of pdict keys.
 #[no_mangle]
 pub extern "C" fn mana_rt_pd_keys(ctx: *mut ProcCtx) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let cell = proc_ref(ctx.global, ctx.current).expect("live current process");
     let p = unsafe { proc_mut(cell) };
     let keys: Vec<u64> = p.pdict.lock().iter().map(|&(k, _)| k).collect();
-    // pdict values are promoted at put — keys are shared-safe; the list
-    // cells still need the acc rooted across allocs
+    // put/2 promoted the pdict entries, so the keys are shared-safe. The
+    // accumulator must stay rooted while the loop allocates list cells.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, NIL];
     fr[0] = saved;
@@ -202,6 +208,7 @@ pub extern "C" fn mana_rt_pd_keys(ctx: *mut ProcCtx) -> u64 {
     fr[2]
 }
 
+/// The whole dictionary as [{K, V}], for get/0 and process_info.
 pub(crate) fn pdict_to_list(ctx: &mut ProcCtx, pid: usize) -> u64 {
     let entries: Vec<(u64, u64)> = match proc_ref(ctx.global, pid) {
         Some(cell) => unsafe { proc_mut(cell) }.pdict.lock().clone(),
@@ -212,7 +219,7 @@ pub(crate) fn pdict_to_list(ctx: &mut ProcCtx, pid: usize) -> u64 {
     fr[0] = saved;
     ctx.roots_head = fr.as_ptr() as u64;
     for &(k, v) in entries.iter().rev() {
-        // k/v are old-space — no rooting needed for them
+        // k and v are old-space terms. They do not need rooting.
         let t = alloc_nursery(ctx, 3);
         unsafe {
             *t = (2 << 8) | KIND_TUPLE;
@@ -238,7 +245,7 @@ pub extern "C" fn mana_rt_pd_get_all(ctx: *mut ProcCtx) -> u64 {
     pdict_to_list(ctxr, cur)
 }
 
-/// Registered names: atom → pid id. Names are dropped at process death.
+/// Registered names: atom → pid id. Process death removes the name.
 pub(crate) static NAME_REGISTRY: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> =
     std::sync::Mutex::new(None);
 
@@ -272,8 +279,8 @@ pub extern "C" fn mana_rt_whereis(ctx: *mut ProcCtx, name: u64) -> u64 {
     }
     let guard = NAME_REGISTRY.lock().unwrap();
     match guard.as_ref().and_then(|m| m.get(&name)) {
-        // a name may outlive its process between death and cleanup — treat
-        // dead as unregistered
+        // A name can outlive its process between death and cleanup. A dead
+        // process counts as unregistered.
         Some(&id) if proc_ref(ctx.global, id).is_some() => make_pid(id),
         _ => known().undefined,
     }
@@ -289,8 +296,9 @@ pub extern "C" fn mana_rt_unregister(ctx: *mut ProcCtx, name: u64) -> u64 {
     }
 }
 
-/// process_info/2 — the closed-world subset: registered_name, dictionary,
-/// message_queue_len; everything else answers undefined.
+/// process_info/2. The closed-world subset: registered_name, dictionary,
+/// trap_exit, current_stacktrace, message_queue_len. All other items answer
+/// undefined.
 #[no_mangle]
 pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -318,7 +326,7 @@ pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) 
                     }
                     t as u64
                 }
-                None => NIL, // BEAM: [] for an unnamed live process
+                None => NIL, // BEAM returns [] for an unnamed live process.
             }
         }
         b"dictionary" => {
@@ -353,7 +361,7 @@ pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) 
             t as u64
         }
         b"current_stacktrace" => {
-            // stacktraces are not built — TODO(stacktraces)
+            // TODO(stacktraces): the runtime does not build stacktraces.
             let t = alloc_nursery(ctx, 3);
             unsafe {
                 *t = (2 << 8) | KIND_TUPLE;
@@ -363,9 +371,9 @@ pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) 
             t as u64
         }
         b"message_queue_len" => {
-            // ingress length is approximate cross-thread; good enough. The
-            // cursor is a receive-scan position, not a consumption mark:
-            // the whole queue counts, like BEAM.
+            // The ingress length is approximate across threads. That is good
+            // enough. The cursor is a receive-scan position, not a
+            // consumption mark. The whole queue counts, as in BEAM.
             let cell = proc_ref(ctx.global, id).unwrap();
             let p = unsafe { proc_mut(cell) };
             let n = p.private.len() + p.ingress.len();
@@ -381,7 +389,7 @@ pub extern "C" fn mana_rt_process_info2(ctx: *mut ProcCtx, pid: u64, item: u64) 
     }
 }
 
-/// erlang:spawn_opt/2 — closure spawn with link/monitor options.
+/// erlang:spawn_opt/2. Spawns a closure with the link and monitor options.
 #[no_mangle]
 pub extern "C" fn mana_rt_spawn_opt_fun(ctx: *mut ProcCtx, fun: u64, opts: u64) -> u64 {
     let ctxr = unsafe { &mut *ctx };
@@ -425,14 +433,14 @@ pub extern "C" fn mana_rt_spawn_opt_fun(ctx: *mut ProcCtx, fun: u64, opts: u64) 
     pid
 }
 
-// ---------------------------------------------------------------------------
-// process BIF surface
+// Process BIF surface
 
-/// Reduction budget exhausted: reschedule the current process.
+/// The reduction budget is exhausted. Reschedules the current process.
 #[no_mangle]
 pub extern "C" fn mana_rt_yield(ctx: *mut ProcCtx) {
     let ctx = unsafe { &mut *ctx };
-    suspend_current(ctx); // state stays Running → scheduler re-queues
+    // The state stays Running, so the scheduler re-queues the process.
+    suspend_current(ctx);
 }
 
 #[no_mangle]
@@ -441,8 +449,9 @@ pub extern "C" fn mana_rt_self(ctx: *mut ProcCtx) -> u64 {
     make_pid(ctx.current)
 }
 
-/// erlang:spawn/1 — returns the pid, or 0 for a non-arity-0-fun argument
-/// (codegen raises badarg). Round-robin placement across schedulers.
+/// erlang:spawn/1. Returns the pid, or 0 when the argument is not a fun of
+/// arity 0. In that case codegen raises badarg. Placement across schedulers
+/// is round-robin.
 #[no_mangle]
 pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
     if closure & TAG_MASK != TAG_BOXED || closure == 0 {
@@ -488,13 +497,14 @@ pub extern "C" fn mana_rt_spawn(ctx: *mut ProcCtx, closure: u64) -> u64 {
     make_pid(pid)
 }
 
-/// erlang:'!'/2 — young payload parts are promoted (copied once), old parts
-/// pass zero-copy. Sends to dead/unknown pids succeed silently.
+/// erlang:'!'/2. The send promotes young payload parts (one copy). Old
+/// parts pass zero-copy. Sends to dead or unknown pids succeed silently.
 #[no_mangle]
 pub extern "C" fn mana_rt_send(ctx: *mut ProcCtx, pid: u64, msg: u64) {
     let mut pid = pid;
     if pid & 0xF == REF_TAG4 {
-        // reply alias: silently dropped when inactive
+        // A reply alias. If the alias is inactive, the runtime drops the
+        // send silently.
         let target = ALIASES
             .lock()
             .unwrap()
@@ -508,7 +518,7 @@ pub extern "C" fn mana_rt_send(ctx: *mut ProcCtx, pid: u64, msg: u64) {
         let ctxr = unsafe { &mut *ctx };
         match mana_rt_whereis(ctxr as *mut ProcCtx, pid) {
             p if p & 0xF == PID_TAG4 => pid = p,
-            _ => return, // BEAM raises badarg; softened — TODO(send-name)
+            _ => return, // TODO(send-name): BEAM raises badarg here. This code returns instead.
         }
     }
     let Some(id) = pid_id(pid) else { return };
@@ -518,9 +528,9 @@ pub extern "C" fn mana_rt_send(ctx: *mut ProcCtx, pid: u64, msg: u64) {
         return;
     };
     let p = unsafe { &*cell.0.get() };
-    // same-scheduler sends stay zero-copy even for young terms: the local
-    // minor drains + scans local ingress queues. Cross-scheduler payloads
-    // promote (so no scheduler ever sees another's nursery).
+    // Same-scheduler sends stay zero-copy even for young terms. The local
+    // minor drains and scans the local ingress queues. Cross-scheduler
+    // payloads promote, so no scheduler ever sees the nursery of another.
     let msg = if p.home == ctx.sched_id {
         msg
     } else {
@@ -541,7 +551,7 @@ pub extern "C" fn mana_rt_send(ctx: *mut ProcCtx, pid: u64, msg: u64) {
     }
 }
 
-// ---- receive primops (erlc lowers `receive` to these) ----
+// Receive primops. erlc lowers `receive` to these.
 
 #[allow(clippy::mut_from_ref)]
 pub(crate) fn cur_proc(ctx: &ProcCtx) -> &mut Process {
@@ -549,7 +559,7 @@ pub(crate) fn cur_proc(ctx: &ProcCtx) -> &mut Process {
     unsafe { proc_mut(&*(ctx.current_cell as *const ProcessCell)) }
 }
 
-/// Move everything from the ingress queue into the private list.
+/// Moves all messages from the ingress queue to the private list.
 pub(crate) fn drain_ingress(p: &mut Process) {
     while let Some(m) = p.ingress.pop() {
         p.private.push_back(m);
@@ -592,8 +602,9 @@ pub extern "C" fn mana_rt_recv_remove(ctx: *mut ProcCtx) {
     p.cursor = 0;
 }
 
-/// recv_wait_timeout: 1 if the timeout elapsed, 0 if a message is available
-/// past the cursor. Timeout term: small int (ms) or 'infinity'.
+/// recv_wait_timeout. Returns 1 if the timeout elapsed. Returns 0 if a
+/// message is available past the cursor. The timeout term is a small int
+/// (ms) or 'infinity'.
 #[no_mangle]
 pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -603,9 +614,9 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
             let p = cur_proc(ctx);
             drain_ingress(p);
             if p.private.len() <= p.cursor {
-                // A timed-out receive ends the scan: the messages this
-                // receive skipped must be visible to the next one (BEAM
-                // resets the save pointer on timeout).
+                // A timed-out receive ends the scan. The messages that this
+                // receive skipped must be visible to the next one. BEAM
+                // resets the save pointer on timeout.
                 p.cursor = 0;
                 return 1;
             }
@@ -613,7 +624,7 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
         }
         Some(Instant::now() + Duration::from_millis(ms as u64))
     } else {
-        None // 'infinity' (or anything non-integer)
+        None // 'infinity', or any non-integer term
     };
     loop {
         {
@@ -624,14 +635,14 @@ pub extern "C" fn mana_rt_recv_wait(ctx: *mut ProcCtx, timeout: u64) -> u64 {
             }
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
-                    p.cursor = 0; // timeout ends the scan (see above)
+                    p.cursor = 0; // The timeout ends the scan (see above).
                     return 1;
                 }
             }
-            // publish Waiting, THEN re-check ingress: a sender on another
+            // Publish Waiting, THEN re-check ingress. A sender on another
             // scheduler pushes to ingress before it reads our state. If it
-            // pushed between our drain above and this store, it saw Running
-            // and did not wake us — re-checking here closes that window.
+            // pushed between the drain above and this store, it saw Running
+            // and did not wake us. The re-check here closes that window.
             {
                 let mut st = p.state.lock();
                 *st = PState::Waiting(deadline);

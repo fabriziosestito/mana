@@ -1,14 +1,19 @@
-use super::*;
+//! Global runtime state and the scheduler loop.
+//!
+//! This module holds the process table, the shared old space, the
+//! per-scheduler `ProcCtx`, and the loop that resumes process coroutines.
+//! The main contract: only the home scheduler thread (or the STW requester
+//! while all schedulers are parked) touches the non-Mutex fields of a
+//! process.
 
-// ---------------------------------------------------------------------------
-// global state
+use super::*;
 
 pub(crate) struct OldSpace {
     pub(crate) chunks: Vec<Chunk>,
 }
 
 impl OldSpace {
-    /// Bump-allocate in the shared old space (caller holds the lock).
+    /// Bump-allocate in the shared old space. The caller must hold the lock.
     pub(crate) fn alloc(&mut self, words: usize, used: &AtomicUsize) -> *mut u64 {
         if let Some(chunk) = self.chunks.last_mut() {
             unsafe {
@@ -40,7 +45,8 @@ impl OldSpace {
 pub(crate) enum PState {
     Runnable,
     Running,
-    /// waiting for a message, with an optional wake deadline
+    /// The process waits for a message. The deadline, if present, is the
+    /// time of the wake.
     Waiting(Option<Instant>),
 }
 
@@ -53,47 +59,54 @@ pub(crate) struct Process {
     pub(crate) saved_roots: u64,
     pub(crate) saved_exc_class: u64,
     pub(crate) saved_exc_reason: u64,
-    /// lock-free sender-side queue. Cross-scheduler senders only ever push
-    /// old-space/immediate terms (send promotes); same-scheduler pushes may
-    /// be young (local minors drain + scan).
+    /// Lock-free queue on the sender side. Cross-scheduler senders only push
+    /// old-space or immediate terms, because send promotes them.
+    /// Same-scheduler pushes can be young terms. Local minors drain and scan
+    /// them.
     pub(crate) ingress: SegQueue<u64>,
-    /// receiver-private message list — home scheduler only, no lock
-    /// home-thread mailbox. VecDeque: remove_message pops from the front
-    /// (or near it) — with a Vec that was O(N) per receive under a backlog
-    /// (a gen_server behind 100k messages spent seconds shifting the tail).
+    /// Private message list of the receiver. Only the home scheduler touches
+    /// it, without a lock. It is a VecDeque because remove_message pops from
+    /// the front or near it. With a Vec, each receive was O(N) under a
+    /// backlog. A gen_server behind 100k messages spent seconds to shift the
+    /// tail.
     pub(crate) private: std::collections::VecDeque<u64>,
-    /// receive cursor into `private` — home scheduler only
+    /// Receive cursor into `private`. Only the home scheduler touches it.
     pub(crate) cursor: usize,
     pub(crate) state: Mutex<PState>,
-    /// spawn closure (old-space) until first resume
+    /// The spawn closure, in old space, until the first resume.
     pub(crate) pending_closure: u64,
-    /// links/monitors/trap flag — mutated cross-thread under this lock
+    /// Links, monitors, and the trap flag. Other threads change them under
+    /// this lock.
     pub(crate) lstate: Mutex<LinkState>,
-    /// process dictionary. Values are promoted at put, so cross-thread
-    /// readers (process_info) only ever see old-space/immediate terms.
+    /// The process dictionary. Values are promoted at put. As a result,
+    /// cross-thread readers (process_info) only see old-space or immediate
+    /// terms.
     pub(crate) pdict: Mutex<Vec<(u64, u64)>>,
-    /// may this process reference its home scheduler's CURRENT nursery?
-    /// Set when it runs (swap-out) or receives any message; cleared by the
-    /// minor that scans it. Clean parked processes are skipped by minors —
-    /// a parked process only gains nursery refs by running or by a local
-    /// send, and its previous refs were forwarded by the prior minor.
+    /// True if this process can reference the CURRENT nursery of its home
+    /// scheduler. It is set when the process runs (swap-out) or receives any
+    /// message. The minor that scans the process clears it. Minors skip clean
+    /// parked processes. A parked process only gains nursery references when
+    /// it runs or when a local send arrives. The previous minor forwarded
+    /// its earlier references.
     pub(crate) dirty: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
 pub(crate) struct LinkState {
     pub(crate) links: Vec<usize>,
-    /// (ref id, watcher pid) — processes monitoring me
+    /// (ref id, watcher pid) pairs. These processes monitor this process.
     pub(crate) monitors_on_me: Vec<(u64, usize)>,
-    /// (ref id, target pid) — processes I monitor
+    /// (ref id, target pid) pairs. This process monitors these processes.
     pub(crate) monitoring: Vec<(u64, usize)>,
     pub(crate) trap_exit: bool,
-    /// pending unhandled exit signal: reason term (old-space/eternal), 0 = none
+    /// The pending unhandled exit signal. It is the reason term, in old
+    /// space or eternal. 0 = none.
     pub(crate) pending_kill: u64,
 }
 
-/// Home-scheduler pinning makes the interior safe: only the home thread (or
-/// the STW requester while everyone is parked) touches non-Mutex fields.
+/// Home-scheduler pinning makes the interior safe. Only the home thread
+/// touches the non-Mutex fields. The STW requester can also touch them
+/// while all schedulers are parked.
 pub(crate) struct ProcessCell(pub(crate) UnsafeCell<Process>);
 
 unsafe impl Send for ProcessCell {}
@@ -101,12 +114,12 @@ unsafe impl Send for ProcessCell {}
 unsafe impl Sync for ProcessCell {}
 
 pub(crate) struct SchedShared {
-    /// pids made runnable by other threads (lock-free)
+    /// Pids that other threads made runnable. The queue is lock-free.
     pub(crate) inject: SegQueue<usize>,
-    /// wake signal for an idle scheduler; the bool defeats lost wakeups
+    /// Wake signal for an idle scheduler. The bool prevents lost wakeups.
     pub(crate) cv: Condvar,
     pub(crate) cv_m: Mutex<bool>,
-    /// registered ProcCtx pointer (for the STW requester)
+    /// The registered ProcCtx pointer, for the STW requester.
     pub(crate) ctx_addr: AtomicUsize,
 }
 
@@ -118,7 +131,7 @@ pub(crate) struct StwState {
 
 pub(crate) struct Global {
     pub(crate) n_scheds: usize,
-    /// fast-path flag mirroring StwState.collecting
+    /// Fast-path flag. It mirrors StwState.collecting.
     pub(crate) stw_flag: AtomicBool,
     pub(crate) scheds: Vec<SchedShared>,
     pub(crate) procs: RwLock<Vec<Option<&'static ProcessCell>>>,
@@ -141,10 +154,11 @@ pub struct ProcCtx {
     pub exc_class: u64,     // word 3 — codegen contract
     pub exc_reason: u64,    // word 4 — codegen contract
     pub reductions: i64,    // word 5 — codegen contract
-    /// word 6 — codegen contract: per-scheduler argument spill for the
-    /// uniform compiled ABI (`ctx + 6 words`). Callers of arity > 6 write
-    /// args 5.. here right before the call; the callee prologue reads them
-    /// before anything else runs. Only valid across that one call edge.
+    /// word 6 — codegen contract. Per-scheduler argument spill for the
+    /// uniform compiled ABI (`ctx + 6 words`). A caller with arity > 6
+    /// writes args 5.. here directly before the call. The callee prologue
+    /// reads them before anything else runs. The slot is only valid across
+    /// that one call edge.
     pub argv_spill: *mut u64,
     pub(crate) nursery_start: *mut u64,
     pub(crate) nursery_words: usize,
@@ -152,7 +166,8 @@ pub struct ProcCtx {
     pub(crate) sched_id: usize,
     pub(crate) run_q: VecDeque<usize>,
     pub(crate) current: usize,
-    /// cached &ProcessCell of the running process (hot path: recv primops)
+    /// Cached &ProcessCell of the running process. The recv primops use it
+    /// on the hot path.
     pub(crate) current_cell: usize,
 }
 
@@ -160,7 +175,8 @@ pub(crate) fn proc_ref(g: &Global, pid: usize) -> Option<&'static ProcessCell> {
     g.procs.read().get(pid).copied().flatten()
 }
 
-/// Home-thread (or STW-requester) access to a process's interior.
+/// Access to the interior of a process. Only the home thread or the STW
+/// requester can call this function.
 #[allow(clippy::mut_from_ref)]
 pub(crate) unsafe fn proc_mut(cell: &ProcessCell) -> &mut Process {
     unsafe { &mut *cell.0.get() }
@@ -168,8 +184,7 @@ pub(crate) unsafe fn proc_mut(cell: &ProcessCell) -> &mut Process {
 
 pub(crate) static REF_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
-// ---------------------------------------------------------------------------
-// initialization & scheduler loop
+// Initialization and the scheduler loop
 
 #[no_mangle]
 pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
@@ -246,7 +261,8 @@ pub(crate) fn register_process(g: &Global, p: Process) -> usize {
     tab.len() - 1
 }
 
-/// Coroutine for a spawned process: applies the (old-space) closure.
+/// Build the coroutine for a spawned process. It applies the closure, which
+/// is in old space.
 pub(crate) fn make_coroutine(global: &'static Global, home: usize) -> ProcCoro {
     let stack = DefaultStack::new(STACK_BYTES).expect("stack allocation failed");
     Coroutine::with_stack(stack, move |yielder, _| {
@@ -254,7 +270,7 @@ pub(crate) fn make_coroutine(global: &'static Global, home: usize) -> ProcCoro {
         let ctx_ref = unsafe { &mut *ctx };
         let p = cur_proc(ctx_ref);
         p.yielder = yielder as *const _;
-        // reload at start: a major may have moved the closure since spawn
+        // Reload the closure at start. A major can move it after the spawn.
         let cl = p.pending_closure;
         p.pending_closure = 0;
         let header = unsafe { *((cl & !TAG_MASK) as *const u64) };
@@ -272,8 +288,8 @@ pub(crate) fn make_coroutine(global: &'static Global, home: usize) -> ProcCoro {
     })
 }
 
-/// Drive the schedulers until the root process (pid 0) returns; its result
-/// (possibly the exception sentinel) becomes the program result.
+/// Drive the schedulers until the root process (pid 0) returns. Its result
+/// becomes the program result. The result can be the exception sentinel.
 #[no_mangle]
 pub extern "C" fn mana_rt_run(
     ctx: *mut ProcCtx,
@@ -281,7 +297,7 @@ pub extern "C" fn mana_rt_run(
 ) -> u64 {
     let global = unsafe { (*ctx).global };
 
-    // the root process: its coroutine calls `entry` directly
+    // The root process. Its coroutine calls `entry` directly.
     {
         let stack = DefaultStack::new(ROOT_STACK_BYTES).expect("stack allocation failed");
         let coro = Coroutine::with_stack(stack, move |yielder, _| {
@@ -352,22 +368,23 @@ pub(crate) fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64
             continue;
         };
         let p = unsafe { proc_mut(cell) };
-        // an exit signal arrived while it was suspended: it never resumes
+        // An exit signal arrived while the process was suspended. It never
+        // resumes.
         {
             let reason = p.lstate.lock().pending_kill;
             if reason != 0 {
                 process_death(ctx, pid, reason);
                 if pid == 0 {
-                    return; // root killed: program ends (result 0)
+                    return; // The root was killed. The program ends with result 0.
                 }
                 continue;
             }
         }
         {
-            // a pid can sit in the run queue more than once (woken, ran,
-            // parked again, woken again before the stale entry drained);
-            // resuming a Waiting coroutine would make its park return
-            // spuriously. Only Runnable entries run.
+            // A pid can sit in the run queue more than once. Example: it woke,
+            // ran, parked again, and woke again before the stale entry
+            // drained. If the loop resumed a Waiting coroutine, its park
+            // returned without cause. Only Runnable entries run.
             let mut st = p.state.lock();
             if *st != PState::Runnable {
                 continue;
@@ -388,7 +405,7 @@ pub(crate) fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64
                 p.saved_roots = ctx.roots_head;
                 p.saved_exc_class = ctx.exc_class;
                 p.saved_exc_reason = ctx.exc_reason;
-                // it ran: its roots/queues may reference the nursery
+                // The process ran. Its roots and queues can reference the nursery.
                 p.dirty.store(true, Ordering::Release);
                 let killed = p.lstate.lock().pending_kill;
                 if killed != 0 {
@@ -407,9 +424,10 @@ pub(crate) fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64
             }
             CoroutineResult::Return(v) => {
                 let reason = if v == EXC_SENTINEL {
-                    // an uncaught exit with reason normal/shutdown/{shutdown,_}
-                    // is an orderly termination (gen_server stop, socket
-                    // close) — silent, like BEAM
+                    // An uncaught exit with reason normal, shutdown, or
+                    // {shutdown,_} is an orderly termination. Examples: a
+                    // gen_server stop, a socket close. It is silent, as on
+                    // BEAM.
                     let quiet = ctx.exc_class == find_atom("exit").unwrap_or(0)
                         && exit_reason_is_quiet(ctx.exc_reason);
                     if pid != 0 && !quiet {
@@ -422,7 +440,7 @@ pub(crate) fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64
                             pid, class, reason
                         );
                     }
-                    ctx.exc_reason // eternal/immediate: shared-safe
+                    ctx.exc_reason // Eternal or immediate. It is safe to share.
                 } else {
                     known().normal
                 };
@@ -439,8 +457,8 @@ pub(crate) fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64
     }
 }
 
-/// No runnable process: wake due sleepers, or sleep until the nearest
-/// deadline / an external wake.
+/// Called when no process is runnable. It wakes the sleepers that are due.
+/// Otherwise it sleeps until the nearest deadline or an external wake.
 pub(crate) fn idle_wait(ctx: &mut ProcCtx) {
     let global = ctx.global;
     let now = Instant::now();

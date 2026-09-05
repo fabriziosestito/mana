@@ -1,14 +1,15 @@
-use super::*;
+//! gen_tcp and inet for the native runtime. OTP's inet stack is never
+//! compiled.
+//!
+//! All syscalls are NONBLOCKING and run on the scheduler thread. On
+//! WouldBlock the operation arms a waiter slot, registers the socket with
+//! the reactor, and parks the process (Waiting). The reactor wakes it
+//! through IO_WAKES. `reactor.rs` documents the lost-wakeup protocol. Every
+//! term argument is converted to a native value BEFORE any park. The Rust
+//! locals of a suspended coroutine are not GC roots, so a term pointer must
+//! never live across a suspend.
 
-// ---------------------------------------------------------------------------
-// gen_tcp / inet (native cut: OTP's inet stack is never compiled)
-//
-// All syscalls are NONBLOCKING and run on the scheduler thread; WouldBlock
-// parks the process (Waiting) after arming a waiter slot + reactor
-// registration, and the reactor wakes it via IO_WAKES (see the reactor
-// section for the lost-wakeup protocol). All term arguments are converted
-// to native values BEFORE any park: a suspended coroutine's Rust locals are
-// not GC roots, so term pointers must never be used across a suspend.
+use super::*;
 
 pub(crate) fn sock_handle(ctx: &mut ProcCtx, idx: usize) -> u64 {
     let p = alloc_nursery(ctx, 3);
@@ -41,7 +42,7 @@ pub(crate) fn sock_resolve(t: u64) -> Option<usize> {
     }
 }
 
-/// Options both connect/listen accept; active semantics land in Phase D.
+/// Options that both connect and listen accept.
 #[derive(Clone, Copy)]
 pub(crate) struct TcpOpts {
     pub(crate) binary: bool,
@@ -57,7 +58,7 @@ pub(crate) fn parse_tcp_opts(mut cur: u64) -> Result<TcpOpts, ()> {
             match atom_bytes(h) {
                 b"binary" => o.binary = true,
                 b"list" => o.binary = false,
-                _ => {} // reuseaddr etc. accepted as bare atoms too
+                _ => {} // Other bare atoms, for example reuseaddr, are accepted.
             }
         } else if h & TAG_MASK == TAG_BOXED && h != 0 {
             unsafe {
@@ -87,7 +88,7 @@ pub(crate) fn parse_tcp_opts(mut cur: u64) -> Result<TcpOpts, ()> {
                             }
                         }
                         b"packet" => {
-                            // raw/0 only — TODO(packet)
+                            // Only raw and 0 are accepted. TODO(packet): other packet modes.
                             let raw = (v & TAG_MASK == TAG_SMALL && v >> 3 == 0)
                                 || (v & TAG_MASK == TAG_ATOM
                                     && matches!(atom_bytes(v), b"raw" | b"0"));
@@ -95,7 +96,8 @@ pub(crate) fn parse_tcp_opts(mut cur: u64) -> Result<TcpOpts, ()> {
                                 return Err(());
                             }
                         }
-                        // reuseaddr/backlog/nodelay/mode etc: accepted
+                        // Other options, for example reuseaddr, backlog, and
+                        // nodelay, are accepted and ignored.
                         _ => {}
                     }
                 }
@@ -106,7 +108,8 @@ pub(crate) fn parse_tcp_opts(mut cur: u64) -> Result<TcpOpts, ()> {
     Ok(o)
 }
 
-/// {A,B,C,D} tuple | binary | charlist | atom 'localhost' → IpAddr.
+/// Converts an address term to an IpAddr. The term is an {A,B,C,D} tuple, a
+/// binary, a charlist, or the atom 'localhost'.
 pub(crate) fn ip_of(t: u64) -> Result<std::net::IpAddr, ()> {
     use std::net::{IpAddr, Ipv4Addr};
     if t & TAG_MASK == TAG_BOXED && t != 0 {
@@ -129,8 +132,9 @@ pub(crate) fn ip_of(t: u64) -> Result<std::net::IpAddr, ()> {
             }
         }
     }
-    // hostname as chardata/atom: numeric or localhost only stays
-    // nonblocking; general getaddrinfo blocks (documented)
+    // A hostname as chardata or an atom: only a numeric address or localhost
+    // stays nonblocking. A general getaddrinfo call blocks, so it is not
+    // supported.
     let mut bytes = Vec::new();
     if t & TAG_MASK == TAG_ATOM {
         bytes.extend_from_slice(atom_bytes(t));
@@ -159,9 +163,9 @@ pub(crate) fn closed_err(ctx: &mut ProcCtx) -> u64 {
     pair_term(ctx, b"error", atom_intern(b"closed"))
 }
 
-/// Arm the read/write waiter + registration, then park until the reactor
-/// (or the deadline via idle_wait) wakes us. Returns false on timeout.
-/// The SOCKETS lock must NOT be held by the caller.
+/// Arms the read or write waiter and the reactor registration, then parks the
+/// process. The reactor wakes it, or idle_wait wakes it at the deadline.
+/// Returns false on timeout. The caller must NOT hold the SOCKETS lock.
 pub(crate) fn park_on_socket(
     ctx: &mut ProcCtx,
     idx: usize,
@@ -172,7 +176,7 @@ pub(crate) fn park_on_socket(
     {
         let mut tab = SOCKETS.lock().unwrap();
         let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-            return true; // closed under us: let the caller's retry observe it
+            return true; // The socket closed under us. The caller's retry observes it.
         };
         if want_read {
             entry.read_waiter = Some(pid);
@@ -193,12 +197,13 @@ pub(crate) fn park_on_socket(
         }
     }
     {
-        // publish Waiting, then re-check the mailbox under the lock: a
-        // sender that saw us Running pushed to ingress without queueing us.
-        // A message is not what this park waits for, but stranding it
-        // until the process next blocks in `receive` is a lost wakeup
-        // (Bandit's connection loop: tcp op, then gen_server receive).
-        // Return spuriously instead; the op retries and re-parks.
+        // Publish Waiting, then check the mailbox again under the lock. A
+        // sender that saw us Running pushed to ingress and did not enqueue
+        // us for a run. A message is not what this park waits for. But if
+        // the message waits until the process next blocks in `receive`, that
+        // is a lost wakeup (Bandit's connection loop: tcp op, then gen_server
+        // receive). Instead, return spuriously. The op retries and parks
+        // again.
         let p = cur_proc(ctx);
         let mut st = p.state.lock();
         *st = PState::Waiting(deadline);
@@ -231,7 +236,7 @@ pub(crate) fn clear_waiter(idx: usize, pid: usize, want_read: bool) {
     }
 }
 
-// tcp op codes (codegen compile dispatch mirrors these)
+// TCP op codes. The codegen compile dispatch mirrors these values.
 pub const T_CONNECT: u64 = 0;
 
 pub const T_LISTEN: u64 = 1;
@@ -240,8 +245,9 @@ pub const T_ACCEPT: u64 = 2;
 
 pub const T_RECV: u64 = 3;
 
-/// file:sendfile/5 (RawFile, Socket, Offset, Bytes, _Opts) — read-at +
-/// parking send loop; Bytes == 0 streams to EOF. Returns {ok, Sent}.
+/// file:sendfile/5 (RawFile, Socket, Offset, Bytes, _Opts). Reads the file at
+/// an offset and sends with a parking send loop. Bytes == 0 streams to EOF.
+/// Returns {ok, Sent}.
 #[no_mangle]
 pub extern "C" fn mana_rt_sendfile(
     ctx: *mut ProcCtx,
@@ -263,7 +269,7 @@ pub extern "C" fn mana_rt_sendfile(
         return raise_badarg(ctx);
     }
     let base = (off_t as i64 >> 3) as u64;
-    let want = (len_t as i64 >> 3) as u64; // 0 = to EOF
+    let want = (len_t as i64 >> 3) as u64; // 0 means: stream to EOF.
     let mut sent = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -289,9 +295,9 @@ pub extern "C" fn mana_rt_sendfile(
             }
         };
         if n == 0 {
-            break; // EOF: {ok, actually_sent}, like BEAM
+            break; // EOF: return {ok, Sent} with the real count, like BEAM.
         }
-        // socket send with partial-write parking (the T_SEND discipline)
+        // Socket send with partial-write parking, the same discipline as T_SEND.
         let mut off = 0usize;
         while off < n {
             let step: Result<Option<usize>, std::io::Error> = {
@@ -370,7 +376,7 @@ pub(crate) fn addr_tuple(ctx: &mut ProcCtx, addr: std::net::SocketAddr) -> u64 {
     let small = |v: i64| ((v << 3) as u64) | TAG_SMALL;
     let ip = match addr.ip() {
         std::net::IpAddr::V4(v4) => v4.octets(),
-        std::net::IpAddr::V6(_) => [0, 0, 0, 0], // TODO(ipv6)
+        std::net::IpAddr::V6(_) => [0, 0, 0, 0], // TODO(ipv6): return the real IPv6 address.
     };
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, NIL];
@@ -407,7 +413,7 @@ pub extern "C" fn mana_rt_tcp(
     let ctx = unsafe { &mut *ctx };
     match op {
         T_CONNECT => {
-            // a=addr, b=port, c=opts, d=timeout
+            // Arguments: a is addr, b is port, c is opts, d is timeout.
             let Ok(ip) = ip_of(a) else { return raise_badarg(ctx) };
             if b & TAG_MASK != TAG_SMALL {
                 return raise_badarg(ctx);
@@ -432,7 +438,7 @@ pub extern "C" fn mana_rt_tcp(
                 recv_oct: 0,
                 send_oct: 0,
             });
-            // wait for writability, then check SO_ERROR
+            // Wait for writability, then check SO_ERROR.
             loop {
                 {
                     let mut tab = SOCKETS.lock().unwrap();
@@ -456,8 +462,8 @@ pub extern "C" fn mana_rt_tcp(
                             if e.kind() == std::io::ErrorKind::NotConnected
                                 || e.raw_os_error() == Some(libc_einprogress()) =>
                         {
-                            // a refused connect also reports NotConnected
-                            // from peer_addr — the verdict lives in SO_ERROR
+                            // A refused connect also reports NotConnected
+                            // from peer_addr. The verdict lives in SO_ERROR.
                             if let Ok(Some(err)) = s.take_error() {
                                 tab.slots[idx] = None;
                                 tab.free.push(idx);
@@ -506,7 +512,7 @@ pub extern "C" fn mana_rt_tcp(
             }
         }
         T_LISTEN => {
-            // a=port, b=opts
+            // Arguments: a is port, b is opts.
             if a & TAG_MASK != TAG_SMALL {
                 return raise_badarg(ctx);
             }
@@ -537,7 +543,7 @@ pub extern "C" fn mana_rt_tcp(
             }
         }
         T_ACCEPT => {
-            // a=lsock, b=timeout
+            // Arguments: a is lsock, b is timeout.
             let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
             let Ok(deadline) = timeout_deadline(b) else { return raise_badarg(ctx) };
             loop {
@@ -594,7 +600,7 @@ pub extern "C" fn mana_rt_tcp(
             }
         }
         T_RECV => {
-            // a=sock, b=len, c=timeout
+            // Arguments: a is sock, b is len, c is timeout.
             let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
             if b & TAG_MASK != TAG_SMALL || (b as i64 >> 3) < 0 {
                 return raise_badarg(ctx);
@@ -616,7 +622,6 @@ pub extern "C" fn mana_rt_tcp(
                         return closed_err(ctx);
                     };
                     let binary = entry.binary;
-                    // enough buffered already?
                     if want > 0 && entry.rbuf.len() >= want {
                         let rest = entry.rbuf.split_off(want);
                         let data = std::mem::replace(&mut entry.rbuf, rest);
@@ -690,7 +695,7 @@ pub extern "C" fn mana_rt_tcp(
             }
         }
         T_SEND => {
-            // a=sock, b=iodata
+            // Arguments: a is sock, b is iodata.
             let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
             let mut data = Vec::new();
             if iolist_flatten(b, &mut data).is_err() {
@@ -757,7 +762,7 @@ pub extern "C" fn mana_rt_tcp(
                 e
             };
             if let Some(e) = entry {
-                // waiters retry, observe the missing entry → {error, closed}
+                // Waiters retry, see the missing entry, and return {error, closed}.
                 if let Some(pid) = e.read_waiter {
                     IO_WAKES.push((pid, idx, true));
                 }
@@ -767,7 +772,8 @@ pub extern "C" fn mana_rt_tcp(
                 for s in 0..ctx.global.n_scheds {
                     wake_sched(ctx.global, s);
                 }
-                // dropping the source closes the fd (epoll auto-deregisters)
+                // The drop of the source closes the fd. epoll deregisters it
+                // on close.
             }
             atom_intern(b"ok")
         }
@@ -843,8 +849,9 @@ pub extern "C" fn mana_rt_tcp(
             }
             drop(tab);
             if activated {
-                // deliver anything already buffered (or an edge the kernel
-                // already reported) — the pump no-ops if the socket is quiet
+                // Deliver data that is already buffered, or an edge that the
+                // kernel already reported. If the socket is quiet, the pump
+                // does nothing.
                 ensure_registered_active(ctx, idx);
                 IO_ACTIVE.push(idx);
                 for s in 0..ctx.global.n_scheds {
@@ -952,7 +959,8 @@ pub extern "C" fn mana_rt_tcp(
                 };
                 (entry.active, entry.binary)
             };
-            // answer the asked-for option names we model; skip unknowns
+            // Answer only the requested option names that the runtime models.
+            // Skip unknown names.
             let mut wanted: Vec<&'static [u8]> = Vec::new();
             let mut cur = b;
             while cur & TAG_MASK == TAG_CONS {
@@ -989,8 +997,8 @@ pub extern "C" fn mana_rt_tcp(
                             atom_intern(b"list")
                         }
                     }
-                    b"packet" => TAG_SMALL, // small 0
-                    _ => known().true_a, // nodelay/keepalive/reuseaddr
+                    b"packet" => TAG_SMALL, // The small integer 0.
+                    _ => known().true_a, // nodelay, keepalive, and reuseaddr always report true.
                 };
                 let t = alloc_nursery(ctx, 3);
                 unsafe {
@@ -1015,16 +1023,17 @@ pub extern "C" fn mana_rt_tcp(
 }
 
 pub(crate) fn libc_einprogress() -> i32 {
-    115 // linux EINPROGRESS
+    115 // Linux EINPROGRESS.
 }
 
-// ---- active mode ({active, once | true}) ----
-//
-// The reactor never reads sockets: on a readable event for an active socket
-// with no parked reader it enqueues the index here; a scheduler drains at
-// its loop top, performs the nonblocking reads, and delivers real
-// {tcp, Sock, Data} / {tcp_closed, Sock} messages to the owner (built in
-// the shared old space — push_and_wake requires shared-safe terms).
+// Active mode ({active, once | true})
+
+/// Queue of active sockets that have a readable event and no parked reader.
+/// The reactor never reads sockets. It pushes the socket index here. A
+/// scheduler drains the queue at its loop top, performs the nonblocking
+/// reads, and delivers {tcp, Sock, Data} and {tcp_closed, Sock} messages to
+/// the owner. The messages are built in the shared old space, because
+/// push_and_wake requires shared-safe terms.
 pub(crate) static IO_ACTIVE: SegQueue<usize> = SegQueue::new();
 
 pub(crate) fn shared_bin(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
@@ -1033,7 +1042,7 @@ pub(crate) fn shared_bin(ctx: &mut ProcCtx, bytes: &[u8]) -> u64 {
     unsafe {
         *p = ((bytes.len() as u64) << 8) | KIND_BIN;
         if words > 1 {
-            *p.add(words - 1) = 0; // zero the padding tail word
+            *p.add(words - 1) = 0; // The padding tail word must be zero.
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(1) as *mut u8, bytes.len());
     }
@@ -1060,8 +1069,8 @@ pub(crate) fn shared_sock_handle(ctx: &mut ProcCtx, idx: usize) -> u64 {
     )
 }
 
-/// Register an active socket with the reactor if it isn't yet (sockets that
-/// never park would otherwise never get events).
+/// Registers an active socket with the reactor if it is not registered yet.
+/// Without this, a socket that never parks never gets events.
 pub(crate) fn ensure_registered_active(ctx: &mut ProcCtx, idx: usize) {
     let mut need = false;
     {
@@ -1082,7 +1091,8 @@ pub(crate) fn ensure_registered_active(ctx: &mut ProcCtx, idx: usize) {
     }
 }
 
-/// Drain pending active-mode sockets (scheduler loop top, a safepoint).
+/// Drains the pending active-mode sockets. The scheduler calls this at its
+/// loop top, which is a safepoint.
 pub(crate) fn drain_io_active(ctx: &mut ProcCtx) {
     let n = IO_ACTIVE.len();
     for _ in 0..n {
@@ -1095,19 +1105,19 @@ pub(crate) fn active_pump(ctx: &mut ProcCtx, idx: usize) {
     use std::io::Read;
     loop {
         enum Ev {
-            Data(Vec<u8>, usize, bool, bool), // bytes, owner, binary, once
+            Data(Vec<u8>, usize, bool, bool), // Fields: bytes, owner, binary, once.
             Closed(usize),
             Quiet,
         }
-        // read + state transitions under the lock; deliver outside it
-        // (push_and_wake takes state locks — never nest under SOCKETS)
+        // Read and change state under the lock. Deliver outside the lock.
+        // push_and_wake takes state locks. Never nest them under SOCKETS.
         let ev = {
             let mut tab = SOCKETS.lock().unwrap();
             let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
                 return;
             };
             if entry.active == ActiveMode::Passive {
-                return; // deactivated (or tcp_closed already sent)
+                return; // The socket is passive now, or tcp_closed was already sent.
             }
             let owner = entry.owner;
             let binary = entry.binary;
@@ -1120,11 +1130,11 @@ pub(crate) fn active_pump(ctx: &mut ProcCtx, idx: usize) {
                 Ev::Data(data, owner, binary, once)
             } else {
                 let SockSource::Stream(s) = &mut entry.source else {
-                    return; // listeners have no active data
+                    return; // A listener has no active data.
                 };
                 match with_recv_scratch(|chunk| s.read(chunk).map(|k| chunk[..k].to_vec())) {
                     Ok(data) if data.is_empty() => {
-                        entry.active = ActiveMode::Passive; // tcp_closed once
+                        entry.active = ActiveMode::Passive; // Send tcp_closed only once.
                         Ev::Closed(owner)
                     }
                     Ok(data) => {

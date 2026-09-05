@@ -1,6 +1,14 @@
+//! System BIFs: environment, hashing, process and system flags, memory and
+//! statistics reports, time, `system_info/1`, external commands, and timers.
+//! Values that BEAM computes from VM internals are approximations here. The
+//! doc of each function states where the value diverges from BEAM. The
+//! timer thread runs outside the stop-the-world protocol. It never touches
+//! process or scheduler state. It only enqueues deliveries that schedulers
+//! drain at a safepoint.
+
 use super::*;
 
-/// os:getenv/1 (nif_error stub in os.erl — real BIF on BEAM).
+/// os:getenv/1. In os.erl this is a nif_error stub. On BEAM it is a real BIF.
 #[no_mangle]
 pub extern "C" fn mana_rt_os_getenv(ctx: *mut ProcCtx, name: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -28,12 +36,13 @@ pub extern "C" fn mana_rt_iolist_size(ctx: *mut ProcCtx, t: u64) -> u64 {
     ((out.len() as i64) << 3) as u64 | TAG_SMALL
 }
 
-/// erlang:phash2/1,2 — structural term hash. Values are STABLE for this
-/// runtime but do NOT match BEAM's phash2 (documented divergence; callers
-/// use it for sharding/ids, not persisted values).
+/// erlang:phash2/1,2: a structural term hash. Values are stable for this
+/// runtime. They do not match the phash2 values of BEAM. This is a documented
+/// divergence. Callers use the hash for sharding and ids, not for persisted
+/// values.
 pub(crate) fn phash2_term(t: u64, h: &mut u64) {
     fn mix(h: &mut u64, v: u64) {
-        *h = (*h ^ v).wrapping_mul(0x100000001b3); // FNV-ish
+        *h = (*h ^ v).wrapping_mul(0x100000001b3); // FNV-style mix
     }
     match t & TAG_MASK {
         TAG_SMALL => mix(h, t),
@@ -59,7 +68,7 @@ pub(crate) fn phash2_term(t: u64, h: &mut u64) {
         TAG_BOXED if t != 0 => unsafe {
             let p = t as *const u64;
             let kind = *p & 0xff;
-            // views hash as binaries: equal bytes must hash equal
+            // Views hash as binaries. Equal bytes must hash equal.
             mix(h, 5 + if kind == KIND_SUBBIN { KIND_BIN } else { kind });
             match kind {
                 KIND_TUPLE | KIND_MAP => {
@@ -84,7 +93,7 @@ pub(crate) fn phash2_term(t: u64, h: &mut u64) {
                 _ => mix(h, *p),
             }
         },
-        _ => mix(h, t), // pids etc: identity word
+        _ => mix(h, t), // pids and other immediates hash by identity word
     }
 }
 
@@ -92,7 +101,7 @@ pub(crate) fn phash2_term(t: u64, h: &mut u64) {
 pub extern "C" fn mana_rt_phash2(ctx: *mut ProcCtx, t: u64, range: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let modulus = if range == 0 {
-        1u64 << 27 // phash2/1 default range
+        1u64 << 27 // the default range of phash2/1
     } else {
         if range & TAG_MASK != TAG_SMALL || (range as i64 >> 3) <= 0 {
             return raise_badarg(ctx);
@@ -104,8 +113,9 @@ pub extern "C" fn mana_rt_phash2(ctx: *mut ProcCtx, t: u64, range: u64) -> u64 {
     (((h % modulus) as i64) << 3) as u64 | TAG_SMALL
 }
 
-/// erlang:unique_integer/0,1 — a global counter (uniqueness only; the
-/// positive/monotonic option atoms are all satisfied by counting up).
+/// erlang:unique_integer/0,1: a global counter. It gives uniqueness only. A
+/// counter that counts up also satisfies the positive and monotonic option
+/// atoms.
 pub(crate) static UNIQUE_INTEGER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
 
 #[no_mangle]
@@ -114,7 +124,8 @@ pub extern "C" fn mana_rt_unique_integer(_ctx: *mut ProcCtx) -> u64 {
     ((v << 3) as u64) | TAG_SMALL
 }
 
-/// erlang:is_record/3 — tuple whose first element is Tag with Size arity.
+/// erlang:is_record/3: true for a tuple of arity Size whose first element is
+/// Tag.
 #[no_mangle]
 pub extern "C" fn mana_rt_is_record(t: u64, tag: u64, size: u64) -> u64 {
     if size & TAG_MASK != TAG_SMALL || t & TAG_MASK != TAG_BOXED || t == 0 {
@@ -134,8 +145,9 @@ pub extern "C" fn mana_rt_is_record(t: u64, tag: u64, size: u64) -> u64 {
     }
 }
 
-/// erlang:process_flag/2 — trap_exit is real; the scheduler-tuning flags
-/// are accepted no-ops with plausible old values; unknown flags badarg.
+/// erlang:process_flag/2. The trap_exit flag is real. The scheduler tuning
+/// flags are accepted no-ops that return plausible old values. Unknown flags
+/// raise badarg.
 #[no_mangle]
 pub extern "C" fn mana_rt_process_flag(ctx: *mut ProcCtx, flag: u64, value: u64) -> u64 {
     let ctxp = ctx;
@@ -154,9 +166,9 @@ pub extern "C" fn mana_rt_process_flag(ctx: *mut ProcCtx, flag: u64, value: u64)
     }
 }
 
-/// erlang:system_flag/2 — accepted no-ops returning plausible old values
-/// (VM tuning knobs that have no meaning here; Phoenix sets
-/// backtrace_depth at application start).
+/// erlang:system_flag/2: accepted no-ops that return plausible old values.
+/// These VM tuning knobs have no meaning in this runtime. Phoenix sets
+/// backtrace_depth at application start.
 #[no_mangle]
 pub extern "C" fn mana_rt_system_flag(ctx: *mut ProcCtx, flag: u64, _value: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -170,7 +182,8 @@ pub extern "C" fn mana_rt_system_flag(ctx: *mut ProcCtx, flag: u64, _value: u64)
     }
 }
 
-/// persistent_term:info/0 — #{count => N, memory => bytes-ish}.
+/// persistent_term:info/0: returns #{count => N, memory => Bytes}. The memory
+/// value is an estimate.
 #[no_mangle]
 pub extern "C" fn mana_rt_pt_info(ctx: *mut ProcCtx) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -183,7 +196,7 @@ pub extern "C" fn mana_rt_pt_info(ctx: *mut ProcCtx) -> u64 {
     let t = alloc_nursery(ctx, 5);
     unsafe {
         *t = (2 << 8) | KIND_MAP;
-        // sorted flatmap: atom order is by name — count < memory
+        // A flatmap is sorted. Atoms sort by name, so count comes before memory.
         *t.add(1) = atom_intern(b"count");
         *t.add(2) = (count << 3) | TAG_SMALL;
         *t.add(3) = atom_intern(b"memory");
@@ -192,9 +205,10 @@ pub extern "C" fn mana_rt_pt_info(ctx: *mut ProcCtx) -> u64 {
     t as u64
 }
 
-/// erlang:memory/0 — allocator stats mapped onto BEAM's key set. Values
-/// come from OUR heaps (old space + nurseries), so absolute numbers
-/// diverge from BEAM (documented; consumers chart trends, not identities).
+/// erlang:memory/0: allocator statistics mapped onto the key set of BEAM.
+/// The values come from the heaps of this runtime (old space plus nurseries).
+/// The absolute numbers diverge from BEAM. This is documented. Consumers
+/// chart trends, not identities.
 #[no_mangle]
 pub extern "C" fn mana_rt_memory(ctx: *mut ProcCtx) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -216,9 +230,9 @@ pub extern "C" fn mana_rt_memory(ctx: *mut ProcCtx) -> u64 {
         (b"code", 0),
         (b"ets", 0),
     ];
-    // build [{k, v} | ...] back-to-front; BOTH the list and the fresh
-    // tuple are frame-rooted across the cons allocation (a Rust local is
-    // not a GC root — the cons alloc can move the tuple)
+    // Build [{k, v} | ...] back to front. Both the list and the fresh tuple
+    // must be frame-rooted across the cons allocation. A Rust local is not a
+    // GC root, and the cons allocation can move the tuple.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 2, NIL, NIL];
     fr[0] = saved;
@@ -243,7 +257,7 @@ pub extern "C" fn mana_rt_memory(ctx: *mut ProcCtx) -> u64 {
     fr[2]
 }
 
-/// erlang:statistics/1 — the telemetry_poller keys only.
+/// erlang:statistics/1: only the keys that telemetry_poller reads.
 #[no_mangle]
 pub extern "C" fn mana_rt_statistics(ctx: *mut ProcCtx, item: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -251,22 +265,22 @@ pub extern "C" fn mana_rt_statistics(ctx: *mut ProcCtx, item: u64) -> u64 {
         return raise_badarg(ctx);
     }
     match atom_bytes(item) {
-        // run queues are drained at safepoints; a snapshot of 0 is honest
-        // enough for poller charts
+        // Run queues drain at safepoints. A snapshot of 0 is accurate enough
+        // for poller charts.
         b"total_run_queue_lengths" | b"total_run_queue_lengths_all" | b"run_queue" => TAG_SMALL,
         _ => raise_badarg(ctx),
     }
 }
 
-// ---------------------------------------------------------------------------
-// time
+// Time
 
 pub(crate) fn monotonic_epoch() -> std::time::Instant {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     *EPOCH.get_or_init(std::time::Instant::now)
 }
 
-/// Convert nanoseconds to the requested unit term (atom or integer hertz).
+/// Converts nanoseconds to the requested unit. The unit is an atom or an
+/// integer in hertz.
 pub(crate) fn in_time_unit(ctx: &mut ProcCtx, nanos: i128, unit: u64) -> u64 {
     let v: i128 = if unit & TAG_MASK == TAG_SMALL {
         let hz = unit as i64 >> 3;
@@ -292,9 +306,10 @@ pub(crate) fn in_time_unit(ctx: &mut ProcCtx, nanos: i128, unit: u64) -> u64 {
     make_int_mag(ctx, neg && !mag.is_empty(), &mag)
 }
 
-/// erlang:fun_info/2 — closures carry no module/name metadata; arity and
-/// env answer truthfully, the rest is undefined (callers only thread the
-/// {Item, Value} shape through — Agent's initial_call bookkeeping).
+/// erlang:fun_info/2. Closures carry no module or name metadata. The arity
+/// and env items answer truthfully. Every other item is undefined. Callers
+/// only pass the {Item, Value} shape through, for example the initial_call
+/// bookkeeping of Agent.
 #[no_mangle]
 pub extern "C" fn mana_rt_fun_info(ctx: *mut ProcCtx, fun: u64, item: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -308,9 +323,9 @@ pub extern "C" fn mana_rt_fun_info(ctx: *mut ProcCtx, fun: u64, item: u64) -> u6
     let value = match atom_bytes(item) {
         b"arity" => ((((header >> 8) & 0xff) << 3) as u64) | TAG_SMALL,
         b"env" => NIL,
-        // closures carry no MFA metadata — every fun reports as local
-        // (telemetry:attach warns-and-proceeds on local; BEAM would say
-        // external for `fun M:F/A` captures — documented divergence)
+        // Closures carry no MFA metadata, so every fun reports as local.
+        // telemetry:attach warns and proceeds on local. BEAM answers external
+        // for `fun M:F/A` captures. This is a documented divergence.
         b"type" => atom_intern(b"local"),
         _ => known().undefined,
     };
@@ -328,8 +343,8 @@ pub extern "C" fn mana_rt_fun_info(ctx: *mut ProcCtx, fun: u64, item: u64) -> u6
     t as u64
 }
 
-/// erlang:fun_info_mfa/1 — closures carry no MFA metadata; arity is real,
-/// module/name are undefined (callers only display them).
+/// erlang:fun_info_mfa/1. Closures carry no MFA metadata. The arity is real.
+/// The module and the name are undefined. Callers only display them.
 #[no_mangle]
 pub extern "C" fn mana_rt_fun_info_mfa(ctx: *mut ProcCtx, fun: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -365,7 +380,7 @@ pub extern "C" fn mana_rt_is_process_alive(ctx: *mut ProcCtx, pid: u64) -> u64 {
     }
 }
 
-/// erlang:monotonic_time/1 (unit 'native' == nanosecond here).
+/// erlang:monotonic_time/1. The unit 'native' is one nanosecond here.
 #[no_mangle]
 pub extern "C" fn mana_rt_monotonic_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -373,15 +388,14 @@ pub extern "C" fn mana_rt_monotonic_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     in_time_unit(ctx, nanos, unit)
 }
 
-/// erlang:system_time/1 — true Unix epoch; nanosecond magnitudes come
-/// back as bignums.
+/// erlang:system_time/1: the true Unix epoch. Nanosecond magnitudes come back
+/// as bignums.
 #[no_mangle]
 pub extern "C" fn mana_rt_system_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    // true Unix epoch: absolute nanoseconds exceed the small range and
-    // come back as bignums (the old 2020-offset hack put every absolute
-    // wall-clock reading 50 years in the past — the famous 1976 Date
-    // header)
+    // Absolute nanoseconds since the Unix epoch exceed the small range. They
+    // come back as bignums. An earlier 2020 offset put every absolute wall
+    // clock reading 50 years in the past. That caused the 1976 Date header.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
@@ -389,7 +403,7 @@ pub extern "C" fn mana_rt_system_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
     in_time_unit(ctx, nanos, unit)
 }
 
-/// erlang:convert_time_unit/3 — from/to as unit terms.
+/// erlang:convert_time_unit/3. The from and to arguments are unit terms.
 #[no_mangle]
 pub extern "C" fn mana_rt_convert_time_unit(
     ctx: *mut ProcCtx,
@@ -401,7 +415,7 @@ pub extern "C" fn mana_rt_convert_time_unit(
     let v: i128 = if t & TAG_MASK == TAG_SMALL {
         (t as i64 >> 3) as i128
     } else if let Some((neg, mag)) = bignum_parts(t) {
-        // wall-clock magnitudes fit two limbs comfortably
+        // Wall clock magnitudes fit in two limbs.
         if mag.len() > 2 {
             return raise_badarg(ctx);
         }
@@ -429,8 +443,8 @@ pub extern "C" fn mana_rt_convert_time_unit(
     in_time_unit(ctx, nanos, to)
 }
 
-/// erlang:system_info/1 — the closed-world answer sheet. Extend as
-/// callers appear; unknown items raise badarg (loud).
+/// erlang:system_info/1: the closed-world answer sheet. Extend it when new
+/// callers appear. An unknown item raises badarg, so a gap is loud.
 #[no_mangle]
 pub extern "C" fn mana_rt_system_info(ctx: *mut ProcCtx, item: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -463,8 +477,8 @@ pub extern "C" fn mana_rt_system_info(ctx: *mut ProcCtx, item: u64) -> u64 {
             let n = ctx.global.n_scheds as u64;
             ((n << 3) as u64) | TAG_SMALL
         }
-        // telemetry_poller system_counts — real where cheap, plausible
-        // constants for the BEAM-only limits
+        // The system_counts of telemetry_poller. The counts are real where
+        // they are cheap. The BEAM-only limits are plausible constants.
         b"process_count" => {
             let n = ctx.global.procs.read().iter().filter(|s| s.is_some()).count() as u64;
             ((n << 3) as u64) | TAG_SMALL
@@ -475,7 +489,7 @@ pub extern "C" fn mana_rt_system_info(ctx: *mut ProcCtx, item: u64) -> u64 {
         b"atom_limit" => ((1_048_576u64 << 3) as u64) | TAG_SMALL,
         b"port_limit" => ((65_536u64 << 3) as u64) | TAG_SMALL,
         b"os_monotonic_time_source" => {
-            // property list benchee's repeated_measurement reads
+            // A property list. The repeated_measurement of benchee reads it.
             let cell = alloc_nursery(ctx, 2);
             let t = alloc_nursery(ctx, 3);
             unsafe {
@@ -491,9 +505,10 @@ pub extern "C" fn mana_rt_system_info(ctx: *mut ProcCtx, item: u64) -> u64 {
     }
 }
 
-/// Elixir.System.cmd/2,3 (native override): run a command, capture stdout,
-/// return {Output, ExitCode}. Synchronous on the calling scheduler thread —
-/// fine for system probing; real port support is TODO(port).
+/// Elixir.System.cmd/2,3 (native override). Runs a command, captures stdout,
+/// and returns {Output, ExitCode}. The call is synchronous on the scheduler
+/// thread of the caller. This is acceptable for system probing. Real port
+/// support is TODO(port).
 #[no_mangle]
 pub extern "C" fn mana_rt_system_cmd(ctx: *mut ProcCtx, cmd: u64, args: u64, _opts: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -540,7 +555,8 @@ pub extern "C" fn mana_rt_system_cmd(ctx: *mut ProcCtx, cmd: u64, args: u64, _op
     t as u64
 }
 
-/// timer:tc — time a fun application in microseconds → {Us, Result}.
+/// timer:tc. Times a fun application in microseconds and returns
+/// {Us, Result}.
 #[no_mangle]
 pub extern "C" fn mana_rt_timer_tc(ctx: *mut ProcCtx, fun: u64, args: u64) -> u64 {
     let ctxr = unsafe { &mut *ctx };
@@ -566,21 +582,20 @@ pub extern "C" fn mana_rt_timer_tc(ctx: *mut ProcCtx, fun: u64, args: u64) -> u6
     t as u64
 }
 
-// ---------------------------------------------------------------------------
-// timers (send_after / start_timer / cancel_timer)
+// Timers (send_after / start_timer / cancel_timer)
 //
-// A dedicated timer thread sleeps until the nearest deadline and delivers
-// by pushing to the target's ingress + waking its scheduler (the same
-// cross-thread path sends use). Messages are eternal deep copies —
-// immortal, so the timer heap needs no GC integration; timer volume is
-// low on our paths — TODO(timer-gc).
+// A dedicated timer thread sleeps until the nearest deadline. To deliver, it
+// pushes to the ingress of the target and wakes its scheduler. This is the
+// same cross-thread path that sends use. Messages are eternal deep copies.
+// They are immortal, so the timer heap needs no GC integration. Timer volume
+// is low on our paths. TODO(timer-gc): GC integration for the timer heap.
 
 pub(crate) struct TimerEntry {
     pub(crate) deadline: std::time::Instant,
     pub(crate) ref_id: u64,
     pub(crate) dest_pid: Option<usize>,
-    pub(crate) dest_name: Option<u64>, // registered-name atom, resolved at fire time
-    pub(crate) msg: u64,               // eternal
+    pub(crate) dest_name: Option<u64>, // a registered-name atom, resolved at fire time
+    pub(crate) msg: u64,               // an eternal copy
 }
 
 pub(crate) struct Timers {
@@ -593,10 +608,11 @@ pub(crate) static TIMERS: std::sync::Mutex<Option<Timers>> = std::sync::Mutex::n
 
 pub(crate) static TIMER_CV: std::sync::Condvar = std::sync::Condvar::new();
 
-/// The timer thread is OUTSIDE the STW protocol, so it must not mutate
-/// process/scheduler state directly (a state flip mid-major corrupts the
-/// run queues). It only enqueues (pid, msg) here and wakes a scheduler;
-/// schedulers drain at their loop top — a safepoint.
+/// The timer thread is outside the STW protocol. It must not change process
+/// or scheduler state directly. A state flip in the middle of a major GC
+/// corrupts the run queues. The thread only enqueues (pid, msg) here and
+/// wakes a scheduler. Schedulers drain the queue at their loop top, which is
+/// a safepoint.
 pub(crate) static TIMER_DELIVERIES: SegQueue<(usize, u64)> = SegQueue::new();
 
 pub(crate) fn deliver_cross_thread(g: &'static Global, id: usize, msg: u64) {
@@ -606,7 +622,7 @@ pub(crate) fn deliver_cross_thread(g: &'static Global, id: usize, msg: u64) {
     }
 }
 
-/// Called from the scheduler loop (a safepoint-adjacent context).
+/// The scheduler loop calls this next to a safepoint.
 pub(crate) fn drain_timer_deliveries(ctx: &mut ProcCtx) {
     while let Some((id, msg)) = TIMER_DELIVERIES.pop() {
         push_and_wake(ctx, id, msg);
@@ -620,7 +636,6 @@ pub(crate) fn timer_thread() {
             let now = std::time::Instant::now();
             let t = guard.as_mut().unwrap();
             let g = t.global;
-            // fire everything due
             let mut i = 0;
             while i < t.entries.len() {
                 if t.entries[i].deadline <= now {
@@ -656,8 +671,9 @@ pub(crate) fn timer_thread() {
     }
 }
 
-/// send_after/start_timer. `wrap != 0` wraps the message as
-/// {timeout, Ref, Msg} (start_timer semantics). Returns the timer ref.
+/// send_after/start_timer. If `wrap != 0`, the message is wrapped as
+/// {timeout, Ref, Msg}. This is the start_timer behavior. Returns the timer
+/// ref.
 #[no_mangle]
 pub extern "C" fn mana_rt_send_after(
     ctx: *mut ProcCtx,
@@ -680,7 +696,6 @@ pub extern "C" fn mana_rt_send_after(
     };
     let r = mana_rt_make_ref(ctx as *mut ProcCtx);
     let payload = if wrap != 0 {
-        // {timeout, Ref, Msg}
         let m = eternal_deep_copy(msg);
         let p = alloc_space(4);
         unsafe {
@@ -718,7 +733,7 @@ pub extern "C" fn mana_rt_send_after(
     r
 }
 
-/// cancel_timer/1,2 → remaining ms | false.
+/// cancel_timer/1,2. Returns the remaining milliseconds, or false.
 #[no_mangle]
 pub extern "C" fn mana_rt_cancel_timer(ctx: *mut ProcCtx, r: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };

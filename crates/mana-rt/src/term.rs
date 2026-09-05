@@ -1,3 +1,9 @@
+//! Term representation and the shared runtime tables. This module holds the
+//! tag and kind constants, the heap and stack size constants, the raw memory
+//! primitives, the atom table, and the term helpers for order and numbers.
+//! The tag and kind bit patterns are the ABI contract with the compiler.
+//! They must match mana-codegen bit for bit.
+
 use super::*;
 
 pub const TAG_MASK: u64 = 0b111;
@@ -12,8 +18,9 @@ pub const NIL: u64 = 0b011;
 
 pub const TAG_CONS: u64 = 0b100;
 
-/// Identifier class: bit 3 discriminates — pid `id<<4|0110`, ref
-/// `id<<4|1110`. Both immediates: raw-word equality and GC-transparent.
+/// Identifier class. Bit 3 selects the kind: a pid is `id<<4|0110`, a ref
+/// is `id<<4|1110`. Both are immediates. Raw-word equality compares them,
+/// and the GC does not touch them.
 pub const TAG_PID: u64 = 0b110;
 
 pub const PID_TAG4: u64 = 0b0110;
@@ -22,7 +29,7 @@ pub const REF_TAG4: u64 = 0b1110;
 
 pub const TAG_FORWARD: u64 = 0b111;
 
-/// Matches mana-codegen's exception sentinel (tag 0b101).
+/// This value must match the exception sentinel of mana-codegen (tag 0b101).
 pub(crate) const EXC_SENTINEL: u64 = 0b101;
 
 pub const KIND_TUPLE: u64 = 0;
@@ -30,37 +37,45 @@ pub const KIND_TUPLE: u64 = 0;
 pub const KIND_FLOAT: u64 = 1;
 
 /// Fun object: `[header | code_ptr | captured terms...]`.
-/// Header: bits 0-7 kind, bits 8-15 arity, bits 16+ number of captures.
+/// Header layout: bits 0-7 hold the kind, bits 8-15 hold the arity, and
+/// bits 16 and up hold the number of captures.
 pub const KIND_FUN: u64 = 2;
 
-/// Flatmap: `[header(size<<8|4) | k1..kn | v1..vn]`, keys canonically
-/// sorted (term order with an exactness tiebreak: 1 before 1.0).
+/// Flatmap: `[header(size<<8|4) | k1..kn | v1..vn]`. The keys are sorted in
+/// canonical term order. Exactness breaks ties: 1 sorts before 1.0.
 pub const KIND_MAP: u64 = 4;
 
 pub const KIND_BIN: u64 = 5;
 
-/// Real bignum: `[header(limbs<<9 | sign<<8 | 3) | limbs (LE u64)...]`,
-/// normalized (never a value that fits the 61-bit small range, no leading
-/// zero limbs; sign bit set = negative). Allocated in the SHARED OLD SPACE
-/// (alloc_shared: pure bump, never a GC point) so arithmetic keeps its
-/// no-frame fast paths. No term fields — GC copies limbs verbatim.
+/// Real bignum: `[header(limbs<<9 | sign<<8 | 3) | limbs (LE u64)...]`.
+/// The value is normalized: it never fits the 61-bit small range, and it
+/// has no leading zero limbs. A set sign bit means negative. The runtime
+/// allocates bignums in the SHARED OLD SPACE with alloc_shared. That
+/// allocation is a pure bump and never a GC point, so arithmetic keeps its
+/// no-frame fast paths. A bignum has no term fields. The GC copies the
+/// limbs verbatim.
 pub const KIND_BIGNUM: u64 = 3;
 
-/// Sub-binary view: `[header(len<<8|13) | parent_term | byte_offset]` — a
-/// zero-copy slice of a ROOT KIND_BIN (never of another view; slicing a
-/// view folds offsets). Same header convention as KIND_BIN so the inline
-/// length preflight works for both; kinds 5 (0b0101) and 13 (0b1101)
-/// differ only in bit 3, so `(kind | 8) == 13` accepts either. Kind 7 is
-/// FORBIDDEN for heap objects: header low bits 0b111 collide with the
-/// GC's TAG_FORWARD marker. The parent is a TERM (it moves under GC) —
-/// data pointers are recomputed on every access, never cached.
+/// Sub-binary view: `[header(len<<8|13) | parent_term | byte_offset]`. It
+/// is a zero-copy slice of a ROOT KIND_BIN, never of another view. A slice
+/// of a view folds the offsets.
+///
+/// The header convention is the same as KIND_BIN, so the inline length
+/// preflight works for both. Kinds 5 (0b0101) and 13 (0b1101) differ only
+/// in bit 3, so `(kind | 8) == 13` accepts either. Kind 7 is FORBIDDEN for
+/// heap objects: header low bits 0b111 collide with the TAG_FORWARD marker
+/// of the GC.
+///
+/// The parent is a TERM and moves under GC. Every access recomputes the
+/// data pointer. The pointer is never cached.
 pub const KIND_SUBBIN: u64 = 13;
 
 pub(crate) const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 
-/// MANA_NURSERY_WORDS overrides the initial nursery size AND pins it
-/// (adaptive growth disabled) — a GC-stress knob for shaking out rooting
-/// bugs: tiny nurseries make every allocation path face constant minors.
+/// MANA_NURSERY_WORDS overrides the initial nursery size AND pins it.
+/// Adaptive growth is then disabled. This is a GC-stress knob that finds
+/// rooting bugs: a tiny nursery makes every allocation path meet constant
+/// minor collections.
 pub(crate) fn nursery_words_override() -> Option<usize> {
     std::env::var("MANA_NURSERY_WORDS").ok()?.parse().ok()
 }
@@ -73,21 +88,24 @@ pub(crate) const OLD_CHUNK_WORDS: usize = 64 * 1024;
 
 pub(crate) const OLD_LIMIT_INIT: usize = 4 * OLD_CHUNK_WORDS;
 
-/// Reservation only — anonymous pages commit lazily on first touch.
-pub(crate) const STACK_BYTES: usize = 256 * 1024 * 1024; // lazy-commit reservation — TODO(stacks): growable
+/// This is a reservation only. Anonymous pages commit lazily on the first
+/// touch.
+pub(crate) const STACK_BYTES: usize = 256 * 1024 * 1024; // TODO(stacks): make the stack growable
 
-pub(crate) const ROOT_STACK_BYTES: usize = 512 * 1024 * 1024; // lazy-commit reservation
+/// This is a reservation only. Anonymous pages commit lazily on the first
+/// touch.
+pub(crate) const ROOT_STACK_BYTES: usize = 512 * 1024 * 1024;
 
 pub(crate) const REDUCTIONS_PER_SLICE: i64 = 4000;
 
-/// Uniform compiled ABI: `ctx + ABI_REGS` term words per call; arguments
-/// past ABI_REGS-1 travel through `ProcCtx::argv_spill` (see codegen NREG).
+/// Uniform compiled ABI: every call passes `ctx + ABI_REGS` term words.
+/// Arguments past ABI_REGS-1 travel through `ProcCtx::argv_spill` (see
+/// codegen NREG).
 pub(crate) const ABI_REGS: usize = 5;
 
 pub(crate) const ARGV_SPILL_WORDS: usize = 64;
 
-// ---------------------------------------------------------------------------
-// memory primitives
+// Memory primitives
 
 pub(crate) struct Chunk {
     pub(crate) start: *mut u64,
@@ -120,7 +138,7 @@ pub(crate) fn payload_words(header: u64) -> usize {
         KIND_FUN => 1 + (header >> 16) as usize,
         KIND_MAP => 2 * (header >> 8) as usize,
         KIND_BIN => ((header >> 8) as usize + 7) / 8,
-        KIND_SUBBIN => 2, // parent term + byte offset (len lives in the header)
+        KIND_SUBBIN => 2, // parent term and byte offset. The length lives in the header.
         KIND_BIGNUM => (header >> 9) as usize,
         _ => 0,
     }
@@ -134,8 +152,8 @@ pub(crate) fn pid_id(t: u64) -> Option<usize> {
     (t & 0xF == PID_TAG4).then_some((t >> 4) as usize)
 }
 
-/// Well-known atom terms registered by the generated main (atoms are
-/// compiler statics; the runtime cannot mint them).
+/// Well-known atom terms that the generated main registers at start. The
+/// runtime reads them here instead of a table lookup on every use.
 #[derive(Default)]
 pub(crate) struct KnownAtoms {
     pub(crate) normal: u64,
@@ -166,7 +184,7 @@ pub(crate) fn known() -> &'static KnownAtoms {
     KNOWN.get().expect("atom table not registered")
 }
 
-/// Called by the generated main before mana_rt_run.
+/// The generated main calls this function before mana_rt_run.
 #[no_mangle]
 pub extern "C" fn mana_rt_register_atoms(
     normal: u64,
@@ -227,8 +245,7 @@ pub(crate) fn atom_exists(name: &[u8]) -> bool {
     atom_table_lock().read().unwrap().contains_key(name)
 }
 
-// ---------------------------------------------------------------------------
-// term order, equality, list/tuple helpers
+// Term order, equality, list and tuple helpers
 
 pub(crate) fn atom_bytes(t: u64) -> &'static [u8] {
     unsafe {
@@ -279,8 +296,9 @@ pub(crate) fn num_val(t: u64) -> f64 {
     f64::from_bits(unsafe { *(t as *const u64).add(1) })
 }
 
-/// Raise-site notifier (MANA_DEBUG_RAISE): names the raising function and
-/// prints the reason term — the debugging stand-in for stacktraces.
+/// Raise-site notifier (MANA_DEBUG_RAISE). It names the function that
+/// raised and prints the reason term. This is the debugging stand-in for
+/// stacktraces.
 #[no_mangle]
 pub extern "C" fn mana_rt_note_raise(msg: *const u8, len: u64, reason: u64) {
     if std::env::var_os("MANA_DEBUG_RAISE").is_some() {
@@ -300,7 +318,7 @@ pub extern "C" fn mana_rt_note_badarg(msg: *const u8, len: u64) {
     }
 }
 
-/// A stubbed (unsupported-construct) function was actually called.
+/// The program called a stubbed function for an unsupported construct.
 #[no_mangle]
 pub extern "C" fn mana_rt_unsupported(msg: *const u8, len: u64) -> ! {
     let m = unsafe { std::slice::from_raw_parts(msg, len as usize) };
@@ -311,8 +329,8 @@ pub extern "C" fn mana_rt_unsupported(msg: *const u8, len: u64) -> ! {
     std::process::exit(1)
 }
 
-/// Set exc and return the sentinel — the raising-BIF convention: codegen
-/// treats these helpers exactly like may-raise calls.
+/// Sets exc and returns the sentinel. This is the raising-BIF convention:
+/// codegen treats these helpers exactly like may-raise calls.
 pub(crate) fn raise_badarg(ctx: &mut ProcCtx) -> u64 {
     if std::env::var_os("MANA_DEBUG_BADARG").is_some() {
         eprintln!(
@@ -329,7 +347,8 @@ pub(crate) fn atom_error() -> u64 {
     known().error_a
 }
 
-/// Allocate in this scheduler's nursery (falls back to the slow path).
+/// Allocates in the nursery of this scheduler. If the nursery is full, it
+/// takes the slow path.
 pub(crate) fn alloc_nursery(ctx: &mut ProcCtx, words: usize) -> *mut u64 {
     unsafe {
         if ctx.heap_top.add(words) <= ctx.heap_end {
@@ -342,7 +361,8 @@ pub(crate) fn alloc_nursery(ctx: &mut ProcCtx, words: usize) -> *mut u64 {
     }
 }
 
-/// badmap/badkey atoms: registered alongside the rest.
+/// Well-known atoms by name. The generated main registers them with the
+/// rest.
 pub(crate) fn atom_by_name(name: &str) -> u64 {
     let k = known();
     match name {
@@ -353,10 +373,10 @@ pub(crate) fn atom_by_name(name: &str) -> u64 {
     }
 }
 
-// Closed-world atom table: codegen plants one pointer per atom static in
-// the `mana_atoms` ELF section; the linker deduplicates (linkonce_odr) and
-// provides __start/__stop bounds. Every program registers well-known atoms,
-// so the section is never empty.
+// Closed-world atom table. Codegen plants one pointer per atom static in
+// the `mana_atoms` ELF section. The linker deduplicates them (linkonce_odr)
+// and provides the __start/__stop bounds. Every program registers the
+// well-known atoms, so the section is never empty.
 extern "C" {
     static __start_mana_atoms: u64;
     static __stop_mana_atoms: u64;
@@ -373,7 +393,7 @@ pub(crate) fn atom_table_lock() -> &'static AtomTable {
             let stop = &raw const __stop_mana_atoms;
             let n = (stop as usize - start as usize) / 8;
             for i in 0..n {
-                // entries are raw pointers to the atom structs
+                // Each entry is a raw pointer to an atom struct.
                 let p = *start.add(i);
                 if p != 0 {
                     let atom = p | TAG_ATOM;
@@ -385,15 +405,15 @@ pub(crate) fn atom_table_lock() -> &'static AtomTable {
     })
 }
 
-/// Look up an existing atom by name bytes.
+/// Looks up an existing atom by its name bytes.
 pub(crate) fn atom_lookup(bytes: &[u8]) -> Option<u64> {
     atom_table_lock().read().unwrap().get(bytes).copied()
 }
 
-/// Get-or-mint an atom. Minted atoms are eternal {len, bytes} structs in
-/// the SAME table, so pointer identity (raw =:=) holds program-wide. BEAM
-/// parity for list_to_atom/binary_to_atom; the table can grow at runtime
-/// but never shrinks — same as BEAM.
+/// Gets an atom, or mints it. A minted atom is an eternal {len, bytes}
+/// struct in the SAME table, so pointer identity (raw =:=) holds for the
+/// whole program. This gives BEAM parity for list_to_atom/binary_to_atom.
+/// The table can grow at runtime but never shrinks. BEAM does the same.
 pub(crate) fn atom_intern(bytes: &[u8]) -> u64 {
     if let Some(a) = atom_lookup(bytes) {
         return a;
@@ -417,17 +437,15 @@ pub(crate) fn atom_intern(bytes: &[u8]) -> u64 {
     atom
 }
 
-// ---------------------------------------------------------------------------
-// binary module C BIFs (all of binary.erl is nif stubs)
-
-/// Any atom compiled into the program, by name. The closed-world table is
-/// complete, so a miss means the runtime tried to mint a new atom.
+/// Finds any atom compiled into the program, by name. The closed-world
+/// table is complete. A miss means that the runtime tried to mint a new
+/// atom.
 pub(crate) fn find_atom(name: &str) -> Option<u64> {
     atom_lookup(name.as_bytes())
 }
 
-/// normal / shutdown / {shutdown, _}: BEAM treats these exit reasons as
-/// orderly termination and logs nothing.
+/// BEAM treats the exit reasons normal, shutdown, and {shutdown, _} as
+/// orderly termination. It logs nothing for them.
 pub(crate) fn exit_reason_is_quiet(r: u64) -> bool {
     if r == known().normal {
         return true;

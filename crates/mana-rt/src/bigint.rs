@@ -1,16 +1,20 @@
-//! Arbitrary-precision integer magnitudes: little-endian `u64` limb
-//! vectors, always normalized (no most-significant zero limbs; the empty
-//! slice is zero). Sign lives in the term header, not here.
+//! Arbitrary-precision integer magnitudes. A magnitude is a little-endian
+//! vector of `u64` limbs. It is always normalized: it has no
+//! most-significant zero limbs, and the empty slice is zero. The sign lives
+//! in the term header, not here.
 //!
-//! Hand-rolled by MEASURED choice, not dogma: the term layout stores raw
-//! limbs, so a crate pays limb↔bignum conversion on every op. The in-tree
-//! A/B (`cargo test --release -p mana-rt ab_ -- --ignored --nocapture`)
-//! shows num-bigint 2-9x SLOWER on the dominant 1-2 limb shapes
-//! (timestamps, request ids) and ahead only ~1.3x on decimal formatting.
-//! Re-run the A/B before revisiting; correctness is gated by the u128
-//! property tests below plus Conf.Big (BEAM as oracle).
+//! The kernel is hand-rolled by a measured choice, not by dogma. The term
+//! layout stores raw limbs, so a crate pays a limb-to-bignum conversion on
+//! every operation. The in-tree A/B
+//! (`cargo test --release -p mana-rt ab_ -- --ignored --nocapture`) shows
+//! num-bigint 2-9x slower on the dominant 1-2 limb shapes (timestamps,
+//! request ids). num-bigint is ahead only about 1.3x on decimal formatting.
+//! The u128 property tests below and Conf.Big (BEAM as the oracle) gate
+//! correctness.
+//!
+//! Before you change this decision, run the A/B again.
 
-/// Drop most-significant zero limbs.
+/// Removes the most-significant zero limbs.
 pub fn normalize(mut v: Vec<u64>) -> Vec<u64> {
     while v.last() == Some(&0) {
         v.pop();
@@ -49,7 +53,7 @@ pub fn mag_add(a: &[u64], b: &[u64]) -> Vec<u64> {
     out
 }
 
-/// a - b; requires a >= b.
+/// Computes a - b. The caller must pass a >= b.
 pub fn mag_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
     debug_assert!(mag_cmp(a, b) != std::cmp::Ordering::Less);
     let mut out = Vec::with_capacity(a.len());
@@ -93,7 +97,7 @@ pub fn mag_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
     normalize(out)
 }
 
-/// Divide by a single limb; returns (quotient, remainder).
+/// Divides by a single limb and returns (quotient, remainder). `d` must not be zero.
 pub fn mag_divrem_limb(a: &[u64], d: u64) -> (Vec<u64>, u64) {
     debug_assert!(d != 0);
     let mut q = vec![0u64; a.len()];
@@ -106,7 +110,7 @@ pub fn mag_divrem_limb(a: &[u64], d: u64) -> (Vec<u64>, u64) {
     (normalize(q), rem as u64)
 }
 
-/// Number of significant bits.
+/// Returns the number of significant bits.
 pub fn mag_bits(a: &[u64]) -> u64 {
     match a.last() {
         None => 0,
@@ -154,9 +158,9 @@ pub fn mag_shr(a: &[u64], n: u64) -> Vec<u64> {
     normalize(out)
 }
 
-/// Long division: (quotient, remainder). `b` must be non-zero.
-/// Shift-normalized schoolbook with two-limb trial quotients (Knuth D
-/// with the standard at-most-two correction steps).
+/// Long division. Returns (quotient, remainder). `b` must not be zero.
+/// The algorithm is Knuth D: shift-normalized schoolbook division with
+/// two-limb trial quotients and at most two correction steps.
 pub fn mag_divrem(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     debug_assert!(!b.is_empty());
     if mag_cmp(a, b) == std::cmp::Ordering::Less {
@@ -166,7 +170,7 @@ pub fn mag_divrem(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
         let (q, r) = mag_divrem_limb(a, b[0]);
         return (q, if r == 0 { Vec::new() } else { vec![r] });
     }
-    // normalize so the divisor's top bit is set
+    // Knuth D needs the top bit of the divisor set. Shift both operands by the same amount.
     let shift = b.last().unwrap().leading_zeros() as u64;
     let u = mag_shl(a, shift);
     let v = mag_shl(b, shift);
@@ -174,14 +178,14 @@ pub fn mag_divrem(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     let m = u.len() - n;
     let mut u = {
         let mut t = u;
-        t.push(0); // room for the virtual high limb
+        t.push(0); // Room for the virtual high limb.
         t
     };
     let mut q = vec![0u64; m + 1];
     let vtop = v[n - 1] as u128;
     let vsec = v[n - 2] as u128;
     for j in (0..=m).rev() {
-        // trial quotient from the top two dividend limbs vs the top divisor limb
+        // The trial quotient comes from the top two dividend limbs and the top divisor limb.
         let num = ((u[j + n] as u128) << 64) | u[j + n - 1] as u128;
         let mut qhat = num / vtop;
         let mut rhat = num % vtop;
@@ -209,7 +213,7 @@ pub fn mag_divrem(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
         }
         let d = u[j + n] as i128 - carry as i128 - borrow;
         if d < 0 {
-            // qhat was one too large: add v back
+            // qhat was one too large. Add v back.
             u[j + n] = (d + (1i128 << 64)) as u64;
             qhat -= 1;
             let mut carry = 0u128;
@@ -228,10 +232,10 @@ pub fn mag_divrem(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     (normalize(q), mag_shr(&normalize(u), shift))
 }
 
-/// Decimal digits (no sign) → magnitude; None on a non-digit.
+/// Converts decimal digits (no sign) to a magnitude. Returns None on a non-digit.
 pub fn mag_from_decimal(digits: &[u8]) -> Option<Vec<u64>> {
     let mut out: Vec<u64> = Vec::new();
-    // consume 19 digits (10^19 < 2^64) at a time: out = out*10^k + chunk
+    // Each step consumes up to 19 digits (10^19 < 2^64): out = out*10^k + chunk.
     let mut i = 0;
     while i < digits.len() {
         let k = std::cmp::min(19, digits.len() - i);
@@ -242,14 +246,14 @@ pub fn mag_from_decimal(digits: &[u8]) -> Option<Vec<u64>> {
             }
             chunk = chunk * 10 + (d - b'0') as u64;
         }
-        let mul = 10u64.pow(k as u32 - 1) * 10; // 10^k, k<=19 fits u64? 10^19 fits
+        let mul = 10u64.pow(k as u32 - 1) * 10; // 10^k. k<=19, so the value fits in u64 (10^19 fits).
         out = mag_add(&mag_mul(&out, &[mul]), &[chunk]);
         i += k;
     }
     Some(normalize(out))
 }
 
-/// Magnitude → decimal digits (no sign).
+/// Converts a magnitude to decimal digits (no sign).
 pub fn mag_to_decimal(a: &[u64]) -> String {
     if a.is_empty() {
         return "0".to_string();
@@ -268,7 +272,7 @@ pub fn mag_to_decimal(a: &[u64]) -> String {
     s
 }
 
-/// Magnitude → f64 (round-to-nearest via the top 128 bits).
+/// Converts a magnitude to f64. The result rounds to nearest through the top 128 bits.
 pub fn mag_to_f64(a: &[u64]) -> f64 {
     match a.len() {
         0 => 0.0,
@@ -281,7 +285,7 @@ pub fn mag_to_f64(a: &[u64]) -> f64 {
     }
 }
 
-/// Exact integer part of a non-negative finite f64 → magnitude.
+/// Converts the exact integer part of a non-negative finite f64 to a magnitude.
 pub fn f64_to_mag(v: f64) -> Vec<u64> {
     debug_assert!(v.is_finite() && v >= 0.0);
     if v < 1.0 {
@@ -289,7 +293,7 @@ pub fn f64_to_mag(v: f64) -> Vec<u64> {
     }
     let bits = v.to_bits();
     let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
-    let mantissa = (bits & ((1u64 << 52) - 1)) | (1u64 << 52); // implicit bit
+    let mantissa = (bits & ((1u64 << 52) - 1)) | (1u64 << 52); // Adds the implicit leading bit.
     // value = mantissa * 2^(exp-52)
     let shift = exp - 52;
     if shift >= 0 {
@@ -299,7 +303,7 @@ pub fn f64_to_mag(v: f64) -> Vec<u64> {
     }
 }
 
-/// Little-endian magnitude bytes (ETF SMALL_BIG/LARGE_BIG payload).
+/// Returns the magnitude as little-endian bytes (the ETF SMALL_BIG/LARGE_BIG payload).
 pub fn mag_to_bytes_le(a: &[u64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(a.len() * 8);
     for &l in a {
@@ -323,10 +327,10 @@ pub fn mag_from_bytes_le(bytes: &[u8]) -> Vec<u64> {
 
 #[cfg(test)]
 mod ab_bench {
-    //! Hand-rolled kernel vs num-bigint A/B on OUR workload shapes.
-    //! num-bigint pays the term-boundary conversion (&[u64] limbs ↔
-    //! BigUint) because the heap layout stores raw limbs — that is the
-    //! real cost the runtime would see. Run with:
+    //! A/B benchmark: the hand-rolled kernel against num-bigint on our workload shapes.
+    //! num-bigint pays the term-boundary conversion (&[u64] limbs to BigUint and
+    //! back) because the heap layout stores raw limbs. That conversion is the real
+    //! cost that the runtime will see. Run with:
     //!   cargo test --release -p mana-rt ab_ -- --ignored --nocapture
     use super::*;
     use num_bigint::BigUint;
@@ -345,7 +349,7 @@ mod ab_bench {
     }
 
     fn time(label: &str, iters: u32, mut f: impl FnMut() -> u64) {
-        // warmup
+        // Warmup loop. Its time is not measured.
         let mut sink = 0u64;
         for _ in 0..iters / 10 {
             sink = sink.wrapping_add(f());
@@ -362,10 +366,10 @@ mod ab_bench {
     #[ignore]
     fn ab_kernel_vs_num_bigint() {
         let one = vec![0x1234_5678_9abc_def0u64]; // 1 limb (timestamps)
-        let two = vec![u64::MAX, 0x1f]; // 2 limbs (ns since epoch etc.)
+        let two = vec![u64::MAX, 0x1f]; // 2 limbs (for example, ns since epoch)
         let four = mag_from_decimal(b"123456789012345678901234567890123456789012345678901234567890").unwrap();
         let f200 = {
-            // factorial(200) — the Conf.Big stress shape (~1245 bits)
+            // factorial(200), the Conf.Big stress shape (~1245 bits)
             let mut m = vec![1u64];
             for i in 2..=200u64 {
                 m = mag_mul(&m, &[i]);
@@ -410,7 +414,7 @@ mod ab_bench {
             m[0]
         });
         time("crate fact200 mul-chain (+conv)", 5_000, || {
-            // conversion per step, as the runtime term boundary would pay
+            // One conversion per step. The runtime term boundary pays the same cost.
             let mut m = vec![1u64];
             for i in 2..=200u64 {
                 m = from_big(&(to_big(&m) * BigUint::from(i)));
@@ -493,7 +497,7 @@ mod tests {
 
     #[test]
     fn big_multiply_divide_identity() {
-        // (10^40 + 7) * (10^30 + 3) then divide back
+        // Multiply (10^40 + 7) by (10^30 + 3). Then divide back.
         let a = mag_from_decimal(b"10000000000000000000000000000000000000007").unwrap();
         let b = mag_from_decimal(b"1000000000000000000000000000003").unwrap();
         let p = mag_mul(&a, &b);
@@ -538,11 +542,11 @@ mod tests {
 
     #[test]
     fn knuth_d_correction_paths() {
-        // divisors crafted to force qhat corrections (top limbs close)
+        // The operands force qhat corrections: their top limbs are close.
         let a = mag_from_decimal(b"340282366920938463463374607431768211455000000001").unwrap();
         let b = mag_from_decimal(b"18446744073709551615999999999").unwrap();
         let (q, r) = mag_divrem(&a, &b);
-        // verify by reconstruction
+        // Check by reconstruction: q*b + r must equal a.
         let back = mag_add(&mag_mul(&q, &b), &r);
         assert_eq!(mag_cmp(&back, &a), Ordering::Equal);
         assert_eq!(mag_cmp(&r, &b), Ordering::Less);

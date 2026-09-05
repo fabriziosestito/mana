@@ -1,17 +1,20 @@
+//! Flat maps: the map BIFs and the helpers that read and build the flatmap
+//! layout. A map is a boxed block with one header word, then `n` keys, then
+//! `n` values. The keys are in canonical order with no duplicates. Every
+//! function that builds a map must keep this order.
+
 use super::*;
 
-// ---------------------------------------------------------------------------
-// maps (flatmap)
-
-/// Canonical key order: term order, with exactness tiebreak so that keys
-/// like 1 and 1.0 remain distinct (int sorts before float).
+/// Canonical key order. This is term order with an exactness tiebreak, so
+/// keys like 1 and 1.0 stay distinct (the integer sorts before the float).
 pub(crate) fn map_key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
     if a == b {
         return std::cmp::Ordering::Equal;
     }
-    // binary keys (params, headers, JSON maps) dominate lookups on the web
-    // path: compare bytes directly — Erlang orders binaries by bytes, and
-    // byte-equal binaries are exactly equal, so no rank/exactness passes
+    // Binary keys (params, headers, JSON maps) dominate lookups on the web
+    // path, so this compares their bytes directly. Erlang orders binaries by
+    // bytes, and byte-equal binaries are exactly equal. The rank pass and the
+    // exactness pass are not needed for them.
     if let (Some((pa, la)), Some((pb, lb))) = (bin_parts(a), bin_parts(b)) {
         let (x, y) = unsafe {
             (std::slice::from_raw_parts(pa, la), std::slice::from_raw_parts(pb, lb))
@@ -25,9 +28,9 @@ pub(crate) fn map_key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
     if a == b {
         return std::cmp::Ordering::Equal;
     }
-    // compare == 0 with distinct bits: a binary's byte compare was already
-    // exact — only numbers (1 vs 1.0), possibly nested in containers, need
-    // the exactness tiebreak
+    // The compare returned 0 for distinct bits. A binary's byte compare above
+    // was already exact. Only numbers (1 vs 1.0), which can be nested in
+    // containers, need the exactness tiebreak.
     if a & TAG_MASK == TAG_BOXED
         && matches!(unsafe { *(a as *const u64) } & 0xff, KIND_BIN | KIND_SUBBIN)
     {
@@ -36,7 +39,8 @@ pub(crate) fn map_key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
     if mana_rt_eq_exact(a, b) == 1 {
         return std::cmp::Ordering::Equal;
     }
-    // numerically equal but exact-distinct: small int first
+    // The keys are numerically equal but exactly distinct. The small integer
+    // sorts first.
     if a & TAG_MASK == TAG_SMALL {
         std::cmp::Ordering::Less
     } else {
@@ -56,17 +60,18 @@ pub(crate) fn map_parts(m: u64) -> Option<(*mut u64, usize)> {
     Some((p, (header >> 8) as usize))
 }
 
-/// Find a key (exact match) via binary search; returns the pair index.
+/// Finds a key by exact match and returns the pair index. On a miss, the
+/// error value is the insertion position.
 pub(crate) fn map_index(p: *const u64, n: usize, key: u64) -> Result<usize, usize> {
     let keys = unsafe { std::slice::from_raw_parts(p.add(1), n) };
-    // Equal atoms are pointer-identical (linkonce_odr globals) and equal
-    // smalls bit-identical, so for the small maps that dominate (struct
-    // fields, changesets) a raw-u64 scan resolves the hit without any
-    // generic compares. Misses (and boxed keys) fall to binary search,
-    // which also supplies the insertion position for put.
-    // Plug.Conn / Phoenix.Socket structs have 30-40 fields: a linear
-    // identity scan over 64 words is still cheaper than ~6 generic
-    // compares (atoms compare by TEXT in the generic path)
+    // Equal atoms are pointer-identical (linkonce_odr globals), and equal
+    // smalls are bit-identical. For the small maps that dominate (struct
+    // fields, changesets), a raw u64 scan finds a hit without generic
+    // compares. Misses and boxed keys fall to the binary search, which also
+    // supplies the insertion position for put.
+    // Plug.Conn and Phoenix.Socket structs have 30-40 fields. A linear
+    // identity scan over 64 words is still cheaper than about 6 generic
+    // compares. Atoms compare by TEXT in the generic path.
     if n <= 64 {
         if let Some(i) = keys.iter().position(|&k| k == key) {
             return Ok(i);
@@ -75,21 +80,22 @@ pub(crate) fn map_index(p: *const u64, n: usize, key: u64) -> Result<usize, usiz
     keys.binary_search_by(|&k| map_key_cmp(k, key))
 }
 
-/// Normalize a freshly built map (unsorted pairs, not yet published):
-/// sort by key, deduplicate (last write wins). Shrinks the header size on
-/// dedupe; trailing words become unreachable garbage (worklist GC).
+/// Normalizes a new map that has unsorted pairs and is not yet published.
+/// The function sorts the pairs by key and removes duplicates (the last
+/// write wins). It shrinks the header size when it removes duplicates. The
+/// trailing words become unreachable garbage (the worklist GC ignores them).
 #[no_mangle]
 pub extern "C" fn mana_rt_map_norm(m: u64) -> u64 {
     let Some((p, n)) = map_parts(m) else { return m };
     unsafe {
         let mut pairs: Vec<(u64, u64)> = (0..n).map(|i| (*p.add(1 + i), *p.add(1 + n + i))).collect();
-        // stable sort keeps the LAST duplicate later in the run
+        // The stable sort keeps the LAST duplicate later in the run.
         pairs.sort_by(|a, b| map_key_cmp(a.0, b.0));
         let mut out: Vec<(u64, u64)> = Vec::with_capacity(n);
         for pair in pairs {
             if let Some(last) = out.last_mut() {
                 if map_key_cmp(last.0, pair.0) == std::cmp::Ordering::Equal {
-                    *last = pair; // last wins
+                    *last = pair; // The last write wins.
                     continue;
                 }
             }
@@ -105,8 +111,9 @@ pub extern "C" fn mana_rt_map_norm(m: u64) -> u64 {
     m
 }
 
-/// Pattern-match lookup: value, or the exception sentinel for miss /
-/// non-map. Non-allocating — safe inside match contexts.
+/// Lookup for pattern matches. Returns the value, or the exception sentinel
+/// on a miss or a non-map. It does not allocate, so it is safe inside match
+/// contexts.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_pat_get(m: u64, key: u64) -> u64 {
     let Some((p, n)) = map_parts(m) else {
@@ -118,10 +125,10 @@ pub extern "C" fn mana_rt_map_pat_get(m: u64, key: u64) -> u64 {
     }
 }
 
+/// Raises `{badmap, M}` or `{badkey, K}` with class error.
 pub(crate) fn raise_map_err(ctx: &mut ProcCtx, tag_is_badmap: bool, culprit: u64) -> u64 {
-    // {badmap, M} / {badkey, K} with class error
     let tag = if tag_is_badmap { "badmap" } else { "badkey" };
-    // eternal pair (never moved; GC scans fields)
+    // The pair is eternal: the GC never moves it, but it scans the fields.
     let p = alloc_space(3);
     ctx.global.eternal.lock().push((p as usize, false));
     unsafe {
@@ -134,14 +141,14 @@ pub(crate) fn raise_map_err(ctx: &mut ProcCtx, tag_is_badmap: bool, culprit: u64
     EXC_SENTINEL
 }
 
-/// maps:put/3 — returns a new map (insert or replace).
+/// maps:put/3. Returns a new map with the key inserted or replaced.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_put(ctx: *mut ProcCtx, key: u64, val: u64, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let Some((_, n)) = map_parts(m) else {
         return raise_map_err(ctx, true, m);
     };
-    // root inputs across allocation
+    // The inputs stay rooted across the allocation.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 3, key, val, m];
     fr[0] = saved;
@@ -158,7 +165,7 @@ pub extern "C" fn mana_rt_map_put(ctx: *mut ProcCtx, key: u64, val: u64, m: u64)
             }
             Err(pos) => {
                 *newp = (((n + 1) as u64) << 8) | KIND_MAP;
-                // keys with insertion at pos
+                // The new key goes at pos. The other pairs keep their order.
                 for i in 0..pos {
                     *newp.add(1 + i) = *p.add(1 + i);
                     *newp.add(1 + (n + 1) + i) = *p.add(1 + n + i);
@@ -175,7 +182,7 @@ pub extern "C" fn mana_rt_map_put(ctx: *mut ProcCtx, key: u64, val: u64, m: u64)
     newp as u64
 }
 
-/// maps:get/2 — badkey/badmap on miss.
+/// maps:get/2. Raises badkey on a miss and badmap on a non-map.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_get(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -221,7 +228,7 @@ pub extern "C" fn mana_rt_map_remove(ctx: *mut ProcCtx, key: u64, m: u64) -> u64
     newp as u64
 }
 
-/// maps:to_list/1 — [{K, V}] in key order.
+/// maps:to_list/1. Returns `[{K, V}]` in key order.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_to_list(ctx: *mut ProcCtx, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -235,7 +242,7 @@ pub extern "C" fn mana_rt_map_to_list(ctx: *mut ProcCtx, m: u64) -> u64 {
     let mut fr = [0u64, 1, m];
     fr[0] = saved;
     ctx.roots_head = fr.as_ptr() as u64;
-    // 2 words per cons + 3 per {K,V} tuple
+    // Each element needs 2 words for the cons cell and 3 for the {K,V} tuple.
     let block = alloc_nursery(ctx, n * 5);
     ctx.roots_head = saved;
     let m = fr[2];
@@ -258,11 +265,12 @@ pub extern "C" fn mana_rt_map_to_list(ctx: *mut ProcCtx, m: u64) -> u64 {
     unsafe { block.add(3) as u64 | TAG_CONS }
 }
 
-/// maps:from_list/1 — builds then normalizes.
+/// maps:from_list/1. Builds the map, then normalizes it.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_from_list(ctx: *mut ProcCtx, list: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    // count and validate [{K,V}]
+    // The first pass counts the elements and checks that each is a {K,V}
+    // tuple.
     let mut n = 0usize;
     let mut t = list;
     while t != NIL {
@@ -304,7 +312,8 @@ pub extern "C" fn mana_rt_map_from_list(ctx: *mut ProcCtx, list: u64) -> u64 {
     mana_rt_map_norm(newp as u64)
 }
 
-/// `~{K := V | M}~` update: key must exist (Elixir `%{m | k: v}`).
+/// The `~{K := V | M}~` update. The key must exist. Elixir writes this as
+/// `%{m | k: v}`.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_update_exact(ctx: *mut ProcCtx, key: u64, val: u64, m: u64) -> u64 {
     let ctxr = unsafe { &mut *ctx };
@@ -314,9 +323,10 @@ pub extern "C" fn mana_rt_map_update_exact(ctx: *mut ProcCtx, key: u64, val: u64
     let Ok(i) = map_index(p, n, key) else {
         return raise_map_err(ctxr, false, key);
     };
-    // the key exists: copy the map once and patch the value slot (no
-    // second key search, no insertion path) — this is `%{struct | f: v}`,
-    // ~70 times per Phoenix request on Plug.Conn
+    // The key exists, so this copies the map once and patches the value
+    // slot. There is no second key search and no insertion path. This is the
+    // `%{struct | f: v}` operation, which runs about 70 times per Phoenix
+    // request on Plug.Conn.
     let saved = ctxr.roots_head;
     let mut fr = [0u64, 2, val, m];
     fr[0] = saved;
@@ -332,7 +342,8 @@ pub extern "C" fn mana_rt_map_update_exact(ctx: *mut ProcCtx, key: u64, val: u64
     newp as u64
 }
 
-/// maps:is_key/2 → true/false atoms (badmap on non-map).
+/// maps:is_key/2. Returns the true or false atom. Raises badmap on a
+/// non-map.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_is_key(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -346,7 +357,7 @@ pub extern "C" fn mana_rt_map_is_key(ctx: *mut ProcCtx, key: u64, m: u64) -> u64
     }
 }
 
-/// maps:merge/2 — values from the second map win.
+/// maps:merge/2. The values from the second map win.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_merge(ctx: *mut ProcCtx, m1: u64, m2: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -366,7 +377,7 @@ pub extern "C" fn mana_rt_map_merge(ctx: *mut ProcCtx, m1: u64, m2: u64) -> u64 
     let (p1, n1) = map_parts(m1).unwrap();
     let (p2, n2) = map_parts(m2).unwrap();
     unsafe {
-        // merge two sorted pair sequences; m2 wins ties
+        // This merges two sorted pair sequences. On a tie, m2 wins.
         let (mut i, mut j, mut o) = (0usize, 0usize, 0usize);
         let total = n1 + n2;
         let put = |newp: *mut u64, o: usize, k: u64, v: u64| {
@@ -402,8 +413,8 @@ pub extern "C" fn mana_rt_map_merge(ctx: *mut ProcCtx, m1: u64, m2: u64) -> u64 
             j += 1;
             o += 1;
         }
-        // compact values if o < total (ties merged): values were written at
-        // stride `total`; rewrite them at stride `o`
+        // If ties were merged, o < total. The values were written at stride
+        // `total`, so this rewrites them at stride `o`.
         if o < total {
             for idx in 0..o {
                 let v = *newp.add(1 + total + idx);
@@ -415,8 +426,8 @@ pub extern "C" fn mana_rt_map_merge(ctx: *mut ProcCtx, m1: u64, m2: u64) -> u64 
     newp as u64
 }
 
-/// maps:iterator/1 → {mana_miter, 0, Map}; maps:next/1 walks it in
-/// canonical (sorted) key order, returning {K, V, NextIter} | none.
+/// maps:iterator/1. Returns `{mana_miter, 0, Map}`. maps:next/1 walks it in
+/// canonical (sorted) key order and returns `{K, V, NextIter}` or `none`.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_iterator(ctx: *mut ProcCtx, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -432,7 +443,7 @@ pub extern "C" fn mana_rt_map_iterator(ctx: *mut ProcCtx, m: u64) -> u64 {
     unsafe {
         *t = (3 << 8) | KIND_TUPLE;
         *t.add(1) = atom_intern(b"mana_miter");
-        *t.add(2) = TAG_SMALL; // small 0
+        *t.add(2) = TAG_SMALL; // This is the small integer 0.
         *t.add(3) = fr[2];
     }
     t as u64
@@ -458,7 +469,8 @@ pub extern "C" fn mana_rt_map_next(ctx: *mut ProcCtx, iter: u64) -> u64 {
     if i >= n {
         return find_atom("none").expect("none atom");
     }
-    // build the next iterator, then the result tuple, rooting the map
+    // This builds the next iterator, then the result tuple. The map stays
+    // rooted across both allocations.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 2, m, 0];
     fr[0] = saved;
@@ -483,7 +495,8 @@ pub extern "C" fn mana_rt_map_next(ctx: *mut ProcCtx, iter: u64) -> u64 {
     t as u64
 }
 
-/// maps:keys/1 and maps:values/1 (`vals != 0`). Key order = canonical.
+/// maps:keys/1, or maps:values/1 when `vals != 0`. The list is in canonical
+/// key order.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_keys(ctx: *mut ProcCtx, m: u64, vals: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -514,7 +527,7 @@ pub extern "C" fn mana_rt_map_keys(ctx: *mut ProcCtx, m: u64, vals: u64) -> u64 
     fr[3]
 }
 
-/// maps:take/2 → {Value, MapWithoutKey} | error.
+/// maps:take/2. Returns `{Value, MapWithoutKey}`, or `error` on a miss.
 #[no_mangle]
 pub extern "C" fn mana_rt_map_take(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -545,7 +558,8 @@ pub extern "C" fn mana_rt_map_take(ctx: *mut ProcCtx, key: u64, m: u64) -> u64 {
     t as u64
 }
 
-/// maps:update_with/3 — apply Fun to the existing value (badkey on miss).
+/// maps:update_with/3. Applies Fun to the existing value. Raises badkey on a
+/// miss.
 #[no_mangle]
 pub extern "C" fn mana_rt_maps_update_with(ctx: *mut ProcCtx, key: u64, fun: u64, m: u64) -> u64 {
     let ctxr = unsafe { &mut *ctx };
@@ -576,7 +590,8 @@ pub extern "C" fn mana_rt_maps_update_with(ctx: *mut ProcCtx, key: u64, fun: u64
     mana_rt_map_put(ctx, key2, newv, m2)
 }
 
-/// maps:update_with/4 — like /3 but inserts Init when the key is absent.
+/// maps:update_with/4. Same as maps:update_with/3, but inserts Init when the
+/// key is absent.
 #[no_mangle]
 pub extern "C" fn mana_rt_maps_update_with4(
     ctx: *mut ProcCtx,
@@ -595,14 +610,16 @@ pub extern "C" fn mana_rt_maps_update_with4(
     mana_rt_maps_update_with(ctx, key, fun, m)
 }
 
-/// maps:with/2 / maps:without/2 — key-list subset / complement.
+/// maps:with/2 when `keep != 0`, and maps:without/2 otherwise. The result
+/// holds the pairs whose keys are in the key list, or the complement.
 #[no_mangle]
 pub extern "C" fn mana_rt_maps_with(ctx: *mut ProcCtx, keys: u64, m: u64, keep: u64) -> u64 {
     let ctxr = unsafe { &mut *ctx };
     let Some((_, _)) = map_parts(m) else {
         return raise_map_err(ctxr, true, m);
     };
-    // collect wanted keys (immediates or heap terms; compared by eq_exact)
+    // The wanted keys can be immediates or heap terms. The loop below
+    // compares them with eq_exact.
     let mut want: Vec<u64> = Vec::new();
     let mut cur = keys;
     while cur & TAG_MASK == TAG_CONS {
@@ -614,10 +631,11 @@ pub extern "C" fn mana_rt_maps_with(ctx: *mut ProcCtx, keys: u64, m: u64, keep: 
     let mut fr = [0u64, 2, m, NIL];
     fr[0] = saved;
     ctxr.roots_head = fr.as_ptr() as u64;
-    // build result by folding put over matching pairs (m stays rooted)
+    // The result is a fold of put over the matching pairs. The map m stays
+    // rooted for the whole loop.
     let mut acc = {
         let e = alloc_nursery(ctxr, 1);
-        unsafe { *e = KIND_MAP }; // empty map header
+        unsafe { *e = KIND_MAP }; // This is the header of an empty map.
         e as u64
     };
     fr[3] = acc;
@@ -641,7 +659,7 @@ pub extern "C" fn mana_rt_maps_with(ctx: *mut ProcCtx, keys: u64, m: u64, keep: 
     acc
 }
 
-/// maps:foreach/2 — Fun(K, V) per pair, returns ok.
+/// maps:foreach/2. Calls Fun(K, V) for each pair and returns ok.
 #[no_mangle]
 pub extern "C" fn mana_rt_maps_foreach(ctx: *mut ProcCtx, fun: u64, m: u64) -> u64 {
     let ctxr = unsafe { &mut *ctx };
@@ -680,8 +698,8 @@ pub extern "C" fn mana_rt_maps_foreach(ctx: *mut ProcCtx, fun: u64, m: u64) -> u
     atom_intern(b"ok")
 }
 
-/// maps:merge_with/3 — merge with a conflict fun (calls back into compiled
-/// code; everything rooted around the callbacks).
+/// maps:merge_with/3. Merges two maps with a conflict fun. The fun calls
+/// back into compiled code, so every live term is rooted around the calls.
 #[no_mangle]
 pub extern "C" fn mana_rt_maps_merge_with(ctx: *mut ProcCtx, fun: u64, m1: u64, m2: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -691,7 +709,8 @@ pub extern "C" fn mana_rt_maps_merge_with(ctx: *mut ProcCtx, fun: u64, m1: u64, 
     if map_parts(m2).is_none() {
         return raise_map_err(ctx, true, m2);
     }
-    // acc starts as m1; for each pair in m2: put or resolve via fun
+    // The accumulator starts as m1. For each pair in m2, the loop puts the
+    // value or resolves the conflict with the fun.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 3, fun, m1, m2];
     fr[0] = saved;
@@ -704,7 +723,7 @@ pub extern "C" fn mana_rt_maps_merge_with(ctx: *mut ProcCtx, fun: u64, m1: u64, 
         let newv = if existing == EXC_SENTINEL {
             v2
         } else {
-            // fun(K, V1, V2) — build the args list rooted
+            // This builds the rooted argument list for fun(K, V1, V2).
             let mut fr2 = [0u64, 3, k, existing, v2];
             fr2[0] = ctx.roots_head;
             ctx.roots_head = fr2.as_ptr() as u64;
@@ -731,7 +750,7 @@ pub extern "C" fn mana_rt_maps_merge_with(ctx: *mut ProcCtx, fun: u64, m1: u64, 
             }
             r
         };
-        // re-read the key (allocs may have moved m2)
+        // The allocations above can move m2, so this reads the key again.
         let (p2, _) = map_parts(fr[4]).unwrap();
         let k2 = unsafe { *p2.add(1 + i) };
         let merged = mana_rt_map_put(ctx as *mut ProcCtx, k2, newv, fr[3]);
@@ -745,8 +764,8 @@ pub extern "C" fn mana_rt_maps_merge_with(ctx: *mut ProcCtx, fun: u64, m1: u64, 
     fr[3]
 }
 
-/// maps:fold/3 — calls back into compiled code (the fun), so the map, fun,
-/// and accumulator are rooted and reloaded around every callback.
+/// maps:fold/3. The fun calls back into compiled code, so the map, the fun,
+/// and the accumulator are rooted and reloaded around every callback.
 #[no_mangle]
 pub extern "C" fn mana_rt_maps_fold(ctx: *mut ProcCtx, fun: u64, acc0: u64, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -760,14 +779,15 @@ pub extern "C" fn mana_rt_maps_fold(ctx: *mut ProcCtx, fun: u64, acc0: u64, m: u
     for i in 0..n {
         let (p, _) = map_parts(fr[4]).unwrap();
         let (k, v) = unsafe { (*p.add(1 + i), *p.add(1 + n + i)) };
-        // args list for apply_fun: build 3 cells rooted via fr (k/v read
-        // fresh from the rooted map, acc in fr[3])
+        // The argument list for apply_fun is 3 cells. The key and the value
+        // are read fresh from the rooted map. The accumulator is in fr[3].
         let c3 = alloc_nursery(ctx, 2);
         unsafe {
             *c3 = fr[3];
             *c3.add(1) = NIL;
         }
-        // re-read k/v: the alloc above may have moved the map
+        // The allocation above can move the map, so this reads the value
+        // again.
         let (p, _) = map_parts(fr[4]).unwrap();
         let v2 = unsafe { *p.add(1 + n + i) };
         let c2 = alloc_nursery(ctx, 2);

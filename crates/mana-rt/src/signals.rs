@@ -1,16 +1,18 @@
+//! Exit signals, links, and monitors. Every term that this module hands to
+//! another process must be old, eternal, or immediate. There is no remembered
+//! set, so a minor collection does not see young terms in shared tuples.
+
 use super::*;
 
-// ---------------------------------------------------------------------------
-// exit signals, links, monitors
-
-/// Allocate `words` in the shared old space (visible to every process).
+/// Allocate `words` words in the shared old space. Every process can see this
+/// space.
 pub(crate) fn alloc_shared(ctx: &mut ProcCtx, words: usize) -> *mut u64 {
     let g = ctx.global;
     let mut old = g.old.lock();
     old.alloc(words, &g.old_used)
 }
 
-/// Build a tuple in shared space; items must be old/eternal/immediate.
+/// Build a tuple in shared space. Each item must be old, eternal, or immediate.
 pub(crate) fn shared_tuple(ctx: &mut ProcCtx, items: &[u64]) -> u64 {
     let p = alloc_shared(ctx, 1 + items.len());
     unsafe {
@@ -22,7 +24,7 @@ pub(crate) fn shared_tuple(ctx: &mut ProcCtx, items: &[u64]) -> u64 {
     p as u64
 }
 
-/// Push an (already shared-safe) message and wake the target.
+/// Push a message that is already shared-safe, then wake the target.
 pub(crate) fn push_and_wake(ctx: &mut ProcCtx, id: usize, msg: u64) {
     let global = ctx.global;
     let Some(cell) = proc_ref(global, id) else {
@@ -44,11 +46,12 @@ pub(crate) fn push_and_wake(ctx: &mut ProcCtx, id: usize, msg: u64) {
     }
 }
 
-/// Deliver an exit signal to `target`. `forced` = exit(Pid, kill).
+/// Deliver an exit signal to `target`. `forced` is true for exit(Pid, kill).
 pub(crate) fn exit_signal(ctx: &mut ProcCtx, from_pid: usize, target: usize, reason: u64, forced: bool) {
     let g = ctx.global;
-    // the reason lands in old-space tuples and cross-scheduler pending_kill:
-    // young terms would be missed by minors (no remembered set)
+    // The reason lands in old-space tuples and in the cross-scheduler
+    // pending_kill. A minor collection does not see young terms there. There
+    // is no remembered set.
     let reason = promote_term(ctx, reason);
     let Some(cell) = proc_ref(g, target) else {
         return;
@@ -66,7 +69,7 @@ pub(crate) fn exit_signal(ctx: &mut ProcCtx, from_pid: usize, target: usize, rea
     }
     ls.pending_kill = reason;
     drop(ls);
-    // wake it so its home scheduler notices the pending kill
+    // Wake the target so that its home scheduler sees the pending kill.
     let mut st = p.state.lock();
     if matches!(*st, PState::Waiting(_)) {
         *st = PState::Runnable;
@@ -80,10 +83,11 @@ pub(crate) fn exit_signal(ctx: &mut ProcCtx, from_pid: usize, target: usize, rea
     }
 }
 
-/// A process is gone: notify monitors, propagate to links, free the slot.
+/// Handle a dead process. Notify the monitors, send exit signals to the links,
+/// and free the slot.
 pub(crate) fn process_death(ctx: &mut ProcCtx, pid: usize, reason: u64) {
     let g = ctx.global;
-    // the reason goes into old-space DOWN tuples and exit signals
+    // The reason goes into old-space DOWN tuples and exit signals.
     let reason = promote_term(ctx, reason);
     let Some(cell) = proc_ref(g, pid) else {
         return;
@@ -111,7 +115,8 @@ pub(crate) fn process_death(ctx: &mut ProcCtx, pid: usize, reason: u64) {
         }
         exit_signal(ctx, pid, linked, reason, false);
     }
-    // drop stale monitoring entries on targets I watched
+    // Remove the stale monitor entries from the targets that this process
+    // watched.
     for (ref_id, target) in ls.monitoring {
         if let Some(t) = proc_ref(g, target) {
             let t = unsafe { proc_mut(t) };
@@ -125,7 +130,8 @@ pub extern "C" fn mana_rt_make_ref(_ctx: *mut ProcCtx) -> u64 {
     make_ref_term()
 }
 
-/// erlang:link/1 — bidirectional; linking a dead pid delivers noproc.
+/// erlang:link/1. The link is bidirectional. A link to a dead pid delivers a
+/// noproc exit signal.
 #[no_mangle]
 pub extern "C" fn mana_rt_link(ctx: *mut ProcCtx, pid: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -167,8 +173,8 @@ pub extern "C" fn mana_rt_unlink(ctx: *mut ProcCtx, pid: u64) -> u64 {
     1
 }
 
-/// erlang:monitor(process, Pid) — returns the ref; dead target → immediate
-/// noproc DOWN.
+/// erlang:monitor(process, Pid). The function returns the ref. If the target
+/// is dead, the caller gets an immediate noproc DOWN message.
 #[no_mangle]
 pub extern "C" fn mana_rt_monitor(ctx: *mut ProcCtx, pid: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -230,14 +236,15 @@ pub extern "C" fn mana_rt_demonitor(ctx: *mut ProcCtx, r: u64) -> u64 {
     1
 }
 
-/// Reply aliases (OTP 24 monitor opts): ref word → target pid. A send to
-/// a ref consults this table; absent aliases drop silently (BEAM parity).
+/// Reply aliases from the OTP 24 monitor options. The map goes from the ref
+/// word to the target pid. A send to a ref consults this table. A send to an
+/// absent alias does nothing. This matches BEAM.
 pub(crate) static ALIASES: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> =
     std::sync::Mutex::new(None);
 
-/// erlang:monitor/3 — monitor/2 plus options. Supported: {alias, _} (all
-/// deactivation flavors behave like demonitor — TODO(alias-modes)); other
-/// options are ignored.
+/// erlang:monitor/3 is monitor/2 plus options. The {alias, _} option is
+/// supported. TODO(alias-modes): every deactivation mode behaves like
+/// demonitor. The function ignores other options.
 #[no_mangle]
 pub extern "C" fn mana_rt_monitor3(ctx: *mut ProcCtx, pid: u64, opts: u64) -> u64 {
     let r = mana_rt_monitor(ctx, pid);
@@ -273,9 +280,10 @@ pub(crate) fn drop_alias(r: u64) {
     }
 }
 
-/// demonitor/2 with the flush option: also drop any already-delivered
-/// {'DOWN', Ref, ...} message. The info option (return false if the DOWN
-/// already fired) is approximated by whether a message was flushed.
+/// demonitor/2 with the flush option. The function also removes a
+/// {'DOWN', Ref, ...} message that is already in the mailbox. The info option
+/// returns false if the DOWN already fired. Here the result is an
+/// approximation: it reports whether the function flushed a message.
 #[no_mangle]
 pub extern "C" fn mana_rt_demonitor_flush(ctx: *mut ProcCtx, r: u64) -> u64 {
     let res = mana_rt_demonitor(ctx, r);
@@ -301,8 +309,8 @@ pub extern "C" fn mana_rt_demonitor_flush(ctx: *mut ProcCtx, r: u64) -> u64 {
             && unsafe { *tp.add(2) } == r
     };
     let before = p.private.len();
-    // removing before the cursor shifts it; adjust so the receive scan
-    // position stays on the same message
+    // A removal before the cursor shifts the cursor. Adjust the cursor so that
+    // the receive scan stays on the same message.
     let mut removed_before_cursor = 0;
     let cursor = p.cursor;
     let mut i = 0;
@@ -322,7 +330,8 @@ pub extern "C" fn mana_rt_demonitor_flush(ctx: *mut ProcCtx, r: u64) -> u64 {
     }
 }
 
-/// erlang:exit/2 — kill is untrappable and propagates as killed.
+/// erlang:exit/2. The target cannot trap the kill reason. The kill reason
+/// propagates as killed.
 #[no_mangle]
 pub extern "C" fn mana_rt_exit2(ctx: *mut ProcCtx, pid: u64, reason: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -336,7 +345,7 @@ pub extern "C" fn mana_rt_exit2(ctx: *mut ProcCtx, pid: u64, reason: u64) -> u64
     1
 }
 
-/// process_flag(trap_exit, Bool) — returns the previous value.
+/// process_flag(trap_exit, Bool). The function returns the previous value.
 #[no_mangle]
 pub extern "C" fn mana_rt_trap_exit(ctx: *mut ProcCtx, flag: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -352,14 +361,15 @@ pub extern "C" fn mana_rt_trap_exit(ctx: *mut ProcCtx, flag: u64) -> u64 {
     }
 }
 
-/// erlang:hibernate/3 — discard the (conceptual) stack, wait for a
-/// message, then continue at apply(M, F, A). The applied function is not
-/// expected to return; if it does, the process exits normally.
+/// erlang:hibernate/3. Discard the (conceptual) stack, wait for a message,
+/// then continue at apply(M, F, A). In the usual case the applied function
+/// does not return. If it returns, the process exits with reason normal.
 #[no_mangle]
 pub extern "C" fn mana_rt_hibernate(ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -> u64 {
     let ctxr = unsafe { &mut *ctx };
-    // the args list is a heap term held across suspends — root it (the
-    // parked coroutine's root-frame chain is scanned and updated by GC)
+    // The args list is a heap term that lives across suspends, so it needs a
+    // root. The GC scans and updates the root-frame chain of the parked
+    // coroutine.
     let saved = ctxr.roots_head;
     let mut fr = [0u64, 1, a];
     fr[0] = saved;
@@ -370,8 +380,8 @@ pub extern "C" fn mana_rt_hibernate(ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -
         if !p.private.is_empty() {
             break;
         }
-        // publish Waiting, then re-check ingress under the lock (same
-        // lost-wakeup window as recv_wait / park_on_socket)
+        // Publish Waiting, then check the ingress again under the lock. This
+        // closes the same lost-wakeup window as recv_wait and park_on_socket.
         {
             let mut st = p.state.lock();
             *st = PState::Waiting(None);

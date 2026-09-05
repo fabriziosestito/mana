@@ -1,11 +1,16 @@
+//! Native persistent_term, ets, and application env. One global store holds
+//! eternal deep copies of every stored term. An eternal term never points
+//! into a process heap, so the GC does not scan it. This is enough for
+//! elixir_config-style tables. TODO(ets): complete match specs, ordered
+//! tables, delete_all, GC of replaced values.
+
 use super::*;
 
-// ---------------------------------------------------------------------------
-// persistent_term (native cut)
+// persistent_term
 
-/// Deep copy a term into self-contained eternal storage: every pointer in
-/// the copy targets another eternal block, so the GC never needs to see it.
-/// persistent_term values are immortal by design (puts are rare).
+/// Deep copy a term into eternal storage. Every pointer in the copy targets
+/// another eternal block. The GC never scans eternal storage.
+/// persistent_term values live forever by design. Puts are rare.
 pub(crate) fn eternal_deep_copy(t: u64) -> u64 {
     match t & TAG_MASK {
         TAG_CONS => {
@@ -21,8 +26,8 @@ pub(crate) fn eternal_deep_copy(t: u64) -> u64 {
         TAG_BOXED if t != 0 => {
             let p = t as *const u64;
             let header = unsafe { *p };
-            // flatten views up front: an eternal reason must not pin a heap
-            // parent (and eternal storage never gets GC-forwarded)
+            // Flatten sub-binary views first. An eternal copy must not pin a
+            // heap parent, and the GC never forwards eternal storage.
             if header & 0xff == KIND_SUBBIN {
                 let bytes = bin_bytes(t);
                 let bwords = 1 + (bytes.len() + 7) / 8;
@@ -49,7 +54,7 @@ pub(crate) fn eternal_deep_copy(t: u64) -> u64 {
                         std::ptr::copy_nonoverlapping(p.add(1), np.add(1), words - 1);
                     }
                     KIND_FUN => {
-                        *np.add(1) = *p.add(1); // code ptr
+                        *np.add(1) = *p.add(1); // code pointer, not a term
                         for i in 2..words {
                             *np.add(i) = eternal_deep_copy(*p.add(i));
                         }
@@ -63,22 +68,22 @@ pub(crate) fn eternal_deep_copy(t: u64) -> u64 {
             }
             np as u64
         }
-        _ => t, // immediates and atoms (static) pass through
+        _ => t, // immediates and static atoms pass through
     }
 }
 
 pub(crate) static PERSISTENT_TERMS: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> =
     std::sync::Mutex::new(None);
 
-/// persistent_term:put/2 — keys compared exactly (we require immediate or
-/// atom keys, which covers real usage; compound keys are TODO).
+/// persistent_term:put/2. Keys compare exactly, so compound keys work. The
+/// store is a scan, not a hash table.
 #[no_mangle]
 pub extern "C" fn mana_rt_pt_put(_ctx: *mut ProcCtx, key: u64, val: u64) -> u64 {
     let key = eternal_deep_copy(key);
     let val = eternal_deep_copy(val);
     let mut guard = PERSISTENT_TERMS.lock().unwrap();
     let map = guard.get_or_insert_with(Default::default);
-    // exact-compare lookup for compound keys
+    // Exact-compare scan, not a hash lookup, so compound keys match.
     let existing = map.keys().copied().find(|&k| mana_rt_eq_exact(k, key) == 1);
     match existing {
         Some(k) => {
@@ -91,8 +96,8 @@ pub extern "C" fn mana_rt_pt_put(_ctx: *mut ProcCtx, key: u64, val: u64) -> u64 
     known().ok
 }
 
-/// persistent_term:get/1,2 — sentinel-free: get/1 raises badarg on miss
-/// (BEAM's behavior), get/2 returns the default.
+/// persistent_term:get/1,2. On a miss, get/1 raises badarg, as BEAM does.
+/// get/2 returns the default. No sentinel value is used.
 #[no_mangle]
 pub extern "C" fn mana_rt_pt_get(ctx: *mut ProcCtx, key: u64, default: u64, has_default: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -107,10 +112,7 @@ pub extern "C" fn mana_rt_pt_get(ctx: *mut ProcCtx, key: u64, default: u64, has_
     }
 }
 
-// ---------------------------------------------------------------------------
-// ets + application env (native cuts): one global store of eternal deep
-// copies. Enough for elixir_config-style tables — TODO(ets): match specs,
-// ordered tables, delete_all, GC of replaced values.
+// ets + application env
 
 pub(crate) type KvStore = std::sync::Mutex<Option<Vec<(u64, u64, u64)>>>; // (tab, key, tuple)
 
@@ -121,8 +123,8 @@ pub(crate) fn kv_find(rows: &[(u64, u64, u64)], tab: u64, key: u64) -> Option<us
         .position(|&(t, k, _)| t == tab && mana_rt_eq_exact(k, key) == 1)
 }
 
-/// ets:insert/2 with a tuple or list of tuples (keypos 1); insert_new when
-/// `new != 0`.
+/// ets:insert/2 with a tuple or a list of tuples. The key position is 1.
+/// If `new != 0`, the call acts as insert_new.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_insert(ctx: *mut ProcCtx, tab: u64, obj: u64, new: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -170,8 +172,8 @@ pub extern "C" fn mana_rt_ets_insert(ctx: *mut ProcCtx, tab: u64, obj: u64, new:
                 }
             },
             _ => {
-                // bag dedups exact-equal objects; duplicate_bag always
-                // appends. Rows keep insertion order.
+                // A bag skips exact-equal duplicate objects. A duplicate_bag
+                // always appends. Rows keep insertion order.
                 let dup = kind == ETS_BAG
                     && rows.iter().any(|&(t, k, v)| {
                         t == tab
@@ -189,8 +191,9 @@ pub extern "C" fn mana_rt_ets_insert(ctx: *mut ProcCtx, tab: u64, obj: u64, new:
     known.true_a
 }
 
-/// ets:lookup/2 → list of all stored tuples for the key, in insertion
-/// order (bags may hold several — eternal, safe to share).
+/// ets:lookup/2 returns the list of all stored tuples for the key, in
+/// insertion order. A bag can hold several. The tuples are eternal, so the
+/// list shares them.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_lookup(ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -206,7 +209,8 @@ pub extern "C" fn mana_rt_ets_lookup(ctx: *mut ProcCtx, tab: u64, key: u64) -> u
             })
             .unwrap_or_default()
     };
-    // rows are eternal — build the list newest-cons-last (reverse iter)
+    // The rows are eternal and need no rooting. Reverse iteration keeps
+    // insertion order in the list.
     let mut out = NIL;
     for &tuple in found.iter().rev() {
         let mut fr = [ctx.roots_head, 1, out];
@@ -223,7 +227,7 @@ pub extern "C" fn mana_rt_ets_lookup(ctx: *mut ProcCtx, tab: u64, key: u64) -> u
     out
 }
 
-/// ets:delete/2 (by key) — removes every row for the key (bag semantics).
+/// ets:delete/2 by key. Removes every row for the key, as a bag requires.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_delete(_ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
     let mut guard = ETS_STORE.lock().unwrap();
@@ -233,8 +237,8 @@ pub extern "C" fn mana_rt_ets_delete(_ctx: *mut ProcCtx, tab: u64, key: u64) -> 
     known().true_a
 }
 
-/// Restricted ets match pattern: literals (eq_exact), '_' wildcard,
-/// '$N' captures. Captures append to `caps` tagged with N.
+/// Restricted ets match pattern. Literals compare with eq_exact. '_' is the
+/// wildcard. '$N' captures the value. Each capture appends to `caps` with its N.
 pub(crate) fn ets_match_term(pat: u64, val: u64, caps: &mut Vec<(i64, u64)>) -> bool {
     if pat & TAG_MASK == TAG_ATOM {
         let b = atom_bytes(pat);
@@ -275,7 +279,8 @@ pub(crate) fn ets_match_term(pat: u64, val: u64, caps: &mut Vec<(i64, u64)>) -> 
     mana_rt_eq_exact(pat, val) == 1
 }
 
-/// ets:match/2 — list of capture lists ('$N' order), insertion order.
+/// ets:match/2 returns a list of capture lists in '$N' order. The rows are in
+/// insertion order.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_match(ctx: *mut ProcCtx, tab: u64, pattern: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -291,7 +296,8 @@ pub extern "C" fn mana_rt_ets_match(ctx: *mut ProcCtx, tab: u64, pattern: u64) -
             })
             .unwrap_or_default()
     };
-    // rows are eternal (deep-copied at insert) — safe across allocs
+    // The rows are eternal (deep copies made at insert). They survive
+    // allocations without rooting.
     let mut matches: Vec<Vec<u64>> = Vec::new();
     for row in rows {
         let mut caps: Vec<(i64, u64)> = Vec::new();
@@ -327,9 +333,9 @@ pub extern "C" fn mana_rt_ets_match(ctx: *mut ProcCtx, tab: u64, pattern: u64) -
     out
 }
 
-/// Known-table registry: (eternal name term, kind). Kind drives insert
-/// dedup and the shape of lookup_element. Unregistered tables (the app-env
-/// tag) default to Set.
+/// Known-table registry: (eternal name term, kind). The kind controls insert
+/// dedup and the shape of the lookup_element result. A table that is not
+/// registered, for example the app-env tag, defaults to Set.
 pub(crate) static ETS_TABLES: std::sync::Mutex<Vec<(u64, u8)>> = std::sync::Mutex::new(Vec::new());
 
 pub(crate) const ETS_SET: u8 = 0;
@@ -338,7 +344,8 @@ pub(crate) const ETS_BAG: u8 = 1;
 
 pub(crate) const ETS_DUP_BAG: u8 = 2;
 
-/// Kind of a table by name term; Set for anything not registered.
+/// Kind of a table by name term. Returns Set for a table that is not
+/// registered.
 pub(crate) fn ets_kind(tab: u64) -> u8 {
     let tabs = ETS_TABLES.lock().unwrap();
     tabs.iter()
@@ -347,9 +354,9 @@ pub(crate) fn ets_kind(tab: u64) -> u8 {
         .unwrap_or(ETS_SET)
 }
 
-/// ets:new/2 — registers the (named) table and records its kind from the
-/// options (`bag` / `duplicate_bag` / `ordered_set` → Set + TODO(ets); all
-/// other options ignored).
+/// ets:new/2 registers the named table and records its kind from the options.
+/// `bag` and `duplicate_bag` set the kind. `ordered_set` maps to Set.
+/// TODO(ets): ordered tables. The function ignores all other options.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_new(_ctx: *mut ProcCtx, name: u64, opts: u64) -> u64 {
     let mut kind = ETS_SET;
@@ -374,12 +381,13 @@ pub extern "C" fn mana_rt_ets_new(_ctx: *mut ProcCtx, name: u64, opts: u64) -> u
     name
 }
 
-/// Seed the `elixir_config` ets table with the URI scheme → default-port
-/// entries that `elixir:start/2` inserts on BEAM (`{{uri, <<"http">>}, 80}`
-/// …). The closed world never runs the :elixir application boot, so
-/// URI.default_port/1 (→ elixir_config:get({uri, Scheme})) would return nil
-/// and any HTTP request whose Host header omits a port would then crash in
-/// the response path. Called once from the generated main.
+/// Seed the `elixir_config` ets table with the URI scheme to default-port
+/// entries that `elixir:start/2` inserts on BEAM, for example
+/// `{{uri, <<"http">>}, 80}`. The closed world never runs the :elixir
+/// application boot. Without this seed, URI.default_port/1 (which reads
+/// elixir_config:get({uri, Scheme})) returns nil. Then any HTTP request whose
+/// Host header omits a port crashes in the response path. The generated main
+/// calls this function once.
 #[no_mangle]
 pub extern "C" fn mana_rt_seed_uri_defaults(ctx: *mut ProcCtx) {
     let ctx = unsafe { &mut *ctx };
@@ -397,7 +405,7 @@ pub extern "C" fn mana_rt_seed_uri_defaults(ctx: *mut ProcCtx) {
     ];
     for &(scheme, port) in defaults {
         let sbin = bytes_to_new_bin(ctx, scheme);
-        // root sbin across the two tuple allocs
+        // Root sbin across the two tuple allocations.
         let mut fr = [ctx.roots_head, 1, sbin];
         ctx.roots_head = fr.as_ptr() as u64;
         let key = alloc_nursery(ctx, 3);
@@ -429,7 +437,7 @@ pub extern "C" fn mana_rt_ets_info(_ctx: *mut ProcCtx, tab: u64) -> u64 {
     }
 }
 
-/// ets:match_delete/2 — drop matching rows.
+/// ets:match_delete/2 removes every row that matches the pattern.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_match_delete(_ctx: *mut ProcCtx, tab: u64, pattern: u64) -> u64 {
     let mut guard = ETS_STORE.lock().unwrap();
@@ -445,7 +453,7 @@ pub extern "C" fn mana_rt_ets_match_delete(_ctx: *mut ProcCtx, tab: u64, pattern
     known().true_a
 }
 
-/// ets:member/2 — true if any object has the key.
+/// ets:member/2 returns true if any object has the key.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_member(_ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
     let k = known();
@@ -464,8 +472,8 @@ pub extern "C" fn mana_rt_ets_member(_ctx: *mut ProcCtx, tab: u64, key: u64) -> 
     }
 }
 
-/// ets:delete_object/2 — remove every row whose stored object equals the
-/// given one (Registry's per-key unsubscribe cleanup).
+/// ets:delete_object/2 removes every row whose stored object equals the given
+/// one. Registry uses this for its per-key unsubscribe cleanup.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_delete_object(ctx: *mut ProcCtx, tab: u64, obj: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -486,8 +494,8 @@ pub extern "C" fn mana_rt_ets_delete_object(ctx: *mut ProcCtx, tab: u64, obj: u6
     known().true_a
 }
 
-/// ets:take/2 — return all objects for the key (as ets:lookup would) and
-/// remove them.
+/// ets:take/2 returns all objects for the key, as ets:lookup does, and
+/// removes them.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_take(ctx: *mut ProcCtx, tab: u64, key: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -522,10 +530,11 @@ pub extern "C" fn mana_rt_ets_take(ctx: *mut ProcCtx, tab: u64, key: u64) -> u64
     out
 }
 
-/// Count rows of `tab` matching a restricted select head (guards must be
-/// empty). Shared by select_count and select_delete.
+/// Count the rows of `tab` that match a restricted select head. The guards
+/// must be empty. select_count and select_delete share this function.
 pub(crate) fn ets_select_matches(spec: u64, tab: u64, out_heads: &mut Vec<u64>) -> Result<usize, ()> {
-    // parse [{Head, [], _Body}] — heads only, guards must be []
+    // Parse [{Head, [], _Body}]. The function keeps only the heads. The
+    // guards must be [].
     let mut heads: Vec<u64> = Vec::new();
     let mut cur = spec;
     while cur & TAG_MASK == TAG_CONS {
@@ -566,7 +575,8 @@ pub(crate) fn ets_select_matches(spec: u64, tab: u64, out_heads: &mut Vec<u64>) 
     Ok(count)
 }
 
-/// ets:select_count/2 — number of objects matching the spec (empty guards).
+/// ets:select_count/2 returns the number of objects that match the spec. The
+/// guards must be empty.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_select_count(ctx: *mut ProcCtx, tab: u64, spec: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -577,7 +587,8 @@ pub extern "C" fn mana_rt_ets_select_count(ctx: *mut ProcCtx, tab: u64, spec: u6
     }
 }
 
-/// ets:select_delete/2 — delete objects matching the spec, return the count.
+/// ets:select_delete/2 removes the objects that match the spec and returns the
+/// count.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_select_delete(ctx: *mut ProcCtx, tab: u64, spec: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -595,8 +606,9 @@ pub extern "C" fn mana_rt_ets_select_delete(ctx: *mut ProcCtx, tab: u64, spec: u
     ((n as u64) << 3) | TAG_SMALL
 }
 
-/// Match-spec BODY term substitution: '$N' → capture, '$_' → object,
-/// '$$' → all captures, {X} (arity-1 tuple) → tuple-escape of X.
+/// Match-spec body term substitution. '$N' becomes the capture. '$_' becomes
+/// the object. '$$' becomes the list of all captures. {X}, an arity-1 tuple,
+/// is the tuple escape of X.
 pub(crate) fn ets_subst_body(ctx: &mut ProcCtx, body: u64, caps: &[(i64, u64)], obj: u64) -> u64 {
     if body & TAG_MASK == TAG_ATOM {
         let b = atom_bytes(body);
@@ -629,7 +641,8 @@ pub(crate) fn ets_subst_body(ctx: &mut ProcCtx, body: u64, caps: &[(i64, u64)], 
         unsafe {
             let p = body as *const u64;
             if *p & 0xff == KIND_TUPLE && (*p >> 8) == 1 {
-                // {X}: tuple escape — X built literally (with substitution)
+                // {X} is a tuple escape. The result is X itself, with
+                // substitution in its fields.
                 let inner = *p.add(1);
                 if inner & TAG_MASK == TAG_BOXED
                     && inner != 0
@@ -637,7 +650,8 @@ pub(crate) fn ets_subst_body(ctx: &mut ProcCtx, body: u64, caps: &[(i64, u64)], 
                 {
                     let ip = inner as *const u64;
                     let n = (*ip >> 8) as usize;
-                    // substitute fields first (rooted), then build
+                    // Substitute the fields first, under a root frame. Then
+                    // build the tuple.
                     let saved = ctx.roots_head;
                     let mut fields: Vec<u64> = Vec::with_capacity(n);
                     let mut fr = vec![0u64; 2 + n];
@@ -645,7 +659,7 @@ pub(crate) fn ets_subst_body(ctx: &mut ProcCtx, body: u64, caps: &[(i64, u64)], 
                     fr[1] = n as u64;
                     ctx.roots_head = fr.as_ptr() as u64;
                     for i in 0..n {
-                        let ip = inner as *const u64; // re-derive (may move? inner unrooted!)
+                        let ip = inner as *const u64; // Re-derived pointer. `inner` is not rooted, so a GC can move it.
                         let fv = ets_subst_body(ctx, *ip.add(1 + i), caps, obj);
                         fr[2 + i] = fv;
                         fields.push(0);
@@ -667,11 +681,12 @@ pub(crate) fn ets_subst_body(ctx: &mut ProcCtx, body: u64, caps: &[(i64, u64)], 
     body
 }
 
-/// ets:select/2 — restricted match specs [{Head, [], [Body]}] (no guards).
+/// ets:select/2 with restricted match specs [{Head, [], [Body]}]. The
+/// function does not support guards.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_select(ctx: *mut ProcCtx, tab: u64, spec: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    // parse the spec list: [{Head, Guards, [Body]}]
+    // The spec list has the shape [{Head, Guards, [Body]}].
     let mut clauses: Vec<(u64, u64)> = Vec::new(); // (head, body)
     let mut cur = spec;
     while cur & TAG_MASK == TAG_CONS {
@@ -710,10 +725,10 @@ pub extern "C" fn mana_rt_ets_select(ctx: *mut ProcCtx, tab: u64, spec: u64) -> 
             })
             .unwrap_or_default()
     };
-    // results built under a root frame; rows/spec terms are eternal or
-    // caller-live respectively (spec is not used after parsing... heads
-    // and bodies are caller terms — no alloc happens between uses except
-    // inside subst which re-reads from the parsed immediates)
+    // The code builds the results under a root frame. The rows are eternal.
+    // The heads and bodies are caller terms and are not rooted. No allocation
+    // happens between their uses, except inside ets_subst_body, which
+    // re-reads from the parsed values.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 2, NIL, NIL];
     fr[0] = saved;
@@ -728,7 +743,8 @@ pub extern "C" fn mana_rt_ets_select(ctx: *mut ProcCtx, tab: u64, spec: u64) -> 
                 break;
             }
         }
-        // keep already-built results rooted as a growing list
+        // Cons each built result onto the rooted list, so it survives later
+        // allocations.
         while let Some(r) = results.pop() {
             fr[3] = r;
             let cell = alloc_nursery(ctx, 2);
@@ -739,7 +755,7 @@ pub extern "C" fn mana_rt_ets_select(ctx: *mut ProcCtx, tab: u64, spec: u64) -> 
             fr[2] = cell as u64 | TAG_CONS;
         }
     }
-    // reverse into final order
+    // Reverse the rooted list into the final order.
     let mut out = NIL;
     fr[3] = NIL;
     let mut cur = fr[2];
@@ -747,7 +763,7 @@ pub extern "C" fn mana_rt_ets_select(ctx: *mut ProcCtx, tab: u64, spec: u64) -> 
         let p = (cur & !TAG_MASK) as *const u64;
         let v = unsafe { *p };
         cur = unsafe { *p.add(1) };
-        fr[2] = cur; // remaining source stays rooted
+        fr[2] = cur; // the rest of the source list stays rooted
         let mut fr3 = [0u64, 2, v, out];
         fr3[0] = ctx.roots_head;
         ctx.roots_head = fr3.as_ptr() as u64;
@@ -764,11 +780,11 @@ pub extern "C" fn mana_rt_ets_select(ctx: *mut ProcCtx, tab: u64, spec: u64) -> 
     out
 }
 
-/// ets:lookup_element/3 — badarg on missing table/key (Bandit.Clock's
-/// date_header rescues the resulting ArgumentError to compute a fallback).
-/// For bag / duplicate_bag tables the result is the LIST of the Pos-th
-/// elements across every object with the key, in insertion order (this is
-/// what Phoenix.Registry.dispatch consumes).
+/// ets:lookup_element/3 raises badarg on a missing table or key. The
+/// date_header function in Bandit.Clock rescues that ArgumentError to compute
+/// a fallback. For bag and duplicate_bag tables, the result is the LIST of the
+/// Pos-th elements across every object with the key, in insertion order.
+/// Phoenix.Registry.dispatch consumes this list.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_lookup_element(
     ctx: *mut ProcCtx,
@@ -779,13 +795,13 @@ pub extern "C" fn mana_rt_ets_lookup_element(
     match ets_lookup_element_impl(ctx, tab, key, pos) {
         Ok(v) => v,
         Err(true) => raise_badarg(unsafe { &mut *ctx }),
-        // empty on a /3 call is badarg
+        // No rows on a /3 call is also badarg.
         Err(false) => raise_badarg(unsafe { &mut *ctx }),
     }
 }
 
-/// ets:lookup_element/4 — like /3 but returns Default when the key is
-/// absent instead of raising (pg:get_members/2 relies on this).
+/// ets:lookup_element/4 is like /3, but returns Default when the key is
+/// absent instead of a raise. pg:get_members/2 depends on this.
 #[no_mangle]
 pub extern "C" fn mana_rt_ets_lookup_element4(
     ctx: *mut ProcCtx,
@@ -797,12 +813,13 @@ pub extern "C" fn mana_rt_ets_lookup_element4(
     match ets_lookup_element_impl(ctx, tab, key, pos) {
         Ok(v) => v,
         Err(true) => raise_badarg(unsafe { &mut *ctx }),
-        Err(false) => default, // key absent → default
+        Err(false) => default,
     }
 }
 
-/// Shared body: Ok(term) on success, Err(true) on a genuine badarg (bad
-/// pos or malformed tuple), Err(false) when the key has no rows.
+/// Shared body. Returns Ok(term) on success. Returns Err(true) on a real
+/// badarg (bad pos or malformed tuple). Returns Err(false) when the key has no
+/// rows.
 pub(crate) fn ets_lookup_element_impl(ctx: *mut ProcCtx, tab: u64, key: u64, pos: u64) -> Result<u64, bool> {
     let ctx = unsafe { &mut *ctx };
     if pos & TAG_MASK != TAG_SMALL || (pos as i64 >> 3) < 1 {
@@ -824,7 +841,8 @@ pub(crate) fn ets_lookup_element_impl(ctx: *mut ProcCtx, tab: u64, key: u64, pos
     if found.is_empty() {
         return Err(false);
     }
-    // element at position n of each stored tuple (all eternal)
+    // Take the element at position n of each stored tuple. All tuples are
+    // eternal.
     let mut elems: Vec<u64> = Vec::with_capacity(found.len());
     for tuple in found {
         unsafe {
@@ -838,7 +856,7 @@ pub(crate) fn ets_lookup_element_impl(ctx: *mut ProcCtx, tab: u64, key: u64, pos
     if ets_kind(tab) == ETS_SET {
         return Ok(elems[0]);
     }
-    // bag: return the list of elements, insertion order
+    // For a bag, return the list of elements in insertion order.
     let mut out = NIL;
     for &e in elems.iter().rev() {
         let mut fr = [ctx.roots_head, 1, out];
@@ -855,8 +873,8 @@ pub(crate) fn ets_lookup_element_impl(ctx: *mut ProcCtx, tab: u64, key: u64, pos
     Ok(out)
 }
 
-/// application env — same store under a reserved table tag (0b111 is never
-/// a valid term word for a table name).
+/// Application env uses the same store under a reserved table tag. 0b111 is
+/// never a valid term word for a table name.
 pub(crate) const APP_ENV_TAB: u64 = 0b111;
 
 #[no_mangle]
@@ -872,7 +890,7 @@ pub extern "C" fn mana_rt_app_set_env(ctx: *mut ProcCtx, app: u64, key: u64, val
         *kp.add(1) = fr[2];
         *kp.add(2) = fr[3];
     }
-    fr[2] = kp as u64; // reuse slot: composite {App, Key} key
+    fr[2] = kp as u64; // reuse the slot for the composite {App, Key} key
     let op = alloc_nursery(ctx, 3);
     unsafe {
         *op = (2 << 8) | KIND_TUPLE;
@@ -883,8 +901,9 @@ pub extern "C" fn mana_rt_app_set_env(ctx: *mut ProcCtx, app: u64, key: u64, val
     mana_rt_ets_insert(ctx, APP_ENV_TAB, op as u64, 0)
 }
 
-/// get_env: `miss` is returned on absence (codegen passes 'undefined' or
-/// the default); `wrap_ok != 0` wraps hits as {ok, V}.
+/// get_env returns `miss` when the key is absent. Codegen passes 'undefined'
+/// or the default as `miss`. If `wrap_ok != 0`, the function wraps a hit as
+/// {ok, V}.
 #[no_mangle]
 pub extern "C" fn mana_rt_app_get_env(
     ctx: *mut ProcCtx,
@@ -911,7 +930,7 @@ pub extern "C" fn mana_rt_app_get_env(
     drop(guard);
     match found {
         Some(v) if wrap_ok != 0 => {
-            // v is eternal — no rooting needed around this alloc
+            // v is eternal, so this allocation needs no rooting.
             let p = alloc_nursery(ctx, 3);
             unsafe {
                 *p = (2 << 8) | KIND_TUPLE;

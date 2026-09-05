@@ -1,7 +1,7 @@
 use super::*;
 
-/// Integer digits in a base (2..=36, uppercase — BEAM's format).
-/// Digits of ANY integer term in `base` (bignum-aware).
+/// Digits of any integer term in `base`. The term can be a bignum. The base
+/// is 2..=36. Letters are uppercase, which is BEAM's format.
 pub(crate) fn int_term_digits(t: u64, base: u32) -> Option<String> {
     if t & TAG_MASK == TAG_SMALL {
         return Some(int_digits(t as i64 >> 3, base));
@@ -10,7 +10,7 @@ pub(crate) fn int_term_digits(t: u64, base: u32) -> Option<String> {
     let body = if base == 10 {
         bigint::mag_to_decimal(mag)
     } else {
-        // repeated divrem by the base — rare path (Integer.to_string/2)
+        // Repeated divrem by the base. This path is rare (Integer.to_string/2).
         let mut cur = mag.to_vec();
         let mut out = Vec::new();
         while !cur.is_empty() {
@@ -47,7 +47,8 @@ pub(crate) fn int_digits(v: i64, base: u32) -> String {
     String::from_utf8(out).unwrap()
 }
 
-/// erlang:integer_to_binary/1,2 (base as a term; small 10 for /1).
+/// erlang:integer_to_binary/1,2. The base is a term. The /1 form passes
+/// small 10.
 #[no_mangle]
 pub extern "C" fn mana_rt_integer_to_binary(ctx: *mut ProcCtx, t: u64, base: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -77,9 +78,9 @@ pub extern "C" fn mana_rt_integer_to_list(ctx: *mut ProcCtx, t: u64, base: u64) 
     bytes_to_charlist(ctx, s.as_bytes())
 }
 
-/// erlang:pid_to_list/1 — BEAM-style "<0.ID.0>" charlist (no distribution,
-/// so node creation and serial are 0). Inspect.PID wraps this as
-/// "#PID<0.ID.0>".
+/// erlang:pid_to_list/1. Returns a BEAM-style "<0.ID.0>" charlist. There is
+/// no distribution, so the node creation and the serial are 0. Inspect.PID
+/// wraps this as "#PID<0.ID.0>".
 #[no_mangle]
 pub extern "C" fn mana_rt_pid_to_list(ctx: *mut ProcCtx, pid: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -91,7 +92,8 @@ pub extern "C" fn mana_rt_pid_to_list(ctx: *mut ProcCtx, pid: u64) -> u64 {
     bytes_to_charlist(ctx, s.as_bytes())
 }
 
-/// Parse decimal/base digits (with optional sign) — badarg on any junk.
+/// Parses digits in `base` with an optional sign. Any junk gives `None`, and
+/// the callers raise badarg.
 pub(crate) fn parse_int_term(ctx: &mut ProcCtx, bytes: &[u8], base: u32) -> Option<u64> {
     let s = std::str::from_utf8(bytes).ok()?;
     if let Ok(v) = i64::from_str_radix(s, base) {
@@ -99,7 +101,7 @@ pub(crate) fn parse_int_term(ctx: &mut ProcCtx, bytes: &[u8], base: u32) -> Opti
             return Some(((v << 3) as u64) | TAG_SMALL);
         }
     }
-    // outside i64 / outside the small range: parse into limbs
+    // The value is outside i64 or outside the small range. Parse it into limbs.
     let (neg, digits) = match s.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
@@ -180,7 +182,8 @@ pub extern "C" fn mana_rt_atom_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
     bytes_to_charlist(ctx, &bytes)
 }
 
-/// erlang:atom_to_binary/1,2 (utf8 == latin1 for our ascii atom names).
+/// erlang:atom_to_binary/1,2. Atom names are ASCII, so utf8 and latin1 give
+/// the same bytes.
 #[no_mangle]
 pub extern "C" fn mana_rt_atom_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -191,7 +194,8 @@ pub extern "C" fn mana_rt_atom_to_binary(ctx: *mut ProcCtx, t: u64) -> u64 {
     bytes_to_new_bin(ctx, &bytes)
 }
 
-/// erlang:list_to_atom/1 (interning) and list_to_existing_atom/1 (strict).
+/// erlang:list_to_atom/1 and list_to_existing_atom/1. The first interns a
+/// new atom. The second requires an existing atom.
 #[no_mangle]
 pub extern "C" fn mana_rt_list_to_atom(ctx: *mut ProcCtx, l: u64, existing: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -224,8 +228,8 @@ pub extern "C" fn mana_rt_list_to_atom(ctx: *mut ProcCtx, l: u64, existing: u64)
     }
 }
 
-/// erlang:binary_to_atom/1,2 — interns (existing == 0) or requires an
-/// existing atom (binary_to_existing_atom).
+/// erlang:binary_to_atom/1,2 and binary_to_existing_atom. If `existing` is 0,
+/// the call interns a new atom. If not, the atom must exist.
 #[no_mangle]
 pub extern "C" fn mana_rt_binary_to_atom(ctx: *mut ProcCtx, bin: u64, existing: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };

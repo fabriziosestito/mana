@@ -1,32 +1,35 @@
-use super::*;
+//! The I/O reactor (mio). It serves sockets only. Files use direct
+//! syscalls (TODO(io-pool)).
+//!
+//! The reactor obeys the same discipline as the timer thread. It is OUTSIDE
+//! the STW protocol and never changes process or scheduler state. It pushes
+//! (pid, sock, kind) wake tokens to IO_WAKES and pokes the scheduler
+//! condvars. Schedulers drain the tokens at the top of their loop, which is
+//! a safepoint.
+//!
+//! Blocking syscalls MUST NOT run on scheduler threads. The STW requester
+//! waits for every scheduler to reach a safepoint. A blocked syscall
+//! deadlocks the GC. Sockets are nonblocking. Scheduler threads only issue
+//! nonblocking syscalls, and they park the process on WouldBlock.
+//!
+//! Wake protocol (no lost wakeups). A parker first writes itself into the
+//! waiter slot of the socket entry. Then it makes sure that the socket is
+//! registered. Then it retries the syscall. Only then it parks (Waiting +
+//! suspend). The reactor takes the waiter and pushes a wake. The wake can
+//! arrive while the parker is still Running, in the small window before the
+//! suspend. In that case drain_io_wakes pushes the token again, as long as
+//! the waiter slot still names that pid. The protocol converges when the
+//! parker suspends (the flip succeeds) or completes and clears the slot
+//! (the token is dropped as stale).
 
-// ---------------------------------------------------------------------------
-// io reactor (mio) — sockets only; files are direct syscalls (TODO(io-pool)).
-//
-// Same discipline as the timer thread: the reactor is OUTSIDE the STW
-// protocol and never mutates process/scheduler state. It pushes (pid, sock,
-// kind) wake tokens to IO_WAKES and pokes the scheduler condvars; schedulers
-// drain at their loop top — a safepoint. Blocking syscalls MUST NOT run on
-// scheduler threads (the STW requester waits for every scheduler to reach a
-// safepoint — a blocked syscall deadlocks GC). Sockets are nonblocking:
-// scheduler threads only ever issue nonblocking syscalls and park the
-// process on WouldBlock.
-//
-// Wake protocol (no lost wakeups): a parker first writes itself into the
-// socket entry's waiter slot, ensures the socket is registered, retries the
-// syscall, and only then parks (Waiting + suspend). The reactor takes the
-// waiter and pushes a wake. If the wake arrives while the parker is still
-// Running (the tiny pre-suspend window), drain_io_wakes re-pushes the token
-// as long as the waiter slot still names that pid — it converges as soon as
-// the parker either suspends (flip succeeds) or completes and clears the
-// slot (token dropped as stale).
+use super::*;
 
 pub(crate) enum SockSource {
     Listener(mio::net::TcpListener),
     Stream(mio::net::TcpStream),
 }
 
-/// {active, false | once | true}
+/// The socket option {active, false | once | true}.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum ActiveMode {
     Passive,
@@ -36,21 +39,22 @@ pub(crate) enum ActiveMode {
 
 pub(crate) struct SockEntry {
     pub(crate) source: SockSource,
-    /// pid parked waiting for readability (recv/accept), if any
+    /// The pid that is parked for readability (recv/accept), if any.
     pub(crate) read_waiter: Option<usize>,
-    /// pid parked waiting for writability (send/connect), if any
+    /// The pid that is parked for writability (send/connect), if any.
     pub(crate) write_waiter: Option<usize>,
-    /// registered with the reactor's poll (edge-triggered readiness is
-    /// re-armed by the kernel on new activity, and parkers only park after
-    /// WouldBlock, so edges are never missed)
+    /// True if the source is registered with the poll of the reactor.
+    /// Readiness is edge-triggered. The kernel re-arms the edge on new
+    /// activity, and parkers only park after WouldBlock. As a result, no
+    /// edge is missed.
     pub(crate) registered: bool,
     pub(crate) owner: usize,
     pub(crate) active: ActiveMode,
-    /// binary (true) vs charlist (false) delivery
+    /// Delivery mode: binary (true) or charlist (false).
     pub(crate) binary: bool,
-    /// passive-recv buffer (exact-length recv accumulates here)
+    /// Buffer for passive recv. An exact-length recv accumulates bytes here.
     pub(crate) rbuf: Vec<u8>,
-    /// byte counters for inet:getstat
+    /// Byte counters for inet:getstat.
     pub(crate) recv_oct: u64,
     pub(crate) send_oct: u64,
 }
@@ -81,11 +85,11 @@ pub(crate) static SOCKETS: std::sync::Mutex<SocketTable> = std::sync::Mutex::new
 });
 
 thread_local! {
-    /// Per-scheduler-thread read scratch for socket recv/pump. Allocating
-    /// and zeroing a fresh 64 KiB chunk per read cost ~11% of a Phoenix
-    /// request's instructions (callgrind). Safe to share across the
-    /// coroutines of one thread: every use reads then copies out under the
-    /// SOCKETS lock with no yield in between.
+    /// Read scratch buffer for socket recv/pump, one per scheduler thread.
+    /// A fresh 64 KiB chunk per read, allocated and zeroed, cost ~11% of the
+    /// instructions of a Phoenix request (callgrind). The coroutines of one
+    /// thread can share it. Every use reads and then copies out under the
+    /// SOCKETS lock, with no yield between the two steps.
     static RECV_SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; 65536]);
 }
 
@@ -93,10 +97,10 @@ pub(crate) fn with_recv_scratch<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
     RECV_SCRATCH.with(|c| f(&mut c.borrow_mut()[..]))
 }
 
-/// (pid, socket idx, wanted-read) wake tokens from the reactor thread.
+/// Wake tokens (pid, socket idx, wanted-read) from the reactor thread.
 pub(crate) static IO_WAKES: SegQueue<(usize, usize, bool)> = SegQueue::new();
 
-/// socket indices whose sources the reactor should register with its poll.
+/// Socket indices whose sources the reactor must register with its poll.
 pub(crate) static REACTOR_CMDS: SegQueue<usize> = SegQueue::new();
 
 pub(crate) static REACTOR_WAKER: std::sync::OnceLock<mio::Waker> = std::sync::OnceLock::new();
@@ -114,7 +118,7 @@ pub(crate) fn ensure_reactor(g: &'static Global) {
         .name("mana-reactor".into())
         .spawn(move || reactor_thread(g))
         .expect("reactor thread");
-    // wait for the waker to exist so callers can always poke the reactor
+    // Wait until the waker exists. Then callers can always poke the reactor.
     while REACTOR_WAKER.get().is_none() {
         std::thread::yield_now();
     }
@@ -132,11 +136,11 @@ pub(crate) fn reactor_thread(g: &'static Global) {
     REACTOR_WAKER.set(waker).ok();
     let mut events = mio::Events::with_capacity(256);
     loop {
-        // (re)register sources requested since the last pass
+        // Register the sources that were requested since the last pass.
         while let Some(idx) = REACTOR_CMDS.pop() {
             let mut tab = SOCKETS.lock().unwrap();
             let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-                continue; // closed before we got to it
+                continue; // The socket closed before this pass.
             };
             let interests = mio::Interest::READABLE | mio::Interest::WRITABLE;
             let res = match &mut entry.source {
@@ -147,7 +151,7 @@ pub(crate) fn reactor_thread(g: &'static Global) {
                     poll.registry().register(s, mio::Token(idx), interests)
                 }
             };
-            let _ = res; // AlreadyExists on a duplicate request is fine
+            let _ = res; // AlreadyExists on a duplicate request is not an error.
         }
         if poll.poll(&mut events, None).is_err() {
             continue; // EINTR
@@ -155,7 +159,7 @@ pub(crate) fn reactor_thread(g: &'static Global) {
         let mut woke = false;
         for ev in events.iter() {
             if ev.token() == REACTOR_WAKE_TOKEN {
-                continue; // command pass runs at loop top
+                continue; // The command pass runs at the top of the loop.
             }
             let idx = ev.token().0;
             let mut tab = SOCKETS.lock().unwrap();
@@ -163,17 +167,17 @@ pub(crate) fn reactor_thread(g: &'static Global) {
                 continue;
             };
             let closed = ev.is_read_closed() || ev.is_write_closed() || ev.is_error();
-            // The waiter slot is NOT cleared here: it is the liveness signal
-            // drain_io_wakes uses to keep a token alive until the parker has
-            // actually suspended (the op clears its own slot when it
-            // completes). Clearing it here dropped tokens that raced the
-            // park — a lost socket wake.
+            // The waiter slot is NOT cleared here. It is the liveness signal
+            // that drain_io_wakes uses to keep a token alive until the parker
+            // suspended. The op clears its own slot when it completes. If the
+            // slot is cleared here, a token that races the park is dropped,
+            // which is a lost socket wake.
             if ev.is_readable() || closed {
                 if let Some(pid) = entry.read_waiter {
                     IO_WAKES.push((pid, idx, true));
                     woke = true;
                 } else if entry.active != ActiveMode::Passive {
-                    // no parked reader: schedule an active-mode pump
+                    // No reader is parked. Schedule an active-mode pump.
                     IO_ACTIVE.push(idx);
                     woke = true;
                 }
@@ -193,9 +197,9 @@ pub(crate) fn reactor_thread(g: &'static Global) {
     }
 }
 
-/// Scheduler-side drain (loop-top safepoint, like timer deliveries).
-/// Wake-only: no mailbox message — the woken BIF retries its nonblocking
-/// syscall.
+/// Drain the wake tokens on the scheduler side. This runs at the loop-top
+/// safepoint, like the timer deliveries. A wake sends no mailbox message.
+/// The woken BIF retries its nonblocking syscall.
 pub(crate) fn drain_io_wakes(ctx: &mut ProcCtx) {
     let global = ctx.global;
     let n = IO_WAKES.len();
@@ -218,8 +222,9 @@ pub(crate) fn drain_io_wakes(ctx: &mut ProcCtx) {
             continue;
         }
         drop(st);
-        // parker not suspended yet: keep the token alive while the waiter
-        // slot still names it; drop once the op completed (stale wake)
+        // The parker did not suspend yet. Keep the token alive while the
+        // waiter slot still names the pid. If the op completed, drop the
+        // token as a stale wake.
         let tab = SOCKETS.lock().unwrap();
         let still_waiting = tab.slots.get(idx).and_then(|s| s.as_ref()).is_some_and(|e| {
             if is_read {

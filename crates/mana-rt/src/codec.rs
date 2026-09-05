@@ -1,8 +1,12 @@
-use super::*;
+//! Native `crypto` and `zlib` operations for the runtime.
+//!
+//! The `crypto` part holds the subset that Plug.Crypto and Phoenix sessions
+//! need. The NIF stubs in crypto.erl are never compiled. The `zlib` part
+//! holds the one-shot gzip, compress, and uncompress calls, plus streams
+//! behind opaque `{mana_zlib, N}` handles. Every entry point raises `badarg`
+//! on a bad argument, like OTP.
 
-// ---------------------------------------------------------------------------
-// crypto (native cut: crypto.erl's NIF stubs are never compiled) — the
-// subset Plug.Crypto/Phoenix sessions need.
+use super::*;
 
 pub const C_RAND: u64 = 0;
 
@@ -52,7 +56,7 @@ pub(crate) fn crypto_hmac(alg: &[u8], key: &[u8], data: &[u8]) -> Option<Vec<u8>
     }
 }
 
-/// RFC 2898 PBKDF2 over our HMAC.
+/// PBKDF2 (RFC 2898) over `crypto_hmac`.
 pub(crate) fn crypto_pbkdf2(
     alg: &[u8],
     pass: &[u8],
@@ -93,8 +97,8 @@ pub extern "C" fn mana_rt_crypto(
     let ctx = unsafe { &mut *ctx };
     match op {
         C_HASH_EQUALS => {
-            // constant-time equality on equal-size binaries; badarg on
-            // size mismatch or non-binaries, like OTP
+            // Constant-time equality on binaries of equal size. A size
+            // mismatch or a non-binary raises badarg, like OTP.
             let (Some((ap, an)), Some((bp, bn))) = (bin_parts(a), bin_parts(b)) else {
                 return raise_badarg(ctx);
             };
@@ -139,7 +143,7 @@ pub extern "C" fn mana_rt_crypto(
             }
         }
         C_MAC => {
-            // mac(hmac, Alg, Key, Data)
+            // Argument order: mac(hmac, Alg, Key, Data).
             if a & TAG_MASK != TAG_ATOM
                 || atom_bytes(a) != b"hmac"
                 || b & TAG_MASK != TAG_ATOM
@@ -165,7 +169,7 @@ pub extern "C" fn mana_rt_crypto(
             bytes_to_new_bin(ctx, &out)
         }
         C_PBKDF2 => {
-            // pbkdf2_hmac(Alg, Pass, Salt, Iterations, KeyLen)
+            // Argument order: pbkdf2_hmac(Alg, Pass, Salt, Iterations, KeyLen).
             if a & TAG_MASK != TAG_ATOM
                 || d & TAG_MASK != TAG_SMALL
                 || e & TAG_MASK != TAG_SMALL
@@ -186,7 +190,7 @@ pub extern "C" fn mana_rt_crypto(
     }
 }
 
-/// IEEE CRC-32 (gzip's checksum), table-driven.
+/// IEEE CRC-32, the checksum of gzip. The function uses a lookup table.
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| {
@@ -207,8 +211,8 @@ pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     !c
 }
 
-/// zlib:gzip/1 — a real gzip container (RFC 1952) over DEFLATE-compressed
-/// data (miniz_oxide). gunzip/1 inverts it and verifies the CRC32 + ISIZE
+/// zlib:gzip/1. The output is a gzip container (RFC 1952) over DEFLATE data
+/// from miniz_oxide. gunzip/1 inverts it and checks the CRC32 and ISIZE
 /// trailer.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_gzip(ctx: *mut ProcCtx, data: u64) -> u64 {
@@ -219,7 +223,7 @@ pub extern "C" fn mana_rt_zlib_gzip(ctx: *mut ProcCtx, data: u64) -> u64 {
     }
     let body = miniz_oxide::deflate::compress_to_vec(&input, 6);
     let mut out = Vec::with_capacity(body.len() + 18);
-    // header: magic, CM=8 (deflate), no flags, no mtime, XFL=0, OS=unknown
+    // Header: magic, CM=8 (deflate), no flags, no mtime, XFL=0, OS=unknown.
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff]);
     out.extend_from_slice(&body);
     out.extend_from_slice(&crc32(&input).to_le_bytes());
@@ -227,7 +231,8 @@ pub extern "C" fn mana_rt_zlib_gzip(ctx: *mut ProcCtx, data: u64) -> u64 {
     bytes_to_new_bin(ctx, &out)
 }
 
-/// zlib:gunzip/1 — parse a gzip container, inflate, verify CRC32 + ISIZE.
+/// zlib:gunzip/1. The function parses the gzip container, inflates the body,
+/// and checks the CRC32 and ISIZE trailer.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_gunzip(ctx: *mut ProcCtx, data: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -248,7 +253,7 @@ pub(crate) fn gunzip_bytes(input: &[u8]) -> Option<Vec<u8>> {
     let flg = input[3];
     let mut off = 10usize;
     if flg & 0x04 != 0 {
-        // FEXTRA: 2-byte length then that many bytes
+        // FEXTRA: a 2-byte length, then that many bytes.
         if off + 2 > input.len() {
             return None;
         }
@@ -256,15 +261,15 @@ pub(crate) fn gunzip_bytes(input: &[u8]) -> Option<Vec<u8>> {
         off += 2 + xlen;
     }
     if flg & 0x08 != 0 {
-        // FNAME: null-terminated
+        // FNAME: a null-terminated string.
         off = skip_cstr(input, off)?;
     }
     if flg & 0x10 != 0 {
-        // FCOMMENT: null-terminated
+        // FCOMMENT: a null-terminated string.
         off = skip_cstr(input, off)?;
     }
     if flg & 0x02 != 0 {
-        off += 2; // FHCRC
+        off += 2; // FHCRC: a 2-byte header checksum, not checked.
     }
     if off + 8 > input.len() {
         return None;
@@ -291,7 +296,8 @@ pub(crate) fn skip_cstr(input: &[u8], mut off: usize) -> Option<usize> {
     None
 }
 
-/// zlib:compress/1 (zlib wrapper) and zlib:zip/1 (raw deflate).
+/// zlib:compress/1 (zlib wrapper) and zlib:zip/1 (raw deflate). A non-zero
+/// `raw` selects the raw format.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_compress(ctx: *mut ProcCtx, data: u64, raw: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -307,7 +313,8 @@ pub extern "C" fn mana_rt_zlib_compress(ctx: *mut ProcCtx, data: u64, raw: u64) 
     bytes_to_new_bin(ctx, &out)
 }
 
-/// zlib:uncompress/1 (zlib wrapper) and zlib:unzip/1 (raw inflate).
+/// zlib:uncompress/1 (zlib wrapper) and zlib:unzip/1 (raw inflate). A
+/// non-zero `raw` selects the raw format.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_uncompress(ctx: *mut ProcCtx, data: u64, raw: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -326,13 +333,14 @@ pub extern "C" fn mana_rt_zlib_uncompress(ctx: *mut ProcCtx, data: u64, raw: u64
     }
 }
 
-// ---------------------------------------------------------------------------
-// zlib streams (miniz_oxide): opaque {mana_zlib, N} handles over a global
-// slot table, mirroring the {mana_socket, N} pattern. A stream is created
-// Idle by open/0 and switched to inflate or deflate mode by init. Bandit's
-// permessage-deflate uses raw (negative-windowBits) streams with sync
-// flush; browsers use the one-shot gzip/gunzip above.
+// zlib streams
 
+/// A zlib stream behind an opaque `{mana_zlib, N}` handle. The handles index
+/// a global slot table, with the same pattern as `{mana_socket, N}`.
+/// open/0 creates a stream in the Idle state. inflateInit and deflateInit
+/// switch it to the Inflate or Deflate mode. The permessage-deflate
+/// extension of Bandit uses raw streams (negative windowBits) with sync
+/// flush. Browsers use the one-shot gzip and gunzip calls.
 pub(crate) enum ZStream {
     Idle,
     Inflate {
@@ -381,7 +389,7 @@ pub(crate) fn zlib_resolve(t: u64) -> Option<(usize, std::sync::Arc<std::sync::M
     streams.get(idx).and_then(|s| s.clone()).map(|a| (idx, a))
 }
 
-/// zlib:open/0 — a fresh Idle stream handle.
+/// zlib:open/0. The function returns a handle to a new Idle stream.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_open(ctx: *mut ProcCtx) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -402,7 +410,7 @@ pub extern "C" fn mana_rt_zlib_open(ctx: *mut ProcCtx) -> u64 {
     zlib_handle(ctx, idx)
 }
 
-/// zlib:close/1 — free the slot.
+/// zlib:close/1. The function frees the slot of the stream.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_close(ctx: *mut ProcCtx, z: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -422,14 +430,14 @@ pub(crate) fn zlib_window_bits(t: u64) -> i32 {
     if t & TAG_MASK == TAG_SMALL {
         (t as i64 >> 3) as i32
     } else {
-        15 // default
+        15 // The zlib default.
     }
 }
 
-/// zlib:inflateInit/1,2 — switch the stream to inflate mode. Negative
-/// windowBits selects the raw (headerless) format used by permessage-
-/// deflate; the window magnitude is ignored (miniz always uses 32K, a
-/// superset that decodes any smaller-window stream).
+/// zlib:inflateInit/1,2. The function switches the stream to inflate mode.
+/// Negative windowBits selects the raw (headerless) format that
+/// permessage-deflate uses. The magnitude of windowBits is ignored. miniz
+/// always uses a 32K window, which decodes any stream with a smaller window.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_inflate_init(ctx: *mut ProcCtx, z: u64, window_bits: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -446,9 +454,10 @@ pub extern "C" fn mana_rt_zlib_inflate_init(ctx: *mut ProcCtx, z: u64, window_bi
     known().ok
 }
 
-/// zlib:deflateInit/2,6 — switch the stream to deflate mode. level and
-/// strategy are honored, windowBits sign selects raw vs zlib (magnitude
-/// ignored — output window is always 15), method and memLevel are ignored.
+/// zlib:deflateInit/2,6. The function switches the stream to deflate mode.
+/// The level and the strategy are honored. The sign of windowBits selects
+/// raw or zlib format. The magnitude is ignored, and the output window is
+/// always 15. The method and memLevel arguments are ignored.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_deflate_init(
     ctx: *mut ProcCtx,
@@ -466,7 +475,7 @@ pub extern "C" fn mana_rt_zlib_deflate_init(
         if (0..=9).contains(&v) {
             v as i32
         } else {
-            6 // default / -1
+            6 // The default, also for -1.
         }
     } else {
         6
@@ -506,8 +515,9 @@ pub(crate) fn zlib_flush(t: u64) -> miniz_oxide::MZFlush {
     }
 }
 
-/// zlib:deflate/2,3 — compress a chunk with the given flush; returns the
-/// output as a single binary (valid iodata — Bandit does iodata_to_binary).
+/// zlib:deflate/2,3. The function compresses one chunk with the given flush.
+/// It returns the output as one binary. A binary is valid iodata, and Bandit
+/// calls iodata_to_binary on it.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_deflate(ctx: *mut ProcCtx, z: u64, data: u64, flush: u64) -> u64 {
     use miniz_oxide::{MZFlush, MZStatus};
@@ -541,7 +551,8 @@ pub extern "C" fn mana_rt_zlib_deflate(ctx: *mut ProcCtx, z: u64, data: u64, flu
             }
             Err(_) => return raise_badarg(ctx),
         }
-        // Finish must loop to StreamEnd; others stop when drained above
+        // A Finish flush must loop until StreamEnd. The other flushes stop
+        // when the input is drained, in the match above.
         if fl != MZFlush::Finish && inbuf.is_empty() && res.bytes_written == 0 {
             break;
         }
@@ -550,10 +561,11 @@ pub extern "C" fn mana_rt_zlib_deflate(ctx: *mut ProcCtx, z: u64, data: u64, flu
     bytes_to_new_bin(ctx, &out)
 }
 
-/// zlib:safeInflate/2 — one bounded inflate round over the accumulated
-/// input; returns `{continue, Bin}` when more output may follow (the
-/// output chunk filled) or `{finished, Bin}` when the input is drained.
-/// Bandit re-calls with `[]` until it sees `finished`.
+/// zlib:safeInflate/2. The function runs one bounded inflate round over the
+/// accumulated input. It returns `{continue, Bin}` when the output chunk
+/// filled, because more output can follow. It returns `{finished, Bin}` when
+/// the input is drained. Bandit calls again with `[]` until it sees
+/// `finished`.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_safe_inflate(ctx: *mut ProcCtx, z: u64, data: u64) -> u64 {
     use miniz_oxide::{MZFlush, MZStatus};
@@ -579,7 +591,7 @@ pub extern "C" fn mana_rt_zlib_safe_inflate(ctx: *mut ProcCtx, z: u64, data: u64
     let done = matches!(res.status, Ok(MZStatus::StreamEnd)) || written < CHUNK;
     let out = scratch[..written].to_vec();
     drop(s);
-    // build {tag, Bin} — root the binary across the tuple alloc
+    // Build {tag, Bin}. The binary must stay rooted across the tuple alloc.
     let bin = bytes_to_new_bin(ctx, &out);
     let mut fr = [ctx.roots_head, 1, bin];
     ctx.roots_head = fr.as_ptr() as u64;
@@ -595,8 +607,8 @@ pub extern "C" fn mana_rt_zlib_safe_inflate(ctx: *mut ProcCtx, z: u64, data: u64
     p as u64
 }
 
-/// zlib:inflateReset/1 and deflateReset/1 — restore the stream to its
-/// post-init state, keeping the same mode and parameters.
+/// zlib:inflateReset/1 and deflateReset/1. The function restores the stream
+/// to its state after init. The mode and the parameters stay the same.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_reset(ctx: *mut ProcCtx, z: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -621,7 +633,8 @@ pub extern "C" fn mana_rt_zlib_reset(ctx: *mut ProcCtx, z: u64) -> u64 {
     known().ok
 }
 
-/// zlib:inflateEnd/1 and deflateEnd/1 — return the stream to Idle.
+/// zlib:inflateEnd/1 and deflateEnd/1. The function returns the stream to
+/// the Idle state.
 #[no_mangle]
 pub extern "C" fn mana_rt_zlib_end(ctx: *mut ProcCtx, z: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };

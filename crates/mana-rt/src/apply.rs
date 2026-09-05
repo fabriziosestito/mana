@@ -1,6 +1,12 @@
+//! Dynamic calls and code introspection: erlang:apply/2, erlang:apply/3,
+//! erlang:make_fun/3, module_info, and the `code` module BIFs. The world is
+//! closed. Only exported functions of compiled modules are callable. The
+//! binary is static, so "loaded" means compiled in. Every other target
+//! raises undef, like BEAM without the module loaded.
+
 use super::*;
 
-// Behaviours table: (module_atom, behaviour_atom) raw-pointer pairs.
+// The behaviours table holds (module_atom, behaviour_atom) raw-pointer pairs.
 extern "C" {
     static __start_mana_behaviours: u64;
     static __stop_mana_behaviours: u64;
@@ -14,7 +20,7 @@ pub(crate) fn behaviours_of(m: u64) -> Vec<u64> {
         let n = (stop as usize - start as usize) / 16;
         for i in 0..n {
             let e = start.add(2 * i);
-            // a self-referential pair is the section anchor, not data
+            // A self-referential pair is the section anchor, not data.
             if *e | TAG_ATOM == m && *e.add(1) != *e {
                 out.push(*e.add(1) | TAG_ATOM);
             }
@@ -23,21 +29,21 @@ pub(crate) fn behaviours_of(m: u64) -> Vec<u64> {
     out
 }
 
-// Closed-world export table: codegen plants one 4-word entry per exported
-// function in the `mana_exports` ELF section: raw pointers to the module
-// and function atom structs, the arity, and the code pointer. Atoms are
-// program-wide deduped, so lookup is by tagged-word identity.
+// Closed-world export table. Codegen plants one entry per exported function
+// in the `mana_exports` ELF section. Atoms are deduplicated program-wide, so
+// the lookup is by tagged-word identity.
 extern "C" {
     static __start_mana_exports: u64;
     static __stop_mana_exports: u64;
 }
 
 /// Export entry (codegen, `mana_exports` section, 5 words): {mod atom, fun
-/// atom, arity, c_code, fun_code}. `c_code` is the C-ABI wrapper the runtime
-/// calls directly (apply/3, spawn MFA); `fun_code` is the uniform `tailcc`
-/// closure shim (`args ++ [fun]`) that fun objects built by make_fun/3 carry
-/// — compiled code calls fun code with the tailcc convention, so a C
-/// pointer there would mismatch callee-pop and jump into garbage.
+/// atom, arity, c_code, fun_code}. The first two words are raw pointers to
+/// the atom structs. `c_code` is the C-ABI wrapper that the runtime calls
+/// directly (apply/3, spawn MFA). `fun_code` is the uniform `tailcc` closure
+/// shim (`args ++ [fun]`) that fun objects from make_fun/3 carry. Compiled
+/// code calls fun code with the tailcc convention. A C pointer in that slot
+/// mismatches the callee-pop and jumps into garbage.
 pub(crate) struct Export {
     pub(crate) c_code: usize,
     pub(crate) fun_code: usize,
@@ -67,7 +73,8 @@ pub(crate) fn exports() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), Expor
     })
 }
 
-/// (mod, fun, arity) → C-ABI code pointer, for the runtime's own calls.
+/// Map from (mod, fun, arity) to the C-ABI code pointer, for the calls of
+/// the runtime itself.
 pub(crate) fn export_table() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), usize> {
     static TABLE: std::sync::OnceLock<rustc_hash::FxHashMap<(u64, u64, u64), usize>> =
         std::sync::OnceLock::new();
@@ -75,20 +82,21 @@ pub(crate) fn export_table() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), 
 }
 
 extern "C" {
-    /// Emitted by codegen in the entry module: a C-ABI trampoline that
-    /// forwards the uniform argument words into a `tailcc` fun body.
+    /// Codegen emits this C-ABI trampoline in the entry module. It forwards
+    /// the uniform argument words into a `tailcc` fun body.
     fn mana_call_fun(ctx: *mut ProcCtx, x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, code: usize) -> u64;
 }
 
-/// Call a fun object's code (uniform tailcc ABI) with `argv ++ [fun]`.
+/// Calls the code of a fun object (uniform tailcc ABI) with `argv ++ [fun]`.
 pub(crate) unsafe fn call_fun_code(ctx: *mut ProcCtx, code: usize, argv: &[u64], fun_term: u64) -> u64 {
-    let n = argv.len() + 1; // + trailing closure
+    let n = argv.len() + 1; // The extra word is the trailing closure.
     let mut x = [0u64; ABI_REGS];
     if n <= ABI_REGS {
         x[..argv.len()].copy_from_slice(argv);
         x[argv.len()] = fun_term;
     } else {
-        // args 0..ABI_REGS-2 in registers, the rest (incl. the closure) spilled
+        // Arguments 0..ABI_REGS-2 go in registers. The rest, with the
+        // closure, go to the spill area.
         x[..ABI_REGS - 1].copy_from_slice(&argv[..ABI_REGS - 1]);
         let spill = unsafe { (*ctx).argv_spill };
         let rest: Vec<u64> = argv[ABI_REGS - 1..].iter().copied().chain(std::iter::once(fun_term)).collect();
@@ -100,9 +108,10 @@ pub(crate) unsafe fn call_fun_code(ctx: *mut ProcCtx, code: usize, argv: &[u64],
     unsafe { mana_call_fun(ctx, x[0], x[1], x[2], x[3], x[4], code) }
 }
 
-/// Call compiled code with unpacked args: `fun_term != 0` → `code` is a fun
-/// body (uniform tailcc ABI, via the trampoline, fun term trailing);
-/// otherwise `code` is an export's C-ABI wrapper (arities 0..8).
+/// Calls compiled code with unpacked arguments. If `fun_term != 0`, `code`
+/// is a fun body (uniform tailcc ABI, through the trampoline, fun term
+/// trailing). Otherwise `code` is the C-ABI wrapper of an export (arities
+/// 0..8).
 pub(crate) unsafe fn call_dynamic(
     ctx: *mut ProcCtx,
     code: usize,
@@ -138,7 +147,8 @@ pub(crate) unsafe fn call_dynamic(
     Some(r)
 }
 
-/// Unpack a proper list of at most 8 elements. Err(()) = improper/too long.
+/// Unpacks a proper list of at most 8 elements. Err(()) means the list is
+/// improper or too long.
 pub(crate) fn unpack_args(list: u64) -> Result<([u64; 8], usize), ()> {
     let mut v = [0u64; 8];
     let mut n = 0;
@@ -163,9 +173,9 @@ pub(crate) fn raise_undef(ctx: &mut ProcCtx) -> u64 {
     EXC_SENTINEL
 }
 
-/// erlang:apply/3 — closed world: only exported functions of compiled
-/// modules are callable; anything else is undef (like BEAM without the
-/// module loaded). Arities above 8 are TODO(apply-arity).
+/// erlang:apply/3, closed world. Only exported functions of compiled modules
+/// are callable. Every other target is undef, like BEAM without the module
+/// loaded. Arities above 8 are TODO(apply-arity).
 #[no_mangle]
 pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -184,8 +194,8 @@ pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -
         return raise_badarg(ctx);
     };
     let Some(&code) = export_table().get(&(m, f, n as u64)) else {
-        // dynamic calls into the BIF surface (compiled statically
-        // everywhere else): the hot handful, extended on demand
+        // Dynamic calls into the BIF surface. Everywhere else these calls
+        // compile statically. This is the hot set, extended on demand.
         if atom_bytes(m) == b"erlang" {
             match (atom_bytes(f), n) {
                 (b"error", 1) | (b"exit", 1) | (b"throw", 1) => {
@@ -208,8 +218,9 @@ pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -
                 _ => {}
             }
         }
-        // module_info is never compiled; answer the introspection shapes
-        // callers actually use (attributes → behaviours, module → the atom)
+        // module_info is never compiled. This answers the introspection
+        // shapes that callers use: attributes gives the behaviours, module
+        // gives the atom.
         if atom_bytes(f) == b"module_info" && module_is_compiled(m) {
             if n == 0 {
                 return NIL;
@@ -231,13 +242,13 @@ pub extern "C" fn mana_rt_apply3(ctx: *mut ProcCtx, m: u64, f: u64, args: u64) -
     unsafe { call_dynamic(ctx, code, &argv[..n], 0).unwrap_or_else(|| raise_undef(ctx)) }
 }
 
-/// Introspection items shared by the module_info fallback in apply3 and
-/// erlang:get_module_info/2 (which compiled `__info__/1` clauses call).
+/// Introspection items shared by the module_info fallback in apply3 and by
+/// erlang:get_module_info/2. Compiled `__info__/1` clauses call the latter.
 pub(crate) fn module_info_item(ctx: &mut ProcCtx, m: u64, item: u64) -> u64 {
     match atom_bytes(item) {
         b"module" => m,
         b"attributes" => {
-            // [{behaviour, [B]}] per declared behaviour
+            // The result is one [{behaviour, [B]}] per declared behaviour.
             let bs = behaviours_of(m);
             let saved = ctx.roots_head;
             let mut fr = [0u64, 2, NIL, 0];
@@ -267,8 +278,9 @@ pub(crate) fn module_info_item(ctx: &mut ProcCtx, m: u64, item: u64) -> u64 {
             fr[2]
         }
         b"functions" | b"exports" => {
-            // {name, arity} pairs from the export table, name/arity sorted
-            // for determinism (BEAM's order is unspecified)
+            // The result holds the {name, arity} pairs from the export table.
+            // The sort by name and arity makes the order deterministic. BEAM
+            // does not specify the order.
             let mut fs: Vec<(u64, u64)> = export_table()
                 .keys()
                 .filter(|(km, _, _)| *km == m)
@@ -301,8 +313,9 @@ pub(crate) fn module_info_item(ctx: &mut ProcCtx, m: u64, item: u64) -> u64 {
     }
 }
 
-/// erlang:get_module_info/2 — reached by compiled `__info__/1` clauses
-/// (attributes/compile arms); the useful arms answer, the rest are [].
+/// erlang:get_module_info/2. Compiled `__info__/1` clauses reach this from
+/// their attributes and compile arms. The useful arms answer. The rest
+/// return [].
 #[no_mangle]
 pub extern "C" fn mana_rt_get_module_info(ctx: *mut ProcCtx, m: u64, item: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -312,7 +325,7 @@ pub extern "C" fn mana_rt_get_module_info(ctx: *mut ProcCtx, m: u64, item: u64) 
     module_info_item(ctx, m, item)
 }
 
-/// erlang:apply/2 — call a fun value with a runtime argument list.
+/// erlang:apply/2 calls a fun value with a runtime argument list.
 #[no_mangle]
 pub extern "C" fn mana_rt_apply_fun(ctx: *mut ProcCtx, fun: u64, args: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -324,36 +337,36 @@ pub extern "C" fn mana_rt_apply_fun(ctx: *mut ProcCtx, fun: u64, args: u64) -> u
     }
     let header = unsafe { *(fun as *const u64) };
     if header & 0xff != KIND_FUN || (header >> 8) & 0xff != n as u64 {
-        // wrong kind or arity — bare badarg (badarity tuples carry
-        // stacktrace-shaped payloads we don't build; TODO(stacktraces))
+        // A wrong kind or arity raises a bare badarg. A badarity tuple
+        // carries a stacktrace-shaped payload that the runtime does not
+        // build. TODO(stacktraces) tracks this.
         return raise_badarg(ctx);
     }
     let code = unsafe { *(fun as *const u64).add(1) } as usize;
     unsafe { call_dynamic(ctx, code, &argv[..n], fun).unwrap_or_else(|| raise_badarg(ctx)) }
 }
 
-// ---------------------------------------------------------------------------
-// code (native cut: static binary — "loaded" means compiled in)
+// Code introspection. The binary is static, so "loaded" means compiled in.
 
 pub(crate) fn module_is_compiled(m: u64) -> bool {
     if m & TAG_MASK == TAG_ATOM && is_cut_module(atom_bytes(m)) {
         return true;
     }
-    // set of module atoms with at least one export, built once: this is on
-    // the code:ensure_loaded / function_exported? path that Plug and Phoenix
-    // hit per request, and scanning the whole export table each call cost
-    // ~4% of a request.
+    // The set of module atoms with at least one export, built once. This
+    // path serves code:ensure_loaded and function_exported?, which Plug and
+    // Phoenix call per request. A scan of the whole export table on each
+    // call cost ~4% of a request.
     static MODULES: std::sync::OnceLock<rustc_hash::FxHashSet<u64>> = std::sync::OnceLock::new();
     MODULES
         .get_or_init(|| export_table().keys().map(|&(em, _, _)| em).collect())
         .contains(&m)
 }
 
-/// Modules the compiler implements natively (BIF cuts) or compiles as
-/// runtime raises — they have no export-table entries but "exist" for
-/// code:ensure_loaded / is_loaded (Phoenix.PubSub probes :persistent_term
-/// this way). MUST stay in sync with codegen's is_bif_module + the
-/// unimplemented-raise list.
+/// Modules that the compiler implements natively (BIF cuts) or compiles as
+/// runtime raises. They have no export-table entries, but they "exist" for
+/// code:ensure_loaded and is_loaded. Phoenix.PubSub probes :persistent_term
+/// this way. This list MUST stay in sync with is_bif_module in codegen and
+/// with the unimplemented-raise list.
 pub(crate) fn is_cut_module(name: &[u8]) -> bool {
     matches!(
         name,
@@ -386,7 +399,7 @@ pub(crate) fn is_cut_module(name: &[u8]) -> bool {
     )
 }
 
-/// erlang:module_loaded/1 — closed world: compiled or cut = loaded.
+/// erlang:module_loaded/1, closed world. A compiled or cut module is loaded.
 #[no_mangle]
 pub extern "C" fn mana_rt_module_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -400,8 +413,8 @@ pub extern "C" fn mana_rt_module_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
     }
 }
 
-/// code:is_loaded/1 → {file, "native"} | false (Ecto.Queryable.Atom probes
-/// schema modules through this).
+/// code:is_loaded/1 returns {file, "native"} or false. Ecto.Queryable.Atom
+/// probes schema modules through this.
 #[no_mangle]
 pub extern "C" fn mana_rt_code_is_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -411,8 +424,8 @@ pub extern "C" fn mana_rt_code_is_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
     if !module_is_compiled(m) {
         return known().false_a;
     }
-    // {file, "native"} — charlist, matching code:is_loaded's shape for
-    // preloaded/static code
+    // {file, "native"} with a charlist. This is the shape that
+    // code:is_loaded returns for preloaded or static code.
     let saved = ctx.roots_head;
     let mut fr = [0u64, 1, NIL];
     fr[0] = saved;
@@ -435,9 +448,9 @@ pub extern "C" fn mana_rt_code_is_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
     t as u64
 }
 
-/// code:lib_dir/1 and code:priv_dir/1 — the --app boot generator bakes
-/// each application's build-time dir under env {:mana_app_dirs, App}
-/// (a binary). Unknown apps get {error, bad_name}, like BEAM.
+/// code:lib_dir/1 and code:priv_dir/1. The --app boot generator stores the
+/// build-time directory of each application under env {:mana_app_dirs, App}
+/// as a binary. An unknown app gets {error, bad_name}, like BEAM.
 #[no_mangle]
 pub extern "C" fn mana_rt_code_app_dir(ctx: *mut ProcCtx, app: u64, is_priv: u64) -> u64 {
     let ctxr = unsafe { &mut *ctx };
@@ -457,7 +470,7 @@ pub extern "C" fn mana_rt_code_app_dir(ctx: *mut ProcCtx, app: u64, is_priv: u64
         }
         return t as u64;
     }
-    // {ok, DirBin} → charlist (++ "/priv" for priv_dir)
+    // {ok, DirBin} becomes a charlist. priv_dir appends "/priv".
     let dir = unsafe { *((hit & !TAG_MASK) as *const u64).add(2) };
     let mut bytes = bin_bytes(dir).to_vec();
     if is_priv != 0 {
@@ -466,8 +479,8 @@ pub extern "C" fn mana_rt_code_app_dir(ctx: *mut ProcCtx, app: u64, is_priv: u64
     bytes_to_charlist(ctxr, &bytes)
 }
 
-/// code:ensure_loaded/1 → {module, M} | {error, nofile}. Eternal tuples —
-/// tiny, bounded by call sites.
+/// code:ensure_loaded/1 returns {module, M} or {error, nofile}. The tuples
+/// are eternal. They are tiny, and the call sites bound their number.
 #[no_mangle]
 pub extern "C" fn mana_rt_code_ensure_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -489,7 +502,7 @@ pub extern "C" fn mana_rt_code_ensure_loaded(ctx: *mut ProcCtx, m: u64) -> u64 {
     p as u64
 }
 
-/// erlang:function_exported/3 (module_loaded/1 shares the table).
+/// erlang:function_exported/3. module_loaded/1 shares the table.
 #[no_mangle]
 pub extern "C" fn mana_rt_function_exported(_ctx: *mut ProcCtx, m: u64, f: u64, a: u64) -> u64 {
     if a & TAG_MASK != TAG_SMALL {
@@ -504,8 +517,8 @@ pub extern "C" fn mana_rt_function_exported(_ctx: *mut ProcCtx, m: u64, f: u64, 
 }
 
 extern "C" {
-    /// Codegen-emitted uniform `tailcc` fun body that raises undef — the
-    /// code pointer for make_fun/3 of a function that is not compiled.
+    /// Codegen emits this uniform `tailcc` fun body. It raises undef. It is
+    /// the code pointer for make_fun/3 of a function that is not compiled.
     static mana_fun_undef: u8;
 }
 
@@ -513,10 +526,10 @@ pub(crate) fn make_fun_undef_code() -> usize {
     unsafe { &raw const mana_fun_undef as usize }
 }
 
-/// erlang:make_fun/3 — a fun value for an exported function. The closure
-/// convention appends the fun term as a trailing argument; raw compiled
-/// functions ignore it (SysV: extra args are harmless), so the closure's
-/// code pointer can be the export itself.
+/// erlang:make_fun/3 builds a fun value for an exported function. The
+/// closure convention appends the fun term as a trailing argument. The code
+/// pointer is the `fun_code` shim of the export (see `Export`). A function
+/// that is not compiled gets the undef body.
 #[no_mangle]
 pub extern "C" fn mana_rt_make_fun(ctx: *mut ProcCtx, m: u64, f: u64, arity: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -537,7 +550,7 @@ pub extern "C" fn mana_rt_make_fun(ctx: *mut ProcCtx, m: u64, f: u64, arity: u64
     });
     let p = alloc_nursery(ctx, 2);
     unsafe {
-        *p = (a << 8) | KIND_FUN; // zero captures
+        *p = (a << 8) | KIND_FUN; // The fun has zero captures.
         *p.add(1) = code as u64;
     }
     p as u64
