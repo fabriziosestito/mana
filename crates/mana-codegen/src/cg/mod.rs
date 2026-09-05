@@ -11,6 +11,7 @@ mod pattern;
 mod binary;
 mod bif;
 mod bif_erlang;
+mod bif_erlang_proc;
 mod bif_native;
 mod maps;
 

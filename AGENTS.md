@@ -49,8 +49,10 @@ Design pillars. Do not break them without a decision from the author.
   - `cg/case.rs` — let, literals, case dispatch. `cg/pattern.rs` — pattern
     and binary matching. `cg/binary.rs` — binary construction.
   - `cg/bif.rs` — `compile_bif` dispatch. `cg/bif_erlang.rs` — the `erlang`
-    BIFs by family. `cg/bif_native.rs` — the other BIF modules.
-    `cg/maps.rs` — maps.
+    BIFs on data (numbers, type tests, binaries, lists, tuples, maps).
+    `cg/bif_erlang_proc.rs` — the `erlang` BIFs on processes, timers, and
+    the system. `cg/bif_native.rs` — the other BIF modules (timer, file,
+    ets, re, math, zlib, crypto, tcp, io, ...). `cg/maps.rs` — maps.
 - `crates/mana-rt/` — the runtime, a `staticlib` that every binary links.
   **Its crate docs and `term.rs` define the term representation and the
   ProcCtx/GC contract.** Read them before you touch either side. Modules:

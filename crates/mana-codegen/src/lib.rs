@@ -15,7 +15,8 @@
 //! summaries (`<cache>/summary/`). The `cg/` directory holds the code
 //! emitters: `abi.rs`, `statics.rs`, `frame.rs`, `exc.rs`, `module.rs`,
 //! `expr.rs`, `closure.rs`, `arith.rs`, `case.rs`, `pattern.rs`,
-//! `binary.rs`, `bif.rs`, `bif_erlang.rs`, `bif_native.rs`, and `maps.rs`.
+//! `binary.rs`, `bif.rs`, `bif_erlang.rs`, `bif_erlang_proc.rs`,
+//! `bif_native.rs`, and `maps.rs`.
 //!
 //! # Process-context ABI
 //!
