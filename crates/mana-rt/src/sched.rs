@@ -291,10 +291,7 @@ pub(crate) fn make_coroutine(global: &'static Global, home: usize) -> ProcCoro {
 /// Drive the schedulers until the root process (pid 0) returns. Its result
 /// becomes the program result. The result can be the exception sentinel.
 #[no_mangle]
-pub extern "C" fn mana_rt_run(
-    ctx: *mut ProcCtx,
-    entry: extern "C" fn(*mut ProcCtx) -> u64,
-) -> u64 {
+pub extern "C" fn mana_rt_run(ctx: *mut ProcCtx, entry: extern "C" fn(*mut ProcCtx) -> u64) -> u64 {
     let global = unsafe { (*ctx).global };
 
     // The root process. Its coroutine calls `entry` directly.
@@ -322,7 +319,7 @@ pub extern "C" fn mana_rt_run(
                 pending_closure: 0,
                 lstate: Mutex::new(LinkState::default()),
                 pdict: Mutex::new(Vec::new()),
-            dirty: std::sync::atomic::AtomicBool::new(true),
+                dirty: std::sync::atomic::AtomicBool::new(true),
             },
         );
         debug_assert_eq!(pid, 0);
@@ -435,10 +432,7 @@ pub(crate) fn scheduler_loop(ctx: &mut ProcCtx, mut root_result: Option<&mut u64
                         let mut reason = String::new();
                         write_term(ctx.exc_class, &mut class);
                         write_term(ctx.exc_reason, &mut reason);
-                        eprintln!(
-                            "mana: process <0.{}.0> exited: {} {}",
-                            pid, class, reason
-                        );
+                        eprintln!("mana: process <0.{}.0> exited: {} {}", pid, class, reason);
                     }
                     ctx.exc_reason // Eternal or immediate. It is safe to share.
                 } else {

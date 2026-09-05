@@ -9,7 +9,9 @@ use crate::*;
 
 impl<'ctx, 'p> Cg<'ctx, 'p> {
     pub(crate) fn declare_compiled(&self, sym: &str, arity: usize) -> FunctionValue<'ctx> {
-        let f = self.module.add_function(sym, self.term_fn_type(arity), None);
+        let f = self
+            .module
+            .add_function(sym, self.term_fn_type(arity), None);
         f.set_call_conventions(Self::TAILCC);
         f
     }
@@ -57,7 +59,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// `extern "C" fn(ctx, a0..a{arity-1})` with the natural C prototype.
     /// call_dynamic transmutes to exactly that prototype. The wrapper
     /// forwards into the uniform tailcc body.
-    pub(crate) fn ccc_wrapper(&self, target: FunctionValue<'ctx>, arity: usize) -> FunctionValue<'ctx> {
+    pub(crate) fn ccc_wrapper(
+        &self,
+        target: FunctionValue<'ctx>,
+        arity: usize,
+    ) -> FunctionValue<'ctx> {
         let sym = format!("{}.c", target.get_name().to_string_lossy());
         if let Some(w) = self.module.get_function(&sym) {
             return w;
@@ -67,8 +73,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let saved = self.builder.get_insert_block();
         let bb = self.ctx.append_basic_block(w, "entry");
         self.builder.position_at_end(bb);
-        let argv: Vec<BasicMetadataValueEnum> =
-            (0..=arity).map(|i| w.get_nth_param(i as u32).unwrap().into()).collect();
+        let argv: Vec<BasicMetadataValueEnum> = (0..=arity)
+            .map(|i| w.get_nth_param(i as u32).unwrap().into())
+            .collect();
         let packed = self.pack_args(&argv).unwrap();
         let call = self.builder.build_call(target, &packed, "fwd").unwrap();
         call.set_call_convention(Self::TAILCC);
@@ -130,10 +137,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         for (i, a) in argv[NREG..].iter().enumerate() {
             let gep = unsafe {
                 self.builder
-                    .build_in_bounds_gep(self.i64t, sp, &[self.i64t.const_int(i as u64, false)], "spill.g")
+                    .build_in_bounds_gep(
+                        self.i64t,
+                        sp,
+                        &[self.i64t.const_int(i as u64, false)],
+                        "spill.g",
+                    )
                     .map_err(be)?
             };
-            self.builder.build_store(gep, a.into_int_value()).map_err(be)?;
+            self.builder
+                .build_store(gep, a.into_int_value())
+                .map_err(be)?;
         }
         out.push(undef);
         Ok(out)
@@ -142,7 +156,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// Prologue counterpart of `pack_args`: the value of the callee's `i`-th
     /// argument (0-based), given its total arg count. Call this function at
     /// function entry, before any call or allocation.
-    pub(crate) fn param_at(&self, f: FunctionValue<'ctx>, i: usize, nargs: usize) -> CgResult<IntValue<'ctx>> {
+    pub(crate) fn param_at(
+        &self,
+        f: FunctionValue<'ctx>,
+        i: usize,
+        nargs: usize,
+    ) -> CgResult<IntValue<'ctx>> {
         if nargs <= NREG || i < NREG - 1 {
             return Ok(f.get_nth_param(1 + i as u32).unwrap().into_int_value());
         }
@@ -244,8 +263,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
 
     pub(crate) fn rt_register_atoms(&self) -> FunctionValue<'ctx> {
         self.rt_fn("mana_rt_register_atoms", || {
-            let params: Vec<BasicMetadataTypeEnum> =
-                (0..20).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)).collect();
+            let params: Vec<BasicMetadataTypeEnum> = (0..20)
+                .map(|_| BasicMetadataTypeEnum::IntType(self.i64t))
+                .collect();
             self.ctx.void_type().fn_type(&params, false)
         })
     }
@@ -481,7 +501,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.builder.build_unconditional_branch(merge).map_err(be)?;
 
         self.builder.position_at_end(merge);
-        let phi = self.builder.build_phi(self.i64t, "alloc.addr").map_err(be)?;
+        let phi = self
+            .builder
+            .build_phi(self.i64t, "alloc.addr")
+            .map_err(be)?;
         phi.add_incoming(&[(&top, fast), (&slow_addr, slow_bb)]);
         self.builder
             .build_int_to_ptr(phi.as_basic_value().into_int_value(), self.ptrt, "alloc")
@@ -505,12 +528,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     ) -> CgResult<()> {
         let slot = unsafe {
             self.builder
-                .build_in_bounds_gep(
-                    self.i64t,
-                    p,
-                    &[self.i64t.const_int(index, false)],
-                    "slot",
-                )
+                .build_in_bounds_gep(self.i64t, p, &[self.i64t.const_int(index, false)], "slot")
                 .map_err(be)?
         };
         let inst = self.builder.build_store(slot, v).map_err(be)?;
@@ -526,15 +544,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     ) -> CgResult<IntValue<'ctx>> {
         let slot = unsafe {
             self.builder
-                .build_in_bounds_gep(
-                    self.i64t,
-                    p,
-                    &[self.i64t.const_int(index, false)],
-                    "slot",
-                )
+                .build_in_bounds_gep(self.i64t, p, &[self.i64t.const_int(index, false)], "slot")
                 .map_err(be)?
         };
-        let v = self.builder.build_load(self.i64t, slot, "word").map_err(be)?;
+        let v = self
+            .builder
+            .build_load(self.i64t, slot, "word")
+            .map_err(be)?;
         if let Some(inst) = v.as_instruction_value() {
             let _ = inst.set_metadata(self.tbaa_tag(kind), self.tbaa_kind);
         }

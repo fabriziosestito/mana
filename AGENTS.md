@@ -115,6 +115,8 @@ change the other in the same commit. Then run the end-to-end checks below.
 ```sh
 make build                  # cargo build — everything, including libmana_rt.a
 make test                   # cargo test — unit tests (parser and more)
+make fmt                    # rustfmt, all crates (run before every commit)
+make fmt-check              # fail if any Rust file is not formatted
 make test-conformance       # THE correctness gate (see below)
 
 # Quick end-to-end smoke checks:
@@ -174,6 +176,8 @@ PATH), Erlang/OTP (`erlc`) and Elixir (`mix`), a C compiler (`cc`).
   sha1/sha2/hmac, getrandom, miniz_oxide, unicode-normalization, dirs.
 - No `unsafe` outside `mana-rt` term decoding and the GEP helpers in codegen
   that already use it.
+- All Rust code is `rustfmt` formatted with the default settings. Run
+  `make fmt` before you commit. `make fmt-check` must pass.
 - **What can be native (the BIF rule).** `mana-rt` implements BIFs only. The
   test is: "on BEAM, is this function C (BIF/NIF) or is it Erlang/Elixir
   code?"

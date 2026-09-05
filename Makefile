@@ -1,12 +1,22 @@
 BIN := $(CURDIR)/target/debug/manac
 
-.PHONY: build test test-conformance example-elixir bench bench-profile build-release
+.PHONY: build test test-conformance example-elixir bench bench-profile build-release fmt fmt-check
 
 build:
 	cargo build
 
 test:
 	cargo test
+
+# rustfmt on every Rust crate: the workspace and the native hex crates
+NATIVE_CRATES := hex/mana_json/native/mana_json
+fmt:
+	cargo fmt --all
+	for c in $(NATIVE_CRATES); do (cd $$c && cargo fmt); done
+
+fmt-check:
+	cargo fmt --all --check
+	for c in $(NATIVE_CRATES); do (cd $$c && cargo fmt --check); done
 
 # BEAM-as-oracle conformance suite — the correctness gate.
 test-conformance: build

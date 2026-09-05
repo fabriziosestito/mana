@@ -73,9 +73,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = self.compile_value(f, arg, scope)?;
                 self.bind_var(scope, &vars[0], v)
             }
-            (2, Expr::PrimOp { name, args })
-                if name == "recv_peek_message" && args.is_empty() =>
-            {
+            (2, Expr::PrimOp { name, args }) if name == "recv_peek_message" && args.is_empty() => {
                 let call = self
                     .builder
                     .build_call(
@@ -128,7 +126,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
                 Ok(())
             }
-            (_, Expr::Let { vars: iv, arg: ia, body }) => {
+            (
+                _,
+                Expr::Let {
+                    vars: iv,
+                    arg: ia,
+                    body,
+                },
+            ) => {
                 self.bind_let(f, iv, ia, scope)?;
                 self.bind_let(f, vars, body, scope)
             }
@@ -203,10 +208,16 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let all_word = keys.iter().all(|k| matches!(k, DiscKey::Word(_)));
         let all_byte = keys.iter().all(|k| matches!(k, DiscKey::Byte0(_)));
         if keys.len() < 4 || !(all_word || all_byte) {
-            self.builder.build_unconditional_branch(blocks[0]).map_err(be)?;
+            self.builder
+                .build_unconditional_branch(blocks[0])
+                .map_err(be)?;
             return Ok(());
         }
-        let default_bb = if keys.len() < clauses.len() { blocks[keys.len()] } else { fail_bb };
+        let default_bb = if keys.len() < clauses.len() {
+            blocks[keys.len()]
+        } else {
+            fail_bb
+        };
         let subject = match vals {
             CaseVals::Ssa(vs) => vs[0],
             CaseVals::Slots(slots) => self.reload(slots[0])?,
@@ -233,8 +244,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let bin_bb = self.ctx.append_basic_block(f, "disp.bin");
             let merge = self.ctx.append_basic_block(f, "disp.merge");
             let ok = self.kind_test(f, subject, |s, header| {
-                let k = s.builder.build_and(header, s.i64t.const_int(0xff, false), "dp.k").map_err(be)?;
-                let k2 = s.builder.build_or(k, s.i64t.const_int(8, false), "dp.k2").map_err(be)?;
+                let k = s
+                    .builder
+                    .build_and(header, s.i64t.const_int(0xff, false), "dp.k")
+                    .map_err(be)?;
+                let k2 = s
+                    .builder
+                    .build_or(k, s.i64t.const_int(8, false), "dp.k2")
+                    .map_err(be)?;
                 let is_bin = s
                     .builder
                     .build_int_compare(IntPredicate::EQ, k2, s.i64t.const_int(13, false), "dp.bin")
@@ -250,16 +267,24 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 s.builder.build_and(is_bin, nonempty, "dp.ok").map_err(be)
             })?;
             let entry_end = self.builder.get_insert_block().unwrap();
-            self.builder.build_conditional_branch(ok, bin_bb, miss_bb).map_err(be)?;
+            self.builder
+                .build_conditional_branch(ok, bin_bb, miss_bb)
+                .map_err(be)?;
             self.builder.position_at_end(bin_bb);
             let base = self.bin_base_addr(f, subject)?;
-            let bp = self.builder.build_int_to_ptr(base, self.ptrt, "dp.p").map_err(be)?;
+            let bp = self
+                .builder
+                .build_int_to_ptr(base, self.ptrt, "dp.p")
+                .map_err(be)?;
             let b = self
                 .builder
                 .build_load(self.ctx.i8_type(), bp, "dp.b0")
                 .map_err(be)?
                 .into_int_value();
-            let b64 = self.builder.build_int_z_extend(b, self.i64t, "dp.b64").map_err(be)?;
+            let b64 = self
+                .builder
+                .build_int_z_extend(b, self.i64t, "dp.b64")
+                .map_err(be)?;
             let bin_end = self.builder.get_insert_block().unwrap();
             self.builder.build_unconditional_branch(merge).map_err(be)?;
             self.builder.position_at_end(miss_bb);
@@ -271,7 +296,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let _ = entry_end;
             phi.as_basic_value().into_int_value()
         };
-        self.builder.build_switch(disc, default_bb, &arms).map_err(be)?;
+        self.builder
+            .build_switch(disc, default_bb, &arms)
+            .map_err(be)?;
         Ok(())
     }
 
@@ -294,10 +321,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let first = segs.first()?;
                 let spec = parse_seg_spec(&first.spec).ok()?;
                 match (&*first.value, spec.kind) {
-                    (Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_))), SegKind::Int { size: SegSize::Bytes(n) })
-                        if n >= 1 =>
-                    {
-                        let bytes = seg_const_bytes(&Expr::Lit(l.clone()), n, spec.little).ok()??;
+                    (
+                        Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_))),
+                        SegKind::Int {
+                            size: SegSize::Bytes(n),
+                        },
+                    ) if n >= 1 => {
+                        let bytes =
+                            seg_const_bytes(&Expr::Lit(l.clone()), n, spec.little).ok()??;
                         Some(DiscKey::Byte0(bytes[0]))
                     }
                     _ => None,
@@ -331,7 +362,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         for (i, clause) in clauses.iter().enumerate() {
             self.next_slot.set(wm);
             self.builder.position_at_end(blocks[i]);
-            let next = if i + 1 < clauses.len() { blocks[i + 1] } else { fail_bb };
+            let next = if i + 1 < clauses.len() {
+                blocks[i + 1]
+            } else {
+                fail_bb
+            };
             let nvals = match vals {
                 CaseVals::Ssa(vs) => vs.len(),
                 CaseVals::Slots(slots) => slots.len(),
@@ -370,8 +405,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             match merge {
                 None => self.compile_tail(f, &clause.body, &mut cscope)?,
                 Some((merge_bb, ref mut incoming, nvals)) => {
-                    let vs =
-                        self.compile_body_values(f, &clause.body, &mut cscope, nvals)?;
+                    let vs = self.compile_body_values(f, &clause.body, &mut cscope, nvals)?;
                     let cur = self.builder.get_insert_block().unwrap();
                     incoming.push((vs, cur));
                     self.builder
@@ -396,7 +430,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
             self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
             let target = self.unwind_target(f)?;
-            self.builder.build_unconditional_branch(target).map_err(be)?;
+            self.builder
+                .build_unconditional_branch(target)
+                .map_err(be)?;
         }
         Ok(())
     }
@@ -416,10 +452,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             return Ok(vec![self.compile_value(f, body, scope)?]);
         }
         match body {
-            Expr::Values(es) if es.len() == nvals => es
-                .iter()
-                .map(|e| self.compile_value(f, e, scope))
-                .collect(),
+            Expr::Values(es) if es.len() == nvals => {
+                es.iter().map(|e| self.compile_value(f, e, scope)).collect()
+            }
             Expr::Let { vars, arg, body } => {
                 self.bind_let(f, vars, arg, scope)?;
                 self.compile_body_values(f, body, scope, nvals)
@@ -442,8 +477,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 if module == "erlang"
                     && matches!(
                         (name.as_str(), args.len()),
-                        ("error", 1) | ("error", 2) | ("error", 3) | ("exit", 1)
-                            | ("throw", 1)
+                        ("error", 1) | ("error", 2) | ("error", 3) | ("exit", 1) | ("throw", 1)
                     ) =>
             {
                 self.compile_raise(f, name, &args[..1.max(args.len().min(2))], scope)?;
@@ -468,7 +502,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let vals = self.compile_case_arg(f, arg, clauses, scope)?;
         let merge = self.ctx.append_basic_block(f, "mcase.merge");
         let mut incoming: Vec<(Vec<IntValue<'ctx>>, BasicBlock<'ctx>)> = Vec::new();
-        self.compile_case(f, &vals, clauses, scope, Some((merge, &mut incoming, nvals)))?;
+        self.compile_case(
+            f,
+            &vals,
+            clauses,
+            scope,
+            Some((merge, &mut incoming, nvals)),
+        )?;
         self.builder.position_at_end(merge);
         let mut out = Vec::with_capacity(nvals);
         for i in 0..nvals {

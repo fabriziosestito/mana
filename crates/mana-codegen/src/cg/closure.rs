@@ -75,8 +75,7 @@ pub(crate) fn free_vars(e: &Expr, bound: &mut HashSet<String>, out: &mut BTreeSe
         }
         Expr::Let { vars, arg, body } => {
             free_vars(arg, bound, out);
-            let added: Vec<&String> =
-                vars.iter().filter(|v| bound.insert((*v).clone())).collect();
+            let added: Vec<&String> = vars.iter().filter(|v| bound.insert((*v).clone())).collect();
             free_vars(body, bound, out);
             for v in added {
                 bound.remove(v);
@@ -151,8 +150,7 @@ pub(crate) fn free_vars(e: &Expr, bound: &mut HashSet<String>, out: &mut BTreeSe
             handler,
         } => {
             free_vars(arg, bound, out);
-            let added: Vec<&String> =
-                vars.iter().filter(|v| bound.insert((*v).clone())).collect();
+            let added: Vec<&String> = vars.iter().filter(|v| bound.insert((*v).clone())).collect();
             free_vars(body, bound, out);
             for v in added {
                 bound.remove(v);
@@ -293,7 +291,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
             self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
             let target = self.unwind_target(f)?;
-            self.builder.build_unconditional_branch(target).map_err(be)?;
+            self.builder
+                .build_unconditional_branch(target)
+                .map_err(be)?;
         }
 
         self.builder.position_at_end(good);
@@ -371,9 +371,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
         self.store_word(p, 1, code_int)?;
         for (i, name) in capture_names.iter().enumerate() {
-            let v = self.read_var(scope, name).map_err(|e| {
-                format!("{} (captured by fun)", e)
-            })?;
+            let v = self
+                .read_var(scope, name)
+                .map_err(|e| format!("{} (captured by fun)", e))?;
             self.store_word(p, 2 + i as u64, v)?;
         }
         self.builder
@@ -416,10 +416,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let indices: Vec<usize> = defs
             .iter()
             .map(|(fname, fun)| {
-                self.declare_lift(
-                    &format!("{}_{}", fname.name, fname.arity),
-                    fun.params.len(),
-                )
+                self.declare_lift(&format!("{}_{}", fname.name, fname.arity), fun.params.len())
             })
             .collect();
         let sibs: Vec<(FunName, usize)> = defs
@@ -455,7 +452,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// Build a shim that adapts a plain top-level function to the closure
     /// calling convention. The shim is frameless: it holds no live terms
     /// across the call.
-    pub(crate) fn fun_shim(&self, module: Option<&str>, fname: &FunName) -> CgResult<FunctionValue<'ctx>> {
+    pub(crate) fn fun_shim(
+        &self,
+        module: Option<&str>,
+        fname: &FunName,
+    ) -> CgResult<FunctionValue<'ctx>> {
         let target_mod = module.unwrap_or(&self.module_name);
         let sym = format!("{}.shim", mangle(target_mod, fname));
         if let Some(existing) = self.module.get_function(&sym) {

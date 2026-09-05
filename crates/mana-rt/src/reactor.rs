@@ -144,12 +144,8 @@ pub(crate) fn reactor_thread(g: &'static Global) {
             };
             let interests = mio::Interest::READABLE | mio::Interest::WRITABLE;
             let res = match &mut entry.source {
-                SockSource::Listener(l) => {
-                    poll.registry().register(l, mio::Token(idx), interests)
-                }
-                SockSource::Stream(s) => {
-                    poll.registry().register(s, mio::Token(idx), interests)
-                }
+                SockSource::Listener(l) => poll.registry().register(l, mio::Token(idx), interests),
+                SockSource::Stream(s) => poll.registry().register(s, mio::Token(idx), interests),
             };
             let _ = res; // AlreadyExists on a duplicate request is not an error.
         }
@@ -204,7 +200,9 @@ pub(crate) fn drain_io_wakes(ctx: &mut ProcCtx) {
     let global = ctx.global;
     let n = IO_WAKES.len();
     for _ in 0..n {
-        let Some((pid, idx, is_read)) = IO_WAKES.pop() else { break };
+        let Some((pid, idx, is_read)) = IO_WAKES.pop() else {
+            break;
+        };
         let Some(cell) = proc_ref(global, pid) else {
             continue;
         };
@@ -226,13 +224,17 @@ pub(crate) fn drain_io_wakes(ctx: &mut ProcCtx) {
         // waiter slot still names the pid. If the op completed, drop the
         // token as a stale wake.
         let tab = SOCKETS.lock().unwrap();
-        let still_waiting = tab.slots.get(idx).and_then(|s| s.as_ref()).is_some_and(|e| {
-            if is_read {
-                e.read_waiter == Some(pid)
-            } else {
-                e.write_waiter == Some(pid)
-            }
-        });
+        let still_waiting = tab
+            .slots
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|e| {
+                if is_read {
+                    e.read_waiter == Some(pid)
+                } else {
+                    e.write_waiter == Some(pid)
+                }
+            });
         drop(tab);
         if still_waiting {
             IO_WAKES.push((pid, idx, is_read));

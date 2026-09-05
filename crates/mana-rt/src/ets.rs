@@ -99,12 +99,20 @@ pub extern "C" fn mana_rt_pt_put(_ctx: *mut ProcCtx, key: u64, val: u64) -> u64 
 /// persistent_term:get/1,2. On a miss, get/1 raises badarg, as BEAM does.
 /// get/2 returns the default. No sentinel value is used.
 #[no_mangle]
-pub extern "C" fn mana_rt_pt_get(ctx: *mut ProcCtx, key: u64, default: u64, has_default: u64) -> u64 {
+pub extern "C" fn mana_rt_pt_get(
+    ctx: *mut ProcCtx,
+    key: u64,
+    default: u64,
+    has_default: u64,
+) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let guard = PERSISTENT_TERMS.lock().unwrap();
-    let found = guard
-        .as_ref()
-        .and_then(|m| m.keys().copied().find(|&k| mana_rt_eq_exact(k, key) == 1).map(|k| m[&k]));
+    let found = guard.as_ref().and_then(|m| {
+        m.keys()
+            .copied()
+            .find(|&k| mana_rt_eq_exact(k, key) == 1)
+            .map(|k| m[&k])
+    });
     match found {
         Some(v) => v,
         None if has_default != 0 => default,
@@ -176,9 +184,7 @@ pub extern "C" fn mana_rt_ets_insert(ctx: *mut ProcCtx, tab: u64, obj: u64, new:
                 // always appends. Rows keep insertion order.
                 let dup = kind == ETS_BAG
                     && rows.iter().any(|&(t, k, v)| {
-                        t == tab
-                            && mana_rt_eq_exact(k, key) == 1
-                            && mana_rt_eq_exact(v, o) == 1
+                        t == tab && mana_rt_eq_exact(k, key) == 1 && mana_rt_eq_exact(v, o) == 1
                     });
                 if !dup {
                     let copy = eternal_deep_copy(o);
@@ -271,9 +277,11 @@ pub(crate) fn ets_match_term(pat: u64, val: u64, caps: &mut Vec<(i64, u64)>) -> 
     }
     if pat & TAG_MASK == TAG_CONS && val & TAG_MASK == TAG_CONS {
         unsafe {
-            let (pp, vp) = ((pat & !TAG_MASK) as *const u64, (val & !TAG_MASK) as *const u64);
-            return ets_match_term(*pp, *vp, caps)
-                && ets_match_term(*pp.add(1), *vp.add(1), caps);
+            let (pp, vp) = (
+                (pat & !TAG_MASK) as *const u64,
+                (val & !TAG_MASK) as *const u64,
+            );
+            return ets_match_term(*pp, *vp, caps) && ets_match_term(*pp.add(1), *vp.add(1), caps);
         }
     }
     mana_rt_eq_exact(pat, val) == 1
@@ -374,7 +382,10 @@ pub extern "C" fn mana_rt_ets_new(_ctx: *mut ProcCtx, name: u64, opts: u64) -> u
         }
     }
     let mut tabs = ETS_TABLES.lock().unwrap();
-    match tabs.iter().position(|&(t, _)| mana_rt_eq_exact(t, name) == 1) {
+    match tabs
+        .iter()
+        .position(|&(t, _)| mana_rt_eq_exact(t, name) == 1)
+    {
         Some(i) => tabs[i].1 = kind,
         None => tabs.push((eternal_deep_copy(name), kind)),
     }
@@ -532,7 +543,11 @@ pub extern "C" fn mana_rt_ets_take(ctx: *mut ProcCtx, tab: u64, key: u64) -> u64
 
 /// Count the rows of `tab` that match a restricted select head. The guards
 /// must be empty. select_count and select_delete share this function.
-pub(crate) fn ets_select_matches(spec: u64, tab: u64, out_heads: &mut Vec<u64>) -> Result<usize, ()> {
+pub(crate) fn ets_select_matches(
+    spec: u64,
+    tab: u64,
+    out_heads: &mut Vec<u64>,
+) -> Result<usize, ()> {
     // Parse [{Head, [], _Body}]. The function keeps only the heads. The
     // guards must be [].
     let mut heads: Vec<u64> = Vec::new();
@@ -599,9 +614,7 @@ pub extern "C" fn mana_rt_ets_select_delete(ctx: *mut ProcCtx, tab: u64, spec: u
     };
     let mut guard = ETS_STORE.lock().unwrap();
     if let Some(rows) = guard.as_mut() {
-        rows.retain(|&(t, _, v)| {
-            !(t == tab && hits.iter().any(|&h| mana_rt_eq_exact(h, v) == 1))
-        });
+        rows.retain(|&(t, _, v)| !(t == tab && hits.iter().any(|&h| mana_rt_eq_exact(h, v) == 1)));
     }
     ((n as u64) << 3) | TAG_SMALL
 }
@@ -820,7 +833,12 @@ pub extern "C" fn mana_rt_ets_lookup_element4(
 /// Shared body. Returns Ok(term) on success. Returns Err(true) on a real
 /// badarg (bad pos or malformed tuple). Returns Err(false) when the key has no
 /// rows.
-pub(crate) fn ets_lookup_element_impl(ctx: *mut ProcCtx, tab: u64, key: u64, pos: u64) -> Result<u64, bool> {
+pub(crate) fn ets_lookup_element_impl(
+    ctx: *mut ProcCtx,
+    tab: u64,
+    key: u64,
+    pos: u64,
+) -> Result<u64, bool> {
     let ctx = unsafe { &mut *ctx };
     if pos & TAG_MASK != TAG_SMALL || (pos as i64 >> 3) < 1 {
         return Err(true);

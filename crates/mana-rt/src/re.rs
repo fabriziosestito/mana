@@ -33,8 +33,8 @@ pub(crate) struct ReFlags {
 pub(crate) struct ReRunOpts {
     pub(crate) global: bool,
     pub(crate) offset: usize,
-    pub(crate) capture_spec: u64,   // term: an atom (all, first, none, all_but_first, all_names) or a list
-    pub(crate) capture_type: u8,    // 0 = index, 1 = binary, 2 = list
+    pub(crate) capture_spec: u64, // term: an atom (all, first, none, all_but_first, all_names) or a list
+    pub(crate) capture_type: u8,  // 0 = index, 1 = binary, 2 = list
 }
 
 pub(crate) fn term_to_source(t: u64) -> Option<Vec<u8>> {
@@ -277,7 +277,9 @@ pub extern "C" fn mana_rt_re_run(ctx: *mut ProcCtx, subject: u64, pat: u64, opts
                     let mut named: Vec<(String, Option<(usize, usize)>)> = names
                         .iter()
                         .enumerate()
-                        .filter_map(|(i, n)| n.clone().map(|n| (n, groups.get(i).copied().flatten())))
+                        .filter_map(|(i, n)| {
+                            n.clone().map(|n| (n, groups.get(i).copied().flatten()))
+                        })
                         .collect();
                     named.sort_by(|a, b| a.0.cmp(&b.0));
                     named.into_iter().map(|(_, g)| g).collect()

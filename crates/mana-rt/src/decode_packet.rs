@@ -63,7 +63,8 @@ pub(crate) const HTTP_FIELDS: &[&str] = &[
     "Proxy-Connection",
 ];
 
-pub(crate) const HTTP_METHODS: &[&str] = &["OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE"];
+pub(crate) const HTTP_METHODS: &[&str] =
+    &["OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE"];
 
 /// Convert a header name to canonical case the way erts does. The function
 /// capitalizes the first letter of every dash-separated token. It lowercases
@@ -142,7 +143,12 @@ pub(crate) fn dp_ok(
     fr[0] = saved;
     fr[2] = packet;
     ctx.roots_head = fr.as_ptr() as u64;
-    let r = mana_rt_bin_slice(ctx as *mut ProcCtx, unsafe { *bin_slot }, off as u64, rest.len() as i64);
+    let r = mana_rt_bin_slice(
+        ctx as *mut ProcCtx,
+        unsafe { *bin_slot },
+        off as u64,
+        rest.len() as i64,
+    );
     let ctx = unsafe { &mut *(ctx as *mut ProcCtx) };
     fr[3] = r;
     let p = alloc_nursery(ctx, 4);
@@ -181,7 +187,12 @@ pub(crate) fn dp_line(bytes: &[u8]) -> Option<(&[u8], usize)> {
     Some((line, nl + 1))
 }
 
-pub(crate) fn dp_http(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8, bytes: &[u8]) -> u64 {
+pub(crate) fn dp_http(
+    ctx: &mut ProcCtx,
+    bin_slot: *const u64,
+    base: *const u8,
+    bytes: &[u8],
+) -> u64 {
     let Some((line, rest_at)) = dp_line(bytes) else {
         return dp_more(ctx);
     };
@@ -240,7 +251,10 @@ pub(crate) fn dp_version(v: &[u8]) -> Option<(i64, i64)> {
     let v = v.strip_prefix(b"HTTP/")?;
     let dot = v.iter().position(|&b| b == b'.')?;
     let major = std::str::from_utf8(&v[..dot]).ok()?.parse::<i64>().ok()?;
-    let minor = std::str::from_utf8(&v[dot + 1..]).ok()?.parse::<i64>().ok()?;
+    let minor = std::str::from_utf8(&v[dot + 1..])
+        .ok()?
+        .parse::<i64>()
+        .ok()?;
     Some((major, minor))
 }
 
@@ -293,15 +307,19 @@ pub(crate) fn dp_uri(ctx: &mut ProcCtx, uri: &[u8]) -> u64 {
         return atom_intern(b"*");
     }
     let lower: Vec<u8> = uri.to_ascii_lowercase();
-    for (scheme, name) in [(b"http://".as_slice(), &b"http"[..]), (b"https://", b"https")] {
+    for (scheme, name) in [
+        (b"http://".as_slice(), &b"http"[..]),
+        (b"https://", b"https"),
+    ] {
         if lower.starts_with(scheme) {
             let after = &uri[scheme.len()..];
-            let path_at = after
-                .iter()
-                .position(|&b| b == b'/')
-                .unwrap_or(after.len());
+            let path_at = after.iter().position(|&b| b == b'/').unwrap_or(after.len());
             let hostport = &after[..path_at];
-            let path: &[u8] = if path_at == after.len() { b"/" } else { &after[path_at..] };
+            let path: &[u8] = if path_at == after.len() {
+                b"/"
+            } else {
+                &after[path_at..]
+            };
             let (host, port) = match hostport.iter().position(|&b| b == b':') {
                 Some(c) => {
                     let p = std::str::from_utf8(&hostport[c + 1..])
@@ -359,12 +377,23 @@ pub(crate) fn dp_uri(ctx: &mut ProcCtx, uri: &[u8]) -> u64 {
     bytes_to_new_bin(ctx, uri)
 }
 
-pub(crate) fn dp_httph(ctx: &mut ProcCtx, bin_slot: *const u64, base: *const u8, bytes: &[u8]) -> u64 {
+pub(crate) fn dp_httph(
+    ctx: &mut ProcCtx,
+    bin_slot: *const u64,
+    base: *const u8,
+    bytes: &[u8],
+) -> u64 {
     let Some((line, mut rest_at)) = dp_line(bytes) else {
         return dp_more(ctx);
     };
     if line.is_empty() {
-        return dp_ok(ctx, atom_intern(b"http_eoh"), bin_slot, base, &bytes[rest_at..]);
+        return dp_ok(
+            ctx,
+            atom_intern(b"http_eoh"),
+            bin_slot,
+            base,
+            &bytes[rest_at..],
+        );
     }
     if rest_at == bytes.len() {
         // An obs-fold continuation can still extend a complete header line.

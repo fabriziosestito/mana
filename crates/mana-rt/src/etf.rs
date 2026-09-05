@@ -19,7 +19,11 @@ pub(crate) fn etf_encode(t: u64, out: &mut Vec<u8>) -> Result<(), ()> {
                 out.extend_from_slice(&(v as i32).to_be_bytes());
             } else {
                 // SMALL_BIG_EXT for the 61-bit smalls outside the i32 range
-                let (sign, mag) = if v < 0 { (1u8, (-(v as i128)) as u64) } else { (0, v as u64) };
+                let (sign, mag) = if v < 0 {
+                    (1u8, (-(v as i128)) as u64)
+                } else {
+                    (0, v as u64)
+                };
                 let bytes = mag.to_le_bytes();
                 let n = bytes.iter().rposition(|&b| b != 0).map_or(1, |i| i + 1);
                 out.push(110);
@@ -245,7 +249,11 @@ pub(crate) fn etf_decode(ctx: &mut ProcCtx, d: &mut EtfDec, safe: bool) -> Resul
             Ok(list)
         }
         104 | 105 => {
-            let n = if tag == 104 { d.u8()? as usize } else { d.u32()? as usize };
+            let n = if tag == 104 {
+                d.u8()? as usize
+            } else {
+                d.u32()? as usize
+            };
             let saved = ctx.roots_head;
             let mut fr: Vec<u64> = Vec::with_capacity(2 + n);
             fr.push(saved);
@@ -351,7 +359,10 @@ pub extern "C" fn mana_rt_binary_to_term(ctx: *mut ProcCtx, bin: u64, opts: u64)
     if bytes.first() != Some(&131) {
         return raise_badarg(ctx);
     }
-    let mut d = EtfDec { buf: &bytes, pos: 1 };
+    let mut d = EtfDec {
+        buf: &bytes,
+        pos: 1,
+    };
     let r = etf_decode(ctx, &mut d, safe);
     let Ok(term) = r else {
         return raise_badarg(ctx);

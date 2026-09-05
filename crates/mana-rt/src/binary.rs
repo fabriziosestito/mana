@@ -88,7 +88,11 @@ pub extern "C" fn mana_rt_bin_alloc_eternal(ctx: *mut ProcCtx, nbytes: u64) -> u
 pub extern "C" fn mana_rt_bin_len_check(t: u64, n: u64, at_least: u64) -> u64 {
     match bin_parts(t) {
         Some((_, len)) => {
-            (if at_least != 0 { len >= n as usize } else { len == n as usize }) as u64
+            (if at_least != 0 {
+                len >= n as usize
+            } else {
+                len == n as usize
+            }) as u64
         }
         None => 0,
     }
@@ -126,14 +130,20 @@ pub extern "C" fn mana_rt_bin_read_int(bin: u64, off: u64, nbytes: u64, flags: u
     }
     let sv = if flags & 2 != 0 && nbytes > 0 {
         let shift = 64 - 8 * nbytes.min(8) as u32;
-        if shift > 0 { ((v << shift) as i64) >> shift } else { v as i64 }
+        if shift > 0 {
+            ((v << shift) as i64) >> shift
+        } else {
+            v as i64
+        }
     } else {
         v as i64
     };
     // Small ints hold 61 bits. A 64-bit segment with a larger value needs a
     // bignum, and the runtime does not have one here.
     if nbytes >= 8 && (sv >> 60 != 0 && sv >> 60 != -1) {
-        eprintln!("mana: TODO(bignum-segments): 64-bit binary segment value out of small-int range");
+        eprintln!(
+            "mana: TODO(bignum-segments): 64-bit binary segment value out of small-int range"
+        );
         std::process::abort();
     }
     ((sv << 3) as u64) | TAG_SMALL
@@ -297,7 +307,11 @@ pub extern "C" fn mana_rt_bin_write_int(
     } else if let Some((neg, mag)) = bignum_parts(val) {
         // The low 64 bits, in two's complement for negatives (nbytes <= 8).
         let lo = mag[0];
-        if neg { lo.wrapping_neg() } else { lo }
+        if neg {
+            lo.wrapping_neg()
+        } else {
+            lo
+        }
     } else {
         return raise_badarg(ctx);
     };
@@ -364,7 +378,11 @@ pub extern "C" fn mana_rt_binary_part(ctx: *mut ProcCtx, bin: u64, pos: u64, len
         return raise_badarg(ctx);
     }
     let (pos, len) = (pos as i64 >> 3, len as i64 >> 3);
-    let (start, n) = if len < 0 { (pos + len, -len) } else { (pos, len) };
+    let (start, n) = if len < 0 {
+        (pos + len, -len)
+    } else {
+        (pos, len)
+    };
     if start < 0 || n < 0 || (start + n) as usize > total || start as usize > total {
         return raise_badarg(ctx);
     }
@@ -411,9 +429,8 @@ pub extern "C" fn mana_rt_list_to_tuple(ctx: *mut ProcCtx, l: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn mana_rt_tuple_to_list(ctx: *mut ProcCtx, t: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    let ok = t & TAG_MASK == TAG_BOXED
-        && t != 0
-        && unsafe { *(t as *const u64) } & 0xff == KIND_TUPLE;
+    let ok =
+        t & TAG_MASK == TAG_BOXED && t != 0 && unsafe { *(t as *const u64) } & 0xff == KIND_TUPLE;
     if !ok {
         return raise_badarg(ctx);
     }
@@ -596,7 +613,9 @@ pub(crate) fn bin_search(hay: &[u8], pats: &[&[u8]], from: usize) -> Option<(usi
         }
         let mut i = from;
         while i + p.len() <= hay.len() {
-            let Some(k) = hay[i..].iter().position(|&b| b == p[0]) else { return None };
+            let Some(k) = hay[i..].iter().position(|&b| b == p[0]) else {
+                return None;
+            };
             i += k;
             if hay[i..].starts_with(p) {
                 return Some((i, p.len()));
@@ -814,8 +833,7 @@ pub extern "C" fn mana_rt_binary_decode_unsigned(ctx: *mut ProcCtx, bin: u64, li
         return raise_badarg(ctx);
     }
     // `little` is 0 (the /1 default) or the endianness atom from /2.
-    let is_little =
-        little & TAG_MASK == TAG_ATOM && atom_bytes(little) == b"little";
+    let is_little = little & TAG_MASK == TAG_ATOM && atom_bytes(little) == b"little";
     let bytes = bin_bytes(bin).to_vec();
     let le: Vec<u8> = if is_little {
         bytes

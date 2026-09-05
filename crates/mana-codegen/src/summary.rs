@@ -11,8 +11,10 @@
 //! The serialization is a hand-rolled length-prefixed format (no dependency,
 //! fully deterministic). Any decode irregularity counts as a miss.
 
-use crate::{cond_may_gc, cond_may_raise, collect_atom_arg_pairs, collect_atoms,
-            collect_dyn_names, collect_edges, Edge};
+use crate::{
+    collect_atom_arg_pairs, collect_atoms, collect_dyn_names, collect_edges, cond_may_gc,
+    cond_may_raise, Edge,
+};
 use mana_syntax::{FunName, Module};
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
@@ -32,13 +34,13 @@ pub struct ModuleSummary {
 pub struct FunSummary {
     pub name: FunName,
     // reachable_funs inputs
-    pub atoms: Vec<String>,                  // collect_atoms (sorted)
-    pub arg_pairs: Vec<(String, String)>,    // collect_atom_arg_pairs (in order)
-    pub dyn_pairs: Vec<(String, usize)>,     // collect_dyn_names pairs (sorted)
-    pub dyn_any_names: Vec<String>,          // MFA-tuple names, any arity (sorted)
+    pub atoms: Vec<String>,               // collect_atoms (sorted)
+    pub arg_pairs: Vec<(String, String)>, // collect_atom_arg_pairs (in order)
+    pub dyn_pairs: Vec<(String, usize)>,  // collect_dyn_names pairs (sorted)
+    pub dyn_any_names: Vec<String>,       // MFA-tuple names, any arity (sorted)
     pub fun_dyn: bool,
-    pub tuple_heads: Vec<String>,            // collect_dyn_names heads (sorted)
-    pub edges: Vec<Edge>,                    // collect_edges (in order)
+    pub tuple_heads: Vec<String>, // collect_dyn_names heads (sorted)
+    pub edges: Vec<Edge>,         // collect_edges (in order)
     // effect condensations (cond_may_gc, cond_may_raise)
     pub gc_base: bool,
     pub gc_deps: Vec<(String, FunName)>,
@@ -61,7 +63,13 @@ pub fn summarize(m: &Module) -> ModuleSummary {
             let mut fun_dyn = false;
             let mut heads: HashSet<String> = HashSet::new();
             let mut any_names: HashSet<String> = HashSet::new();
-            collect_dyn_names(&fun.body, &mut pairs, &mut fun_dyn, &mut heads, &mut any_names);
+            collect_dyn_names(
+                &fun.body,
+                &mut pairs,
+                &mut fun_dyn,
+                &mut heads,
+                &mut any_names,
+            );
             let mut edges = Vec::new();
             let mut letrec = HashSet::new();
             collect_edges(&fun.body, &mut edges, &mut letrec);
@@ -72,7 +80,13 @@ pub fn summarize(m: &Module) -> ModuleSummary {
             let mut raise_base = false;
             let mut raise_deps = BTreeSet::new();
             let mut letrec = HashSet::new();
-            cond_may_raise(&fun.body, &m.name, &mut letrec, &mut raise_base, &mut raise_deps);
+            cond_may_raise(
+                &fun.body,
+                &m.name,
+                &mut letrec,
+                &mut raise_base,
+                &mut raise_deps,
+            );
             let mut dyn_pairs: Vec<(String, usize)> = pairs.into_iter().collect();
             dyn_pairs.sort();
             let mut dyn_any_names: Vec<String> = any_names.into_iter().collect();
@@ -275,7 +289,11 @@ fn decode(b: &[u8]) -> Option<ModuleSummary> {
     if p != b.len() {
         return None;
     }
-    Some(ModuleSummary { name, exports, funs })
+    Some(ModuleSummary {
+        name,
+        exports,
+        funs,
+    })
 }
 
 fn w32(b: &mut Vec<u8>, v: u32) {

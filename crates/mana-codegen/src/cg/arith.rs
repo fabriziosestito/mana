@@ -89,10 +89,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.builder.position_at_end(cont);
             Ok(())
         };
-        let ovf = |l: IntValue<'ctx>, r: IntValue<'ctx>, which: &str| -> CgResult<(
-            IntValue<'ctx>,
-            IntValue<'ctx>,
-        )> {
+        let ovf = |l: IntValue<'ctx>,
+                   r: IntValue<'ctx>,
+                   which: &str|
+         -> CgResult<(IntValue<'ctx>, IntValue<'ctx>)> {
             let intr = inkwell::intrinsics::Intrinsic::find(which)
                 .ok_or_else(|| format!("missing intrinsic {}", which))?;
             let decl = intr
@@ -165,12 +165,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let ub = self.untag_int(b)?;
                 let zero = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::EQ,
-                        ub,
-                        self.i64t.const_zero(),
-                        "div.z",
-                    )
+                    .build_int_compare(IntPredicate::EQ, ub, self.i64t.const_zero(), "div.z")
                     .map_err(be)?;
                 to_slow(zero, "div.k")?;
                 let q = self
@@ -187,12 +182,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let ub = self.untag_int(b)?;
                 let zero = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::EQ,
-                        ub,
-                        self.i64t.const_zero(),
-                        "rem.z",
-                    )
+                    .build_int_compare(IntPredicate::EQ, ub, self.i64t.const_zero(), "rem.z")
                     .map_err(be)?;
                 to_slow(zero, "rem.k")?;
                 let r = self
@@ -238,12 +228,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let ua = self.untag_int(a)?;
                 let neg = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::SLT,
-                        ua,
-                        self.i64t.const_zero(),
-                        "abs.n",
-                    )
+                    .build_int_compare(IntPredicate::SLT, ua, self.i64t.const_zero(), "abs.n")
                     .map_err(be)?;
                 let nv = self
                     .builder
@@ -304,7 +289,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .builder
             .build_int_add(parent, self.i64t.const_int(8, false), "bba.pd")
             .map_err(be)?;
-        self.builder.build_int_add(pdata, poff, "bba.base").map_err(be)
+        self.builder
+            .build_int_add(pdata, poff, "bba.base")
+            .map_err(be)
     }
 
     /// Returns (root binary term, byte offset into it) for a preflighted binary
@@ -332,12 +319,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .map_err(be)?;
         let is_view = self
             .builder
-            .build_int_compare(
-                IntPredicate::NE,
-                viewbit,
-                self.i64t.const_zero(),
-                "bba.iv",
-            )
+            .build_int_compare(IntPredicate::NE, viewbit, self.i64t.const_zero(), "bba.iv")
             .map_err(be)?;
         let cur = self.builder.get_insert_block().unwrap();
         let view_bb = self.ctx.append_basic_block(f, "bba.view");
@@ -369,7 +351,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let view_end = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge).map_err(be)?;
         self.builder.position_at_end(merge);
-        let pphi = self.builder.build_phi(self.i64t, "bba.parent").map_err(be)?;
+        let pphi = self
+            .builder
+            .build_phi(self.i64t, "bba.parent")
+            .map_err(be)?;
         pphi.add_incoming(&[(&subject, cur), (&parent, view_end)]);
         let ophi = self.builder.build_phi(self.i64t, "bba.poff").map_err(be)?;
         let zero = self.i64t.const_zero();
@@ -400,7 +385,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .builder
             .build_int_compare(IntPredicate::NE, v, self.i64t.const_zero(), "kt.nz")
             .map_err(be)?;
-        let okptr = self.builder.build_and(is_boxed, nonzero, "kt.ptr").map_err(be)?;
+        let okptr = self
+            .builder
+            .build_and(is_boxed, nonzero, "kt.ptr")
+            .map_err(be)?;
         self.builder
             .build_conditional_branch(okptr, boxed_bb, merge)
             .map_err(be)?;

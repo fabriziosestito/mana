@@ -88,7 +88,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.builder.position_at_end(hit);
         let voff = self
             .builder
-            .build_int_add(self.builder.build_int_add(one, n, "mg.vb").map_err(be)?, iv, "mg.vo")
+            .build_int_add(
+                self.builder.build_int_add(one, n, "mg.vb").map_err(be)?,
+                iv,
+                "mg.vo",
+            )
             .map_err(be)?;
         let vptr = unsafe {
             self.builder
@@ -168,7 +172,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 self.builder.position_at_end(hit_bb);
                 // The {ok, V} tuple needs an allocation. Root v in a temporary slot first.
-                let vslot = if self.framed() { Some(self.spill(v)?) } else { None };
+                let vslot = if self.framed() {
+                    Some(self.spill(v)?)
+                } else {
+                    None
+                };
                 let p = self.alloc_words(3)?;
                 self.store_word(p, 0, self.i64t.const_int((2 << 8) | KIND_TUPLE, false))?;
                 let ok_atom = self.atom_term("ok")?;
@@ -318,9 +326,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         &[
                             self.ctx_val().into(),
                             argv[0].into(),
-                            self.i64t
-                                .const_int((name == "values") as u64, false)
-                                .into(),
+                            self.i64t.const_int((name == "values") as u64, false).into(),
                         ],
                         "mkeys",
                     )
@@ -389,9 +395,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             self.ctx_val().into(),
                             argv[0].into(),
                             argv[1].into(),
-                            self.i64t
-                                .const_int((name == "with") as u64, false)
-                                .into(),
+                            self.i64t.const_int((name == "with") as u64, false).into(),
                         ],
                         "mw",
                     )

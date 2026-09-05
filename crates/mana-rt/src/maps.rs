@@ -17,7 +17,10 @@ pub(crate) fn map_key_cmp(a: u64, b: u64) -> std::cmp::Ordering {
     // exactness pass are not needed for them.
     if let (Some((pa, la)), Some((pb, lb))) = (bin_parts(a), bin_parts(b)) {
         let (x, y) = unsafe {
-            (std::slice::from_raw_parts(pa, la), std::slice::from_raw_parts(pb, lb))
+            (
+                std::slice::from_raw_parts(pa, la),
+                std::slice::from_raw_parts(pb, lb),
+            )
         };
         return x.cmp(y);
     }
@@ -88,7 +91,8 @@ pub(crate) fn map_index(p: *const u64, n: usize, key: u64) -> Result<usize, usiz
 pub extern "C" fn mana_rt_map_norm(m: u64) -> u64 {
     let Some((p, n)) = map_parts(m) else { return m };
     unsafe {
-        let mut pairs: Vec<(u64, u64)> = (0..n).map(|i| (*p.add(1 + i), *p.add(1 + n + i))).collect();
+        let mut pairs: Vec<(u64, u64)> =
+            (0..n).map(|i| (*p.add(1 + i), *p.add(1 + n + i))).collect();
         // The stable sort keeps the LAST duplicate later in the run.
         pairs.sort_by(|a, b| map_key_cmp(a.0, b.0));
         let mut out: Vec<(u64, u64)> = Vec::with_capacity(n);

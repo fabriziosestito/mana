@@ -116,7 +116,8 @@ pub extern "C" fn mana_rt_phash2(ctx: *mut ProcCtx, t: u64, range: u64) -> u64 {
 /// erlang:unique_integer/0,1: a global counter. It gives uniqueness only. A
 /// counter that counts up also satisfies the positive and monotonic option
 /// atoms.
-pub(crate) static UNIQUE_INTEGER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+pub(crate) static UNIQUE_INTEGER: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(1);
 
 #[no_mangle]
 pub extern "C" fn mana_rt_unique_integer(_ctx: *mut ProcCtx) -> u64 {
@@ -159,8 +160,9 @@ pub extern "C" fn mana_rt_process_flag(ctx: *mut ProcCtx, flag: u64, value: u64)
         b"trap_exit" => mana_rt_trap_exit(ctxp, value),
         b"priority" => atom_intern(b"normal"),
         b"message_queue_data" => atom_intern(b"off_heap"),
-        b"min_heap_size" | b"min_bin_vheap_size" | b"max_heap_size"
-        | b"fullsweep_after" => (0 << 3) | TAG_SMALL,
+        b"min_heap_size" | b"min_bin_vheap_size" | b"max_heap_size" | b"fullsweep_after" => {
+            (0 << 3) | TAG_SMALL
+        }
         b"sensitive" | b"error_handler" => known().false_a,
         _ => raise_badarg(ctx),
     }
@@ -176,8 +178,11 @@ pub extern "C" fn mana_rt_system_flag(ctx: *mut ProcCtx, flag: u64, _value: u64)
         return raise_badarg(ctx);
     }
     match atom_bytes(flag) {
-        b"backtrace_depth" | b"fullsweep_after" | b"min_heap_size"
-        | b"min_bin_vheap_size" | b"max_heap_size" => (8 << 3) | TAG_SMALL,
+        b"backtrace_depth"
+        | b"fullsweep_after"
+        | b"min_heap_size"
+        | b"min_bin_vheap_size"
+        | b"max_heap_size" => (8 << 3) | TAG_SMALL,
         _ => raise_badarg(ctx),
     }
 }
@@ -405,12 +410,7 @@ pub extern "C" fn mana_rt_system_time(ctx: *mut ProcCtx, unit: u64) -> u64 {
 
 /// erlang:convert_time_unit/3. The from and to arguments are unit terms.
 #[no_mangle]
-pub extern "C" fn mana_rt_convert_time_unit(
-    ctx: *mut ProcCtx,
-    t: u64,
-    from: u64,
-    to: u64,
-) -> u64 {
+pub extern "C" fn mana_rt_convert_time_unit(ctx: *mut ProcCtx, t: u64, from: u64, to: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let v: i128 = if t & TAG_MASK == TAG_SMALL {
         (t as i64 >> 3) as i128
@@ -419,9 +419,12 @@ pub extern "C" fn mana_rt_convert_time_unit(
         if mag.len() > 2 {
             return raise_badarg(ctx);
         }
-        let uv = mag[0] as i128
-            | ((*mag.get(1).unwrap_or(&0) as i128) << 64);
-        if neg { -uv } else { uv }
+        let uv = mag[0] as i128 | ((*mag.get(1).unwrap_or(&0) as i128) << 64);
+        if neg {
+            -uv
+        } else {
+            uv
+        }
     } else {
         return raise_badarg(ctx);
     };
@@ -471,8 +474,9 @@ pub extern "C" fn mana_rt_system_info(ctx: *mut ProcCtx, item: u64) -> u64 {
             }
             t as u64
         }
-        b"logical_processors" | b"logical_processors_available"
-        | b"logical_processors_online" => ((cpus() << 3) as u64) | TAG_SMALL,
+        b"logical_processors" | b"logical_processors_available" | b"logical_processors_online" => {
+            ((cpus() << 3) as u64) | TAG_SMALL
+        }
         b"schedulers" | b"schedulers_online" => {
             let n = ctx.global.n_scheds as u64;
             ((n << 3) as u64) | TAG_SMALL
@@ -480,7 +484,13 @@ pub extern "C" fn mana_rt_system_info(ctx: *mut ProcCtx, item: u64) -> u64 {
         // The system_counts of telemetry_poller. The counts are real where
         // they are cheap. The BEAM-only limits are plausible constants.
         b"process_count" => {
-            let n = ctx.global.procs.read().iter().filter(|s| s.is_some()).count() as u64;
+            let n = ctx
+                .global
+                .procs
+                .read()
+                .iter()
+                .filter(|s| s.is_some())
+                .count() as u64;
             ((n << 3) as u64) | TAG_SMALL
         }
         b"atom_count" => ((interned_atom_count() << 3) as u64) | TAG_SMALL,

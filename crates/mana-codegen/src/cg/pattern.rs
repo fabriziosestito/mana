@@ -41,12 +41,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let e = call_result(call)?.into_int_value();
                 let ok = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::NE,
-                        e,
-                        self.i64t.const_zero(),
-                        "bigpat.ok",
-                    )
+                    .build_int_compare(IntPredicate::NE, e, self.i64t.const_zero(), "bigpat.ok")
                     .map_err(be)?;
                 self.branch_test(f, ok, fail)
             }
@@ -55,22 +50,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .builder
                     .build_call(
                         self.rt_tt_i64("mana_rt_float_pat"),
-                        &[
-                            val.into(),
-                            self.i64t.const_int(x.to_bits(), false).into(),
-                        ],
+                        &[val.into(), self.i64t.const_int(x.to_bits(), false).into()],
                         "fpat",
                     )
                     .map_err(be)?;
                 let ok = call_result(call)?.into_int_value();
                 let ok = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::NE,
-                        ok,
-                        self.i64t.const_zero(),
-                        "fpat.ok",
-                    )
+                    .build_int_compare(IntPredicate::NE, ok, self.i64t.const_zero(), "fpat.ok")
                     .map_err(be)?;
                 self.branch_test(f, ok, fail)
             }
@@ -102,10 +89,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     // Immediate literal keys (atoms, small integers, nil) are
                     // equal only to bit-identical terms. The code scans the
                     // key words inline, with no runtime call.
-                    let immediate_key = matches!(
-                        k,
-                        Expr::Lit(Literal::Atom(_) | Literal::Nil)
-                    ) || matches!(k, Expr::Lit(Literal::Int(v)) if v.unsigned_abs() < (1 << 60));
+                    let immediate_key = matches!(k, Expr::Lit(Literal::Atom(_) | Literal::Nil))
+                        || matches!(k, Expr::Lit(Literal::Int(v)) if v.unsigned_abs() < (1 << 60));
                     let v = if immediate_key {
                         let key = self.compile_value(f, k, scope)?;
                         self.inline_map_get(f, subject, key, fail)?
@@ -143,12 +128,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let tag = self.tag_of(val)?;
                 let is_boxed = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::EQ,
-                        tag,
-                        self.i64t.const_zero(),
-                        "is.boxed",
-                    )
+                    .build_int_compare(IntPredicate::EQ, tag, self.i64t.const_zero(), "is.boxed")
                     .map_err(be)?;
                 self.branch_test(f, is_boxed, fail)?;
                 let p = self
@@ -208,11 +188,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         let subject = self.reload(s)?;
                         let addr = self
                             .builder
-                            .build_and(
-                                subject,
-                                self.i64t.const_int(!TAG_MASK, false),
-                                "cons.addr",
-                            )
+                            .build_and(subject, self.i64t.const_int(!TAG_MASK, false), "cons.addr")
                             .map_err(be)?;
                         self.builder
                             .build_int_to_ptr(addr, self.ptrt, "cons.ptr")
@@ -229,7 +205,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// If the sub-matches of this pattern contain a GC point, this function
     /// spills the subject to a frame slot. The caller can then derive the
     /// pointers again after each sub-match.
-    pub(crate) fn pattern_subject_slot(&self, pat: &Pattern, val: IntValue<'ctx>) -> CgResult<Option<u64>> {
+    pub(crate) fn pattern_subject_slot(
+        &self,
+        pat: &Pattern,
+        val: IntValue<'ctx>,
+    ) -> CgResult<Option<u64>> {
         if !pattern_may_gc(pat) {
             return Ok(None);
         }
@@ -271,9 +251,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let const_total_bits: u64 = specs
             .iter()
             .map(|s| match s.kind {
-                SegKind::Int { size: SegSize::Bytes(n) }
-                | SegKind::Bin { size: SegSize::Bytes(n) } => 8 * n,
-                SegKind::Int { size: SegSize::Bits(b) } => b,
+                SegKind::Int {
+                    size: SegSize::Bytes(n),
+                }
+                | SegKind::Bin {
+                    size: SegSize::Bytes(n),
+                } => 8 * n,
+                SegKind::Int {
+                    size: SegSize::Bits(b),
+                } => b,
                 _ => 0,
             })
             .sum();
@@ -306,12 +292,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .map_err(be)?;
             let is_bin = s
                 .builder
-                .build_int_compare(
-                    IntPredicate::EQ,
-                    k2,
-                    s.i64t.const_int(13, false),
-                    "bl.bin",
-                )
+                .build_int_compare(IntPredicate::EQ, k2, s.i64t.const_int(13, false), "bl.bin")
                 .map_err(be)?;
             let len = s
                 .builder
@@ -321,7 +302,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let lok = s
                 .builder
                 .build_int_compare(
-                    if at_least { IntPredicate::UGE } else { IntPredicate::EQ },
+                    if at_least {
+                        IntPredicate::UGE
+                    } else {
+                        IntPredicate::EQ
+                    },
                     len,
                     want,
                     "bl.ok",
@@ -342,11 +327,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         for (spec, seg) in specs.iter().zip(segs) {
             if prefix_static
                 && static_bits % 8 != 0
-                && !matches!(spec.kind, SegKind::Int { size: SegSize::Bits(_) })
+                && !matches!(
+                    spec.kind,
+                    SegKind::Int {
+                        size: SegSize::Bits(_)
+                    }
+                )
             {
-                return Err(
-                    "TODO(bitstring): byte segment at a sub-byte offset".into()
-                );
+                return Err("TODO(bitstring): byte segment at a sub-byte offset".into());
             }
             let subject = match slot {
                 Some(s) => self.reload(s)?,
@@ -360,8 +348,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         // in Code.Identifier.escape and similar functions.
                         if !prefix_static {
                             return Err(
-                                "TODO(bitstring): sub-byte segment after dynamic prefix"
-                                    .into(),
+                                "TODO(bitstring): sub-byte segment after dynamic prefix".into()
                             );
                         }
                         let s = *s;
@@ -395,11 +382,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                 .map_err(be)?;
                             let shifted = self
                                 .builder
-                                .build_left_shift(
-                                    acc,
-                                    self.i64t.const_int(8, false),
-                                    "bb.sh",
-                                )
+                                .build_left_shift(acc, self.i64t.const_int(8, false), "bb.sh")
                                 .map_err(be)?;
                             acc = self.builder.build_or(shifted, w, "bb.acc").map_err(be)?;
                         }
@@ -416,11 +399,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             .map_err(be)?;
                         let masked = self
                             .builder
-                            .build_and(
-                                down,
-                                self.i64t.const_int((1u64 << s) - 1, false),
-                                "bb.msk",
-                            )
+                            .build_and(down, self.i64t.const_int((1u64 << s) - 1, false), "bb.msk")
                             .map_err(be)?;
                         let v = self.retag_int(masked)?;
                         self.match_pattern(f, v, &seg.value, scope, fail)?;
@@ -434,8 +413,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     // Constant integer sub-patterns with constant sizes
                     // compare as bytes. This covers the wide folded literals
                     // from erlc.
-                    if let (SegSize::Bytes(n), Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_)))) =
-                        (size, seg.value.as_ref())
+                    if let (
+                        SegSize::Bytes(n),
+                        Pattern::Lit(l @ (Literal::Int(_) | Literal::Big(_))),
+                    ) = (size, seg.value.as_ref())
                     {
                         if let Some(bytes) =
                             seg_const_bytes(&Expr::Lit(l.clone()), *n, spec.little)?
@@ -545,7 +526,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         }
                     }
                     if matches!(size, SegSize::Bytes(n) if *n > 8) {
-                        return Err("TODO(bignum-segments): binding integer segments over 64 bits".into());
+                        return Err(
+                            "TODO(bignum-segments): binding integer segments over 64 bits".into(),
+                        );
                     }
                     // A 1-byte unsigned read under a preflighted length is an
                     // inline load. This is the string-walk shape
@@ -612,7 +595,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         self.branch_test(f, ok, fail)?;
                     }
                     self.match_pattern(f, v, &seg.value, scope, fail)?;
-                    off = self.builder.build_int_add(off, nbytes, "boff").map_err(be)?;
+                    off = self
+                        .builder
+                        .build_int_add(off, nbytes, "boff")
+                        .map_err(be)?;
                 }
                 SegKind::Bin { size } => {
                     // `rest::binary` after a static prefix is the string-walk
@@ -635,11 +621,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             .into_int_value();
                         let total = self
                             .builder
-                            .build_right_shift(header, self.i64t.const_int(8, false), false, "brv.tot")
+                            .build_right_shift(
+                                header,
+                                self.i64t.const_int(8, false),
+                                false,
+                                "brv.tot",
+                            )
                             .map_err(be)?;
-                        let len = self.builder.build_int_sub(total, off, "brv.len").map_err(be)?;
+                        let len = self
+                            .builder
+                            .build_int_sub(total, off, "brv.len")
+                            .map_err(be)?;
                         let (parent, poff) = self.bin_parent_off(f, subject)?;
-                        let abs = self.builder.build_int_add(poff, off, "brv.abs").map_err(be)?;
+                        let abs = self
+                            .builder
+                            .build_int_add(poff, off, "brv.abs")
+                            .map_err(be)?;
                         let hdr = self
                             .builder
                             .build_or(
@@ -710,12 +707,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     let raw = call_result(call)?.into_int_value();
                     let ok = self
                         .builder
-                        .build_int_compare(
-                            IntPredicate::SGE,
-                            raw,
-                            self.i64t.const_zero(),
-                            "bru.ok",
-                        )
+                        .build_int_compare(IntPredicate::SGE, raw, self.i64t.const_zero(), "bru.ok")
                         .map_err(be)?;
                     self.branch_test(f, ok, fail)?;
                     let cp = self
@@ -732,8 +724,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
             }
             match &spec.kind {
-                SegKind::Int { size: SegSize::Bytes(n) }
-                | SegKind::Bin { size: SegSize::Bytes(n) } => static_bits += 8 * n,
+                SegKind::Int {
+                    size: SegSize::Bytes(n),
+                }
+                | SegKind::Bin {
+                    size: SegSize::Bytes(n),
+                } => static_bits += 8 * n,
                 _ => prefix_static = false,
             }
         }
@@ -819,14 +815,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .map_err(be)?;
                 let nonneg = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::SGE,
-                        bits,
-                        self.i64t.const_zero(),
-                        "sz.nn",
-                    )
+                    .build_int_compare(IntPredicate::SGE, bits, self.i64t.const_zero(), "sz.nn")
                     .map_err(be)?;
-                let ok = self.builder.build_and(aligned, nonneg, "sz.ok").map_err(be)?;
+                let ok = self
+                    .builder
+                    .build_and(aligned, nonneg, "sz.ok")
+                    .map_err(be)?;
                 match fail {
                     Some(fail) => self.branch_test(f, ok, fail)?,
                     None => self.guard_badarg(f, ok)?,

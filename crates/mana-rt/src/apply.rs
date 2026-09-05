@@ -64,7 +64,10 @@ pub(crate) fn exports() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), Expor
                 if m != 0 && f != 0 {
                     map.insert(
                         (m | TAG_ATOM, f | TAG_ATOM, a),
-                        Export { c_code: c_code as usize, fun_code: fun_code as usize },
+                        Export {
+                            c_code: c_code as usize,
+                            fun_code: fun_code as usize,
+                        },
                     );
                 }
             }
@@ -84,11 +87,24 @@ pub(crate) fn export_table() -> &'static rustc_hash::FxHashMap<(u64, u64, u64), 
 extern "C" {
     /// Codegen emits this C-ABI trampoline in the entry module. It forwards
     /// the uniform argument words into a `tailcc` fun body.
-    fn mana_call_fun(ctx: *mut ProcCtx, x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, code: usize) -> u64;
+    fn mana_call_fun(
+        ctx: *mut ProcCtx,
+        x0: u64,
+        x1: u64,
+        x2: u64,
+        x3: u64,
+        x4: u64,
+        code: usize,
+    ) -> u64;
 }
 
 /// Calls the code of a fun object (uniform tailcc ABI) with `argv ++ [fun]`.
-pub(crate) unsafe fn call_fun_code(ctx: *mut ProcCtx, code: usize, argv: &[u64], fun_term: u64) -> u64 {
+pub(crate) unsafe fn call_fun_code(
+    ctx: *mut ProcCtx,
+    code: usize,
+    argv: &[u64],
+    fun_term: u64,
+) -> u64 {
     let n = argv.len() + 1; // The extra word is the trailing closure.
     let mut x = [0u64; ABI_REGS];
     if n <= ABI_REGS {
@@ -99,8 +115,15 @@ pub(crate) unsafe fn call_fun_code(ctx: *mut ProcCtx, code: usize, argv: &[u64],
         // closure, go to the spill area.
         x[..ABI_REGS - 1].copy_from_slice(&argv[..ABI_REGS - 1]);
         let spill = unsafe { (*ctx).argv_spill };
-        let rest: Vec<u64> = argv[ABI_REGS - 1..].iter().copied().chain(std::iter::once(fun_term)).collect();
-        assert!(rest.len() <= ARGV_SPILL_WORDS, "fun arity exceeds the argument spill");
+        let rest: Vec<u64> = argv[ABI_REGS - 1..]
+            .iter()
+            .copied()
+            .chain(std::iter::once(fun_term))
+            .collect();
+        assert!(
+            rest.len() <= ARGV_SPILL_WORDS,
+            "fun arity exceeds the argument spill"
+        );
         for (i, v) in rest.iter().enumerate() {
             unsafe { *spill.add(i) = *v };
         }
@@ -126,22 +149,67 @@ pub(crate) unsafe fn call_dynamic(
     let r = match (a.len(), fun_term != 0) {
         (0, false) => std::mem::transmute::<usize, extern "C" fn(C) -> u64>(code)(ctx),
         (1, false) => std::mem::transmute::<usize, extern "C" fn(C, u64) -> u64>(code)(ctx, a[0]),
-        (2, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64) -> u64>(code)(ctx, a[0], a[1]),
-        (3, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2]),
-        (4, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3]),
-        (5, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4]),
-        (6, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5]),
-        (7, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6]),
-        (8, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]),
-        (0, true) => std::mem::transmute::<usize, extern "C" fn(C, u64) -> u64>(code)(ctx, fun_term),
-        (1, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64) -> u64>(code)(ctx, a[0], fun_term),
-        (2, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], fun_term),
-        (3, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], fun_term),
-        (4, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], fun_term),
-        (5, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], fun_term),
-        (6, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], fun_term),
-        (7, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], fun_term),
-        (8, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64>(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], fun_term),
+        (2, false) => {
+            std::mem::transmute::<usize, extern "C" fn(C, u64, u64) -> u64>(code)(ctx, a[0], a[1])
+        }
+        (3, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64) -> u64>(code)(
+            ctx, a[0], a[1], a[2],
+        ),
+        (4, false) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64) -> u64>(
+            code,
+        )(ctx, a[0], a[1], a[2], a[3]),
+        (5, false) => {
+            std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64) -> u64>(code)(
+                ctx, a[0], a[1], a[2], a[3], a[4],
+            )
+        }
+        (6, false) => std::mem::transmute::<
+            usize,
+            extern "C" fn(C, u64, u64, u64, u64, u64, u64) -> u64,
+        >(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        (7, false) => std::mem::transmute::<
+            usize,
+            extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64) -> u64,
+        >(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6]),
+        (8, false) => std::mem::transmute::<
+            usize,
+            extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64) -> u64,
+        >(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]),
+        (0, true) => {
+            std::mem::transmute::<usize, extern "C" fn(C, u64) -> u64>(code)(ctx, fun_term)
+        }
+        (1, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64) -> u64>(code)(
+            ctx, a[0], fun_term,
+        ),
+        (2, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64) -> u64>(code)(
+            ctx, a[0], a[1], fun_term,
+        ),
+        (3, true) => std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64) -> u64>(
+            code,
+        )(ctx, a[0], a[1], a[2], fun_term),
+        (4, true) => {
+            std::mem::transmute::<usize, extern "C" fn(C, u64, u64, u64, u64, u64) -> u64>(code)(
+                ctx, a[0], a[1], a[2], a[3], fun_term,
+            )
+        }
+        (5, true) => std::mem::transmute::<
+            usize,
+            extern "C" fn(C, u64, u64, u64, u64, u64, u64) -> u64,
+        >(code)(ctx, a[0], a[1], a[2], a[3], a[4], fun_term),
+        (6, true) => std::mem::transmute::<
+            usize,
+            extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64) -> u64,
+        >(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], fun_term),
+        (7, true) => std::mem::transmute::<
+            usize,
+            extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64) -> u64,
+        >(code)(ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], fun_term),
+        (8, true) => std::mem::transmute::<
+            usize,
+            extern "C" fn(C, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64,
+        >(code)(
+            ctx, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], fun_term,
+        ),
         _ => return None,
     };
     Some(r)
@@ -537,17 +605,20 @@ pub extern "C" fn mana_rt_make_fun(ctx: *mut ProcCtx, m: u64, f: u64, arity: u64
         return raise_badarg(ctx);
     }
     let a = (arity as i64 >> 3) as u64;
-    let code = exports().get(&(m, f, a)).map(|e| e.fun_code).unwrap_or_else(|| {
-        if std::env::var_os("MANA_DEBUG_UNDEF").is_some() {
-            eprintln!(
-                "mana: make_fun miss {}:{}/{}",
-                String::from_utf8_lossy(atom_bytes(m)),
-                String::from_utf8_lossy(atom_bytes(f)),
-                a
-            );
-        }
-        make_fun_undef_code()
-    });
+    let code = exports()
+        .get(&(m, f, a))
+        .map(|e| e.fun_code)
+        .unwrap_or_else(|| {
+            if std::env::var_os("MANA_DEBUG_UNDEF").is_some() {
+                eprintln!(
+                    "mana: make_fun miss {}:{}/{}",
+                    String::from_utf8_lossy(atom_bytes(m)),
+                    String::from_utf8_lossy(atom_bytes(f)),
+                    a
+                );
+            }
+            make_fun_undef_code()
+        });
     let p = alloc_nursery(ctx, 2);
     unsafe {
         *p = (a << 8) | KIND_FUN; // The fun has zero captures.

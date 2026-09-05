@@ -12,11 +12,31 @@ use crate::*;
 /// driver reads this list with `manac --print-bif-modules`. The list is the
 /// single source of truth for the closure BFS of the driver.
 pub const BIF_MODULES: &[&str] = &[
-    "erlang", "maps", "io", "unicode", "persistent_term", "code", "io_lib",
-    "logger", "ets", "application", "file", "prim_file", "math", "re", "timer",
-    "gen_tcp", "inet", "crypto",
-    "erts_internal", "zlib",
-    "elixir_erl", "erl_eval", "beam_lib", "global", "global_group",
+    "erlang",
+    "maps",
+    "io",
+    "unicode",
+    "persistent_term",
+    "code",
+    "io_lib",
+    "logger",
+    "ets",
+    "application",
+    "file",
+    "prim_file",
+    "math",
+    "re",
+    "timer",
+    "gen_tcp",
+    "inet",
+    "crypto",
+    "erts_internal",
+    "zlib",
+    "elixir_erl",
+    "erl_eval",
+    "beam_lib",
+    "global",
+    "global_group",
     "net_kernel",
 ];
 
@@ -60,7 +80,9 @@ pub fn set_native_manifest(m: NativeManifest) {
 }
 
 pub(crate) fn is_native_module(m: &str) -> bool {
-    NATIVE_MODULES.get().is_some_and(|nm| nm.modules.contains(m))
+    NATIVE_MODULES
+        .get()
+        .is_some_and(|nm| nm.modules.contains(m))
 }
 
 pub(crate) fn native_fn(module: &str, name: &str, arity: usize) -> Option<&'static NativeFn> {
@@ -304,7 +326,10 @@ pub(crate) fn reachable_funs(
                 if pf == "module_info" {
                     continue;
                 }
-                let exn = FunName { name: pf, arity: pa };
+                let exn = FunName {
+                    name: pf,
+                    arity: pa,
+                };
                 for a in &mentioned {
                     let m = mod_by_name[a.as_str()];
                     if m.exports.contains(&exn)
@@ -397,7 +422,10 @@ pub(crate) fn reachable_funs(
         }
     }
     for m in &missing_dyn {
-        eprintln!("manac: note: dynamic module candidate '{}' is not compiled", m);
+        eprintln!(
+            "manac: note: dynamic module candidate '{}' is not compiled",
+            m
+        );
     }
     let missing_set: HashSet<String> = missing_modules.keys().cloned().collect();
     if std::env::var("MANA_DEBUG_SEED").is_ok() {
@@ -420,9 +448,7 @@ pub(crate) fn reachable_funs(
 pub(crate) fn collect_atom_arg_pairs(e: &Expr, out: &mut Vec<(String, String)>) {
     fn scan_args(args: &[Expr], out: &mut Vec<(String, String)>) {
         for w in args.windows(2) {
-            if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) =
-                (&w[0], &w[1])
-            {
+            if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) = (&w[0], &w[1]) {
                 out.push((m.clone(), fa.clone()));
             }
         }
@@ -467,7 +493,9 @@ pub(crate) fn collect_atom_arg_pairs(e: &Expr, out: &mut Vec<(String, String)>) 
                 collect_atom_arg_pairs(&c.body, out);
             }
         }
-        Expr::Try { arg, body, handler, .. } => {
+        Expr::Try {
+            arg, body, handler, ..
+        } => {
             collect_atom_arg_pairs(arg, out);
             collect_atom_arg_pairs(body, out);
             collect_atom_arg_pairs(handler, out);
@@ -501,7 +529,11 @@ pub(crate) fn collect_dyn_names(
     any_names: &mut HashSet<String>,
 ) {
     match e {
-        Expr::CallDyn { module: _, name, args } => {
+        Expr::CallDyn {
+            module: _,
+            name,
+            args,
+        } => {
             match name.as_ref() {
                 Expr::Lit(Literal::Atom(a)) => {
                     pairs.insert((a.clone(), args.len()));
@@ -560,7 +592,9 @@ pub(crate) fn collect_dyn_names(
                     pairs.insert(("child_spec".to_string(), 1));
                 }
             }
-            items.iter().for_each(|i| collect_dyn_names(i, pairs, dyn_any, heads, any_names))
+            items
+                .iter()
+                .for_each(|i| collect_dyn_names(i, pairs, dyn_any, heads, any_names))
         }
         Expr::Cons(h, t) => {
             collect_dyn_names(h, pairs, dyn_any, heads, any_names);
@@ -576,9 +610,9 @@ pub(crate) fn collect_dyn_names(
                 .for_each(|(_, f)| collect_dyn_names(&f.body, pairs, dyn_any, heads, any_names));
             collect_dyn_names(body, pairs, dyn_any, heads, any_names);
         }
-        Expr::Apply { args, .. } | Expr::PrimOp { args, .. } => {
-            args.iter().for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads, any_names))
-        }
+        Expr::Apply { args, .. } | Expr::PrimOp { args, .. } => args
+            .iter()
+            .for_each(|a| collect_dyn_names(a, pairs, dyn_any, heads, any_names)),
         Expr::Case { arg, clauses } => {
             collect_dyn_names(arg, pairs, dyn_any, heads, any_names);
             for c in clauses {
@@ -586,7 +620,9 @@ pub(crate) fn collect_dyn_names(
                 collect_dyn_names(&c.body, pairs, dyn_any, heads, any_names);
             }
         }
-        Expr::Try { arg, body, handler, .. } => {
+        Expr::Try {
+            arg, body, handler, ..
+        } => {
             collect_dyn_names(arg, pairs, dyn_any, heads, any_names);
             collect_dyn_names(body, pairs, dyn_any, heads, any_names);
             collect_dyn_names(handler, pairs, dyn_any, heads, any_names);
@@ -671,7 +707,9 @@ pub(crate) fn collect_atoms(e: &Expr, out: &mut BTreeSet<String>) {
                 collect_atoms(&c.body, out);
             }
         }
-        Expr::Try { arg, body, handler, .. } => {
+        Expr::Try {
+            arg, body, handler, ..
+        } => {
             collect_atoms(arg, out);
             collect_atoms(body, out);
             collect_atoms(handler, out);
@@ -769,12 +807,14 @@ pub(crate) fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut Ha
                 _ => None,
             };
             if let Some((m, fa, alist)) = mfa_args {
-                if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) = (m, fa)
-                {
+                if let (Expr::Lit(Literal::Atom(m)), Expr::Lit(Literal::Atom(fa))) = (m, fa) {
                     match static_list_len(alist) {
                         Some(n) => out.push(Edge::Remote(
                             m.clone(),
-                            FunName { name: fa.clone(), arity: n },
+                            FunName {
+                                name: fa.clone(),
+                                arity: n,
+                            },
                         )),
                         None => out.push(Edge::RemoteAnyArity(m.clone(), fa.clone())),
                     }
@@ -786,7 +826,10 @@ pub(crate) fn collect_edges(e: &Expr, out: &mut Vec<Edge>, letrec_bound: &mut Ha
         Expr::CallDyn { module, name, args } => {
             out.push(Edge::Remote(
                 "erlang".into(),
-                FunName { name: "apply".into(), arity: 3 },
+                FunName {
+                    name: "apply".into(),
+                    arity: 3,
+                },
             ));
             collect_edges(module, out, letrec_bound);
             collect_edges(name, out, letrec_bound);

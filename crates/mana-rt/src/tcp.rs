@@ -50,7 +50,10 @@ pub(crate) struct TcpOpts {
 }
 
 pub(crate) fn parse_tcp_opts(mut cur: u64) -> Result<TcpOpts, ()> {
-    let mut o = TcpOpts { binary: false, active: ActiveMode::Always };
+    let mut o = TcpOpts {
+        binary: false,
+        active: ActiveMode::Always,
+    };
     while cur & TAG_MASK == TAG_CONS {
         let p = (cur & !TAG_MASK) as *const u64;
         let h = unsafe { *p };
@@ -154,7 +157,9 @@ pub(crate) fn timeout_deadline(t: u64) -> Result<Option<std::time::Instant>, ()>
     }
     if t & TAG_MASK == TAG_SMALL && (t as i64 >> 3) >= 0 {
         let ms = (t as i64 >> 3) as u64;
-        return Ok(Some(std::time::Instant::now() + std::time::Duration::from_millis(ms)));
+        return Ok(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(ms),
+        ));
     }
     Err(())
 }
@@ -259,8 +264,12 @@ pub extern "C" fn mana_rt_sendfile(
 ) -> u64 {
     use std::os::unix::fs::FileExt;
     let ctx = unsafe { &mut *ctx };
-    let Some(fidx) = file_resolve(fd_t) else { return raise_badarg(ctx) };
-    let Some(sidx) = sock_resolve(sock) else { return raise_badarg(ctx) };
+    let Some(fidx) = file_resolve(fd_t) else {
+        return raise_badarg(ctx);
+    };
+    let Some(sidx) = sock_resolve(sock) else {
+        return raise_badarg(ctx);
+    };
     if off_t & TAG_MASK != TAG_SMALL
         || len_t & TAG_MASK != TAG_SMALL
         || (off_t as i64 >> 3) < 0
@@ -401,26 +410,25 @@ pub(crate) fn addr_tuple(ctx: &mut ProcCtx, addr: std::net::SocketAddr) -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn mana_rt_tcp(
-    ctx: *mut ProcCtx,
-    op: u64,
-    a: u64,
-    b: u64,
-    c: u64,
-    d: u64,
-) -> u64 {
+pub extern "C" fn mana_rt_tcp(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
     use std::io::{Read, Write};
     let ctx = unsafe { &mut *ctx };
     match op {
         T_CONNECT => {
             // Arguments: a is addr, b is port, c is opts, d is timeout.
-            let Ok(ip) = ip_of(a) else { return raise_badarg(ctx) };
+            let Ok(ip) = ip_of(a) else {
+                return raise_badarg(ctx);
+            };
             if b & TAG_MASK != TAG_SMALL {
                 return raise_badarg(ctx);
             }
             let port = (b as i64 >> 3) as u16;
-            let Ok(opts) = parse_tcp_opts(c) else { return raise_badarg(ctx) };
-            let Ok(deadline) = timeout_deadline(d) else { return raise_badarg(ctx) };
+            let Ok(opts) = parse_tcp_opts(c) else {
+                return raise_badarg(ctx);
+            };
+            let Ok(deadline) = timeout_deadline(d) else {
+                return raise_badarg(ctx);
+            };
             let addr = std::net::SocketAddr::new(ip, port);
             let stream = match mio::net::TcpStream::connect(addr) {
                 Ok(s) => s,
@@ -442,8 +450,7 @@ pub extern "C" fn mana_rt_tcp(
             loop {
                 {
                     let mut tab = SOCKETS.lock().unwrap();
-                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
-                    else {
+                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
                         drop(tab);
                         return closed_err(ctx);
                     };
@@ -480,11 +487,8 @@ pub extern "C" fn mana_rt_tcp(
                             }
                         }
                         Err(_) => {
-                            let e = s
-                                .take_error()
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| {
+                            let e =
+                                s.take_error().ok().flatten().unwrap_or_else(|| {
                                     std::io::Error::from(std::io::ErrorKind::Other)
                                 });
                             tab.slots[idx] = None;
@@ -517,7 +521,9 @@ pub extern "C" fn mana_rt_tcp(
                 return raise_badarg(ctx);
             }
             let port = (a as i64 >> 3) as u16;
-            let Ok(opts) = parse_tcp_opts(b) else { return raise_badarg(ctx) };
+            let Ok(opts) = parse_tcp_opts(b) else {
+                return raise_badarg(ctx);
+            };
             let addr = std::net::SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                 port,
@@ -544,17 +550,23 @@ pub extern "C" fn mana_rt_tcp(
         }
         T_ACCEPT => {
             // Arguments: a is lsock, b is timeout.
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
-            let Ok(deadline) = timeout_deadline(b) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
+            let Ok(deadline) = timeout_deadline(b) else {
+                return raise_badarg(ctx);
+            };
             loop {
                 let accepted = {
                     let mut tab = SOCKETS.lock().unwrap();
-                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
-                    else {
+                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
                         drop(tab);
                         return closed_err(ctx);
                     };
-                    let opts = TcpOpts { binary: entry.binary, active: entry.active };
+                    let opts = TcpOpts {
+                        binary: entry.binary,
+                        active: entry.active,
+                    };
                     let SockSource::Listener(l) = &mut entry.source else {
                         drop(tab);
                         return raise_badarg(ctx);
@@ -601,12 +613,16 @@ pub extern "C" fn mana_rt_tcp(
         }
         T_RECV => {
             // Arguments: a is sock, b is len, c is timeout.
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             if b & TAG_MASK != TAG_SMALL || (b as i64 >> 3) < 0 {
                 return raise_badarg(ctx);
             }
             let want = (b as i64 >> 3) as usize;
-            let Ok(deadline) = timeout_deadline(c) else { return raise_badarg(ctx) };
+            let Ok(deadline) = timeout_deadline(c) else {
+                return raise_badarg(ctx);
+            };
             loop {
                 enum Step {
                     Done(Vec<u8>, bool),
@@ -616,8 +632,7 @@ pub extern "C" fn mana_rt_tcp(
                 }
                 let step = {
                     let mut tab = SOCKETS.lock().unwrap();
-                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
-                    else {
+                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
                         drop(tab);
                         return closed_err(ctx);
                     };
@@ -644,14 +659,9 @@ pub extern "C" fn mana_rt_tcp(
                             Ok(0) => Step::Closed(binary),
                             Ok(_) => {
                                 if want == 0 || entry.rbuf.len() >= want {
-                                    let take = if want == 0 {
-                                        entry.rbuf.len()
-                                    } else {
-                                        want
-                                    };
+                                    let take = if want == 0 { entry.rbuf.len() } else { want };
                                     let rest = entry.rbuf.split_off(take);
-                                    let data =
-                                        std::mem::replace(&mut entry.rbuf, rest);
+                                    let data = std::mem::replace(&mut entry.rbuf, rest);
                                     Step::Done(data, binary)
                                 } else {
                                     Step::Park
@@ -659,8 +669,7 @@ pub extern "C" fn mana_rt_tcp(
                             }
                             Err(e)
                                 if e.kind() == std::io::ErrorKind::WouldBlock
-                                    || e.kind()
-                                        == std::io::ErrorKind::Interrupted =>
+                                    || e.kind() == std::io::ErrorKind::Interrupted =>
                             {
                                 Step::Park
                             }
@@ -696,7 +705,9 @@ pub extern "C" fn mana_rt_tcp(
         }
         T_SEND => {
             // Arguments: a is sock, b is iodata.
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             let mut data = Vec::new();
             if iolist_flatten(b, &mut data).is_err() {
                 return raise_badarg(ctx);
@@ -705,8 +716,7 @@ pub extern "C" fn mana_rt_tcp(
             loop {
                 let step: Result<Option<usize>, std::io::Error> = {
                     let mut tab = SOCKETS.lock().unwrap();
-                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
-                    else {
+                    let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
                         drop(tab);
                         return closed_err(ctx);
                     };
@@ -752,7 +762,9 @@ pub extern "C" fn mana_rt_tcp(
             }
         }
         T_CLOSE => {
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             let entry = {
                 let mut tab = SOCKETS.lock().unwrap();
                 let e = tab.slots.get_mut(idx).and_then(|s| s.take());
@@ -778,7 +790,9 @@ pub extern "C" fn mana_rt_tcp(
             atom_intern(b"ok")
         }
         T_SHUTDOWN => {
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             let how = if b & TAG_MASK == TAG_ATOM {
                 match atom_bytes(b) {
                     b"read" => std::net::Shutdown::Read,
@@ -806,8 +820,12 @@ pub extern "C" fn mana_rt_tcp(
             }
         }
         T_SETOPTS => {
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
-            let Ok(opts) = parse_tcp_opts(b) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
+            let Ok(opts) = parse_tcp_opts(b) else {
+                return raise_badarg(ctx);
+            };
             let has_mode_opt = |mut cur: u64, name: &[u8]| -> bool {
                 while cur & TAG_MASK == TAG_CONS {
                     let p = (cur & !TAG_MASK) as *const u64;
@@ -861,7 +879,9 @@ pub extern "C" fn mana_rt_tcp(
             atom_intern(b"ok")
         }
         T_CONTROLLING => {
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             if b & 0xF != PID_TAG4 {
                 return raise_badarg(ctx);
             }
@@ -875,11 +895,12 @@ pub extern "C" fn mana_rt_tcp(
             atom_intern(b"ok")
         }
         T_PEERNAME | T_SOCKNAME | T_PORT => {
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             let addr = {
                 let mut tab = SOCKETS.lock().unwrap();
-                let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut())
-                else {
+                let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
                     drop(tab);
                     return closed_err(ctx);
                 };
@@ -907,7 +928,9 @@ pub extern "C" fn mana_rt_tcp(
             }
         }
         T_GETSTAT => {
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             let (recv_oct, send_oct) = {
                 let tab = SOCKETS.lock().unwrap();
                 let Some(entry) = tab.slots.get(idx).and_then(|s| s.as_ref()) else {
@@ -950,7 +973,9 @@ pub extern "C" fn mana_rt_tcp(
             pair_term(ctx, b"ok", list)
         }
         T_GETOPTS => {
-            let Some(idx) = sock_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = sock_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             let (active, binary) = {
                 let tab = SOCKETS.lock().unwrap();
                 let Some(entry) = tab.slots.get(idx).and_then(|s| s.as_ref()) else {
@@ -998,7 +1023,7 @@ pub extern "C" fn mana_rt_tcp(
                         }
                     }
                     b"packet" => TAG_SMALL, // The small integer 0.
-                    _ => known().true_a, // nodelay, keepalive, and reuseaddr always report true.
+                    _ => known().true_a,    // nodelay, keepalive, and reuseaddr always report true.
                 };
                 let t = alloc_nursery(ctx, 3);
                 unsafe {

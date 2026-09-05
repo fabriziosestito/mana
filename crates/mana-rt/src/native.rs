@@ -22,11 +22,7 @@ pub extern "C" fn mana_rt_native_alloc(ctx: *mut ProcCtx, words: u64) -> *mut u6
 /// Builds a binary term from raw bytes. The function copies the bytes. The
 /// source is not a term, so the caller does not need to root it.
 #[no_mangle]
-pub extern "C" fn mana_rt_native_make_binary(
-    ctx: *mut ProcCtx,
-    ptr: *const u8,
-    len: usize,
-) -> u64 {
+pub extern "C" fn mana_rt_native_make_binary(ctx: *mut ProcCtx, ptr: *const u8, len: usize) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     bytes_to_new_bin(ctx, bytes)

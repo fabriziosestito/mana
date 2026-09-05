@@ -68,10 +68,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// because forward_major leaves boxed terms that are not on the heap
     /// unchanged.
     pub(crate) fn static_binary(&self, bytes: &[u8]) -> CgResult<IntValue<'ctx>> {
-        let sym = format!(
-            "mana_bin.{}",
-            &blake3::hash(bytes).to_hex().as_str()[..16]
-        );
+        let sym = format!("mana_bin.{}", &blake3::hash(bytes).to_hex().as_str()[..16]);
         let g = match self.module.get_global(&sym) {
             Some(g) => g,
             None => {
@@ -106,7 +103,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// allocated that tuple each time, url_encode64 was 150x slower than BEAM.
     ///
     /// Returns None when the term is not constant.
-    pub(crate) fn const_term(&self, f: FunctionValue<'ctx>, e: &Expr) -> CgResult<Option<IntValue<'ctx>>> {
+    pub(crate) fn const_term(
+        &self,
+        f: FunctionValue<'ctx>,
+        e: &Expr,
+    ) -> CgResult<Option<IntValue<'ctx>>> {
         Ok(Some(match e {
             Expr::Lit(Literal::Int(n)) => self.small_int(*n),
             Expr::Lit(Literal::Nil) => self.nil(),
@@ -153,13 +154,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// with `tag`. The symbol key is the printed form of the words, so equal
     /// constants share a symbol within the module. The linkonce_odr linkage
     /// dedups across modules.
-    pub(crate) fn const_boxed(&self, prefix: &str, words: &[IntValue<'ctx>], tag: u64) -> IntValue<'ctx> {
+    pub(crate) fn const_boxed(
+        &self,
+        prefix: &str,
+        words: &[IntValue<'ctx>],
+        tag: u64,
+    ) -> IntValue<'ctx> {
         let key: String = words
             .iter()
             .map(|w| inkwell::values::AnyValue::print_to_string(w).to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let sym = format!("{}.{}", prefix, &blake3::hash(key.as_bytes()).to_hex().as_str()[..16]);
+        let sym = format!(
+            "{}.{}",
+            prefix,
+            &blake3::hash(key.as_bytes()).to_hex().as_str()[..16]
+        );
         let g = match self.module.get_global(&sym) {
             Some(g) => g,
             None => {

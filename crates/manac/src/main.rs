@@ -45,11 +45,7 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "-o" => {
-                output = Some(PathBuf::from(
-                    args.next().ok_or("-o requires an argument")?,
-                ))
-            }
+            "-o" => output = Some(PathBuf::from(args.next().ok_or("-o requires an argument")?)),
             "--entry" => {
                 entry_spec = Some(args.next().ok_or("--entry requires [MODULE:]FUN/ARITY")?)
             }
@@ -76,12 +72,11 @@ fn run() -> Result<(), String> {
             // For modules that belong to the application, every export stays
             // a root. Dependencies are pruned. Config atoms and template
             // names wire the application together.
-            "--seed-exports" => seed_exports
-                .push(args.next().ok_or("--seed-exports requires a module name")?),
+            "--seed-exports" => {
+                seed_exports.push(args.next().ok_or("--seed-exports requires a module name")?)
+            }
             "-h" | "--help" => {
-                println!(
-                    "usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES..."
-                );
+                println!("usage: manac [-o OUT] [--entry [MODULE:]FUN/ARITY] [--emit-ir] FILES...");
                 return Ok(());
             }
             other if other.starts_with('-') => return Err(format!("unknown flag {}", other)),
@@ -129,13 +124,14 @@ fn run() -> Result<(), String> {
                     }
                 };
                 let src = std::fs::read_to_string(&core_path).map_err(|e| {
-                    (String::new(), format!("reading {}: {}", core_path.display(), e))
+                    (
+                        String::new(),
+                        format!("reading {}: {}", core_path.display(), e),
+                    )
                 })?;
                 let source_hash = *blake3::hash(src.as_bytes()).as_bytes();
                 if !force_ast {
-                    if let Some(sum) =
-                        cache.as_ref().and_then(|c| c.get_summary(&source_hash))
-                    {
+                    if let Some(sum) = cache.as_ref().and_then(|c| c.get_summary(&source_hash)) {
                         return Ok(mana_codegen::ModuleUnit {
                             path: core_path,
                             source_hash,
@@ -275,13 +271,7 @@ fn resolve_entry(
         Some((m, f)) => (m.to_string(), f.to_string()),
         None => (default_module.to_string(), mf.to_string()),
     };
-    Ok((
-        module,
-        mana_syntax::FunName {
-            name: fun,
-            arity,
-        },
-    ))
+    Ok((module, mana_syntax::FunName { name: fun, arity }))
 }
 
 fn erl_to_core(input: &Path) -> Result<PathBuf, String> {
@@ -325,8 +315,8 @@ fn link(objs: &[PathBuf], native_objs: &[PathBuf], out: &Path) -> Result<(), Str
 /// fields: `MODULE FUN ARITY SYMBOL MAYGC MAYRAISE`. MAYGC and MAYRAISE are
 /// 0 or 1. The parser ignores blank lines and `#` comments.
 fn parse_native_manifest(path: &Path) -> Result<mana_codegen::NativeManifest, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("reading {}: {}", path.display(), e))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {}", path.display(), e))?;
     let mut m = mana_codegen::NativeManifest::default();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();

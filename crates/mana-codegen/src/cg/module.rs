@@ -58,8 +58,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     "manac: warning: {}:{}/{} stubbed (unsupported: {})",
                     self.module_name, fname.name, fname.arity, e
                 );
-                let msg =
-                    format!("{}:{}/{}: {}", self.module_name, fname.name, fname.arity, e);
+                let msg = format!("{}:{}/{}: {}", self.module_name, fname.name, fname.arity, e);
                 let fv = self.fns.borrow()[fname];
                 self.emit_unsupported_stub(fv, &msg)?;
                 loop {
@@ -96,9 +95,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
         }
         let entry = match f.get_first_basic_block() {
-            Some(first) => self
-                .ctx
-                .prepend_basic_block(first, "stub.entry"),
+            Some(first) => self.ctx.prepend_basic_block(first, "stub.entry"),
             None => self.ctx.append_basic_block(f, "entry"),
         };
         self.builder.position_at_end(entry);
@@ -258,7 +255,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ps.extend((0..nparams).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
             self.i64t.fn_type(&ps, false)
         });
-        let call = self.builder.build_call(callee, &cargs, "natbif").map_err(be)?;
+        let call = self
+            .builder
+            .build_call(callee, &cargs, "natbif")
+            .map_err(be)?;
         // raising convention: the sentinel propagates through the return value
         let v = call_result(call)?;
         self.builder.build_return(Some(&v)).map_err(be)?;
@@ -275,7 +275,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.propagate_bb.set(None);
         // Read the args first. The spill area is only valid until the next call.
         let n = fun.params.len();
-        let vals: Vec<IntValue> = (0..n).map(|i| self.param_at(f, i, n)).collect::<CgResult<_>>()?;
+        let vals: Vec<IntValue> = (0..n)
+            .map(|i| self.param_at(f, i, n))
+            .collect::<CgResult<_>>()?;
         self.setup_frame(&fun.body, &fun.params, &[])?;
         let mut scope = Scope::default();
         for (i, p) in fun.params.iter().enumerate() {
@@ -307,12 +309,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.mem_store(ctx, CTX_REDUCTIONS, dec, MemKind::Ctx)?;
         let out = self
             .builder
-            .build_int_compare(
-                IntPredicate::SLT,
-                dec,
-                self.i64t.const_zero(),
-                "red.out",
-            )
+            .build_int_compare(IntPredicate::SLT, dec, self.i64t.const_zero(), "red.out")
             .map_err(be)?;
         let yield_bb = self.ctx.append_basic_block(f, "yield");
         let cont = self.ctx.append_basic_block(f, "red.cont");
@@ -368,7 +365,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             // Read the args first, with the trailing closure. The spill area
             // is only valid until the next call.
             let n = l.params.len() + 1;
-            let vals: Vec<IntValue> = (0..n).map(|i| self.param_at(f, i, n)).collect::<CgResult<_>>()?;
+            let vals: Vec<IntValue> = (0..n)
+                .map(|i| self.param_at(f, i, n))
+                .collect::<CgResult<_>>()?;
             self.setup_frame(&l.body, &var_names, &sib_names)?;
 
             let mut scope = Scope::default();
@@ -422,12 +421,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
         params.extend((0..NREG).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
         params.push(BasicMetadataTypeEnum::PointerType(self.ptrt)); // the code pointer
-        let t = self.module.add_function("mana_call_fun", self.i64t.fn_type(&params, false), None);
+        let t = self
+            .module
+            .add_function("mana_call_fun", self.i64t.fn_type(&params, false), None);
         let bb = self.ctx.append_basic_block(t, "entry");
         self.builder.position_at_end(bb);
-        let argv: Vec<BasicMetadataValueEnum> =
-            (0..=NREG).map(|i| t.get_nth_param(i as u32).unwrap().into()).collect();
-        let code = t.get_nth_param(1 + NREG as u32).unwrap().into_pointer_value();
+        let argv: Vec<BasicMetadataValueEnum> = (0..=NREG)
+            .map(|i| t.get_nth_param(i as u32).unwrap().into())
+            .collect();
+        let code = t
+            .get_nth_param(1 + NREG as u32)
+            .unwrap()
+            .into_pointer_value();
         let call = self
             .builder
             .build_indirect_call(self.term_fn_type(0), code, &argv, "fun")
@@ -451,7 +456,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             let reason = self.atom_term("undef")?;
             self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
             self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
-            self.builder.build_return(Some(&self.sentinel())).map_err(be)?;
+            self.builder
+                .build_return(Some(&self.sentinel()))
+                .map_err(be)?;
         }
         let i32t = self.ctx.i32_type();
         let main = self
@@ -467,9 +474,26 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // The runtime builds exit and monitor messages, so it needs the
         // well-known atom terms. Atoms are compiler statics.
         let names = [
-            "normal", "killed", "kill", "EXIT", "DOWN", "process", "noproc", "true", "false",
-            "badarg", "error", "badmap", "badkey", "undef", "ok", "module", "nofile",
-            "value", "undefined", "badarith",
+            "normal",
+            "killed",
+            "kill",
+            "EXIT",
+            "DOWN",
+            "process",
+            "noproc",
+            "true",
+            "false",
+            "badarg",
+            "error",
+            "badmap",
+            "badkey",
+            "undef",
+            "ok",
+            "module",
+            "nofile",
+            "value",
+            "undefined",
+            "badarith",
         ];
         let mut atom_args: Vec<BasicMetadataValueEnum> = Vec::new();
         for n in names {

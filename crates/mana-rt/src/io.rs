@@ -234,21 +234,19 @@ pub(crate) fn format_engine(fmt: u64, args: u64) -> Result<Vec<u8>, ()> {
         while matches!(fbytes.get(j), Some(b't') | Some(b'l')) {
             j += 1;
         }
-        let pad = |out: &mut Vec<u8>, piece: Vec<u8>, width: Option<i64>| {
-            match width {
-                Some(w) => {
-                    let w_abs = w.unsigned_abs() as usize;
-                    let fill = w_abs.saturating_sub(piece.len());
-                    if w < 0 {
-                        out.extend_from_slice(&piece);
-                        out.extend(std::iter::repeat(b' ').take(fill));
-                    } else {
-                        out.extend(std::iter::repeat(b' ').take(fill));
-                        out.extend_from_slice(&piece);
-                    }
+        let pad = |out: &mut Vec<u8>, piece: Vec<u8>, width: Option<i64>| match width {
+            Some(w) => {
+                let w_abs = w.unsigned_abs() as usize;
+                let fill = w_abs.saturating_sub(piece.len());
+                if w < 0 {
+                    out.extend_from_slice(&piece);
+                    out.extend(std::iter::repeat(b' ').take(fill));
+                } else {
+                    out.extend(std::iter::repeat(b' ').take(fill));
+                    out.extend_from_slice(&piece);
                 }
-                None => out.extend_from_slice(&piece),
             }
+            None => out.extend_from_slice(&piece),
         };
         match fbytes.get(j) {
             Some(b'n') => out.push(b'\n'),
@@ -499,10 +497,9 @@ pub(crate) fn write_term(t: u64, out: &mut String) {
 /// print raw. This matches `display`, not `~p`.
 pub(crate) fn write_atom(name: &str, out: &mut String) {
     const RESERVED: &[&str] = &[
-        "after", "and", "andalso", "band", "begin", "bnot", "bor", "bsl", "bsr",
-        "bxor", "case", "catch", "cond", "div", "end", "fun", "if", "let",
-        "maybe", "not", "of", "or", "orelse", "receive", "rem", "try", "when",
-        "xor",
+        "after", "and", "andalso", "band", "begin", "bnot", "bor", "bsl", "bsr", "bxor", "case",
+        "catch", "cond", "div", "end", "fun", "if", "let", "maybe", "not", "of", "or", "orelse",
+        "receive", "rem", "try", "when", "xor",
     ];
     let plain = !name.is_empty()
         && name.as_bytes()[0].is_ascii_lowercase()

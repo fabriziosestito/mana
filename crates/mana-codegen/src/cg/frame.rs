@@ -57,7 +57,11 @@ pub(crate) fn frame_prepass(e: &Expr, vars: &mut BTreeSet<String>, nodes: &mut u
             frame_prepass(h, vars, nodes);
             frame_prepass(t, vars, nodes);
         }
-        Expr::Let { vars: vs, arg, body } => {
+        Expr::Let {
+            vars: vs,
+            arg,
+            body,
+        } => {
             vars.extend(vs.iter().cloned());
             frame_prepass(arg, vars, nodes);
             frame_prepass(body, vars, nodes);
@@ -197,12 +201,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // mark after the body is compiled.
         let len_slot = unsafe {
             self.builder
-                .build_in_bounds_gep(
-                    self.i64t,
-                    frame,
-                    &[self.i64t.const_int(1, false)],
-                    "len",
-                )
+                .build_in_bounds_gep(self.i64t, frame, &[self.i64t.const_int(1, false)], "len")
                 .map_err(be)?
         };
         let len_store = self
@@ -276,11 +275,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// Build an eternal (non-moving) 2-tuple for an exception reason.
-    pub(crate) fn eternal_pair(
-        &self,
-        tag: &str,
-        v: IntValue<'ctx>,
-    ) -> CgResult<IntValue<'ctx>> {
+    pub(crate) fn eternal_pair(&self, tag: &str, v: IntValue<'ctx>) -> CgResult<IntValue<'ctx>> {
         let call = self
             .builder
             .build_call(
@@ -298,7 +293,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let tag_atom = self.atom_term(tag)?;
         self.store_word(p, 1, tag_atom)?;
         self.store_word(p, 2, v)?;
-        self.builder.build_ptr_to_int(p, self.i64t, "reason").map_err(be)
+        self.builder
+            .build_ptr_to_int(p, self.i64t, "reason")
+            .map_err(be)
     }
 
     pub(crate) fn slot_ptr(&self, idx: u64) -> CgResult<PointerValue<'ctx>> {
@@ -335,14 +332,22 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
 
     pub(crate) fn reload(&self, idx: u64) -> CgResult<IntValue<'ctx>> {
         let p = self.slot_ptr(idx)?;
-        let v = self.builder.build_load(self.i64t, p, "reload").map_err(be)?;
+        let v = self
+            .builder
+            .build_load(self.i64t, p, "reload")
+            .map_err(be)?;
         if let Some(inst) = v.as_instruction_value() {
             let _ = inst.set_metadata(self.tbaa_frame, self.tbaa_kind);
         }
         Ok(v.into_int_value())
     }
 
-    pub(crate) fn bind_var(&self, scope: &mut Scope<'ctx>, name: &str, v: IntValue<'ctx>) -> CgResult<()> {
+    pub(crate) fn bind_var(
+        &self,
+        scope: &mut Scope<'ctx>,
+        name: &str,
+        v: IntValue<'ctx>,
+    ) -> CgResult<()> {
         if self.framed() {
             let idx = *self
                 .var_slots

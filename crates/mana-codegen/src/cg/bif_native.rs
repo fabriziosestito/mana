@@ -214,11 +214,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             // The lowering passes Level(1), WindowBits(3), and Strategy(5).
             // It drops the rest.
             ("deflateInit", 6) => None, // lowered below
-            ("deflate", 2) => Some((
-                "mana_rt_zlib_deflate",
-                2,
-                vec![self.atom_term("none")?],
-            )),
+            ("deflate", 2) => Some(("mana_rt_zlib_deflate", 2, vec![self.atom_term("none")?])),
             ("deflate", 3) => Some(("mana_rt_zlib_deflate", 3, vec![])),
             ("safeInflate", 2) => Some(("mana_rt_zlib_safe_inflate", 2, vec![])),
             ("inflateReset", 1) | ("deflateReset", 1) => Some(("mana_rt_zlib_reset", 1, vec![])),
@@ -548,7 +544,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
-            ("get_key", 2) | ("get_all_key", 1) | ("get_application", 0)
+            ("get_key", 2)
+            | ("get_all_key", 1)
+            | ("get_application", 0)
             | ("get_application", 1) => self.atom_term("undefined"),
             _ => Err(format!(
                 "unsupported BIF application:{}/{}",
@@ -700,10 +698,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 .builder
                 .build_call(
                     self.rt_fn("mana_rt_pt_info", || {
-                        self.i64t.fn_type(
-                            &[BasicMetadataTypeEnum::PointerType(self.ptrt)],
-                            false,
-                        )
+                        self.i64t
+                            .fn_type(&[BasicMetadataTypeEnum::PointerType(self.ptrt)], false)
                     }),
                     &[self.ctx_val().into()],
                     "ptinfo",
@@ -837,7 +833,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             _ => None,
         };
         let Some((op, pad_infinity)) = spec else {
-            return Err(format!("unsupported BIF {}:{}/{}", module, name, args.len()));
+            return Err(format!(
+                "unsupported BIF {}:{}/{}",
+                module,
+                name,
+                args.len()
+            ));
         };
         let argv = self.eval_siblings(f, &args.iter().collect::<Vec<_>>(), scope)?;
         let callee = self.rt_fn("mana_rt_tcp", || {
@@ -1082,9 +1083,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 )
             });
             let zero = self.i64t.const_zero();
-            let arg = |i: usize| -> IntValue<'ctx> {
-                argv.get(i).copied().unwrap_or(zero)
-            };
+            let arg = |i: usize| -> IntValue<'ctx> { argv.get(i).copied().unwrap_or(zero) };
             let call = self
                 .builder
                 .build_call(

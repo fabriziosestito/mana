@@ -74,8 +74,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         }
         if matches!(
             module,
-            "erts_internal" | "elixir_erl" | "erl_eval" | "beam_lib" | "global"
-                | "global_group" | "net_kernel" | "zlib"
+            "erts_internal"
+                | "elixir_erl"
+                | "erl_eval"
+                | "beam_lib"
+                | "global"
+                | "global_group"
+                | "net_kernel"
+                | "zlib"
         ) {
             // These modules are BEAM, compiler, or distribution internals. The
             // call compiles to a runtime raise, so the whole caller stays
@@ -90,7 +96,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
             self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
             let target = self.unwind_target(f)?;
-            self.builder.build_unconditional_branch(target).map_err(be)?;
+            self.builder
+                .build_unconditional_branch(target)
+                .map_err(be)?;
             let dead = self.ctx.append_basic_block(f, "unsup.dead");
             self.builder.position_at_end(dead);
             return Ok(self.i64t.get_undef());

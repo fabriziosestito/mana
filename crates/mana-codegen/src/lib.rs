@@ -292,7 +292,10 @@ pub(crate) enum SegSize {
     /// only.
     Bits(u64),
     All,
-    Dyn { size: Expr, unit: i64 },
+    Dyn {
+        size: Expr,
+        unit: i64,
+    },
 }
 
 impl SegKind {
@@ -303,8 +306,12 @@ impl SegKind {
         matches!(
             self,
             SegKind::Utf8
-                | SegKind::Int { size: SegSize::Dyn { .. } }
-                | SegKind::Bin { size: SegSize::Dyn { .. } | SegSize::All }
+                | SegKind::Int {
+                    size: SegSize::Dyn { .. }
+                }
+                | SegKind::Bin {
+                    size: SegSize::Dyn { .. } | SegSize::All
+                }
         )
     }
 }
@@ -329,7 +336,9 @@ pub(crate) fn be(e: inkwell::builder::BuilderError) -> String {
     format!("LLVM builder: {}", e)
 }
 
-pub(crate) fn call_result(call: CallSiteValue<'_>) -> CgResult<inkwell::values::BasicValueEnum<'_>> {
+pub(crate) fn call_result(
+    call: CallSiteValue<'_>,
+) -> CgResult<inkwell::values::BasicValueEnum<'_>> {
     match call.try_as_basic_value() {
         ValueKind::Basic(v) => Ok(v),
         ValueKind::Instruction(_) => Err("call to void function used as a value".into()),

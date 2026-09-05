@@ -182,7 +182,10 @@ pub(crate) fn erlang_may_gc(name: &str, arity: usize) -> bool {
 /// the result with the original per-iteration AST walkers. This check needs
 /// the AST of every unit. The driver disables the summary cache under the
 /// flag.
-pub(crate) fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)>) -> GcSet {
+pub(crate) fn compute_may_gc(
+    units: &[ModuleUnit],
+    reachable: &HashSet<(String, FunName)>,
+) -> GcSet {
     let defs: HashMap<(&str, &FunName), &summary::FunSummary> = units
         .iter()
         .flat_map(|u| {
@@ -204,7 +207,10 @@ pub(crate) fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, 
     // Native fns were injected only to resolve their callers. They are not
     // compiled functions, so the result drops them. The reference walker
     // never has them as keys either.
-    let set: GcSet = set.into_iter().filter(|(m, _)| !is_native_module(m)).collect();
+    let set: GcSet = set
+        .into_iter()
+        .filter(|(m, _)| !is_native_module(m))
+        .collect();
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
         if let Some(mods) = all_asts(units) {
             let slow = compute_may_gc_slow(&mods, reachable);
@@ -215,7 +221,10 @@ pub(crate) fn compute_may_gc(units: &[ModuleUnit], reachable: &HashSet<(String, 
 }
 
 /// Fixpoint: the reachable functions that can raise an exception.
-pub(crate) fn compute_may_raise(units: &[ModuleUnit], reachable: &HashSet<(String, FunName)>) -> GcSet {
+pub(crate) fn compute_may_raise(
+    units: &[ModuleUnit],
+    reachable: &HashSet<(String, FunName)>,
+) -> GcSet {
     let defs: HashMap<(&str, &FunName), &summary::FunSummary> = units
         .iter()
         .flat_map(|u| {
@@ -229,12 +238,18 @@ pub(crate) fn compute_may_raise(units: &[ModuleUnit], reachable: &HashSet<(Strin
         .iter()
         .filter_map(|(m, f)| {
             let fs = defs.get(&(m.as_str(), f))?;
-            Some(((m.clone(), f.clone()), (fs.raise_base, fs.raise_deps.clone())))
+            Some((
+                (m.clone(), f.clone()),
+                (fs.raise_base, fs.raise_deps.clone()),
+            ))
         })
         .collect();
     let conds = inject_native_conds(conds, false);
     let set = effect_fixpoint(conds);
-    let set: GcSet = set.into_iter().filter(|(m, _)| !is_native_module(m)).collect();
+    let set: GcSet = set
+        .into_iter()
+        .filter(|(m, _)| !is_native_module(m))
+        .collect();
     if std::env::var_os("MANA_CHECK_ANALYSIS").is_some() {
         if let Some(mods) = all_asts(units) {
             let slow = compute_may_raise_slow(&mods, reachable);
@@ -260,7 +275,13 @@ pub(crate) fn inject_native_conds(
     for (_, deps) in conds.values() {
         for (m, f) in deps {
             if is_native_module(m) {
-                let v = native_fn(m, &f.name, f.arity).map_or(true, |nf| if gc { nf.may_gc } else { nf.may_raise });
+                let v = native_fn(m, &f.name, f.arity).map_or(true, |nf| {
+                    if gc {
+                        nf.may_gc
+                    } else {
+                        nf.may_raise
+                    }
+                });
                 extra.push(((m.clone(), f.clone()), v));
             }
         }
@@ -326,10 +347,17 @@ pub(crate) fn check_analysis_equal(what: &str, fast: &GcSet, slow: &GcSet) {
     }
 }
 
-pub(crate) fn compute_may_gc_slow(mods: &[&Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
+pub(crate) fn compute_may_gc_slow(
+    mods: &[&Module],
+    reachable: &HashSet<(String, FunName)>,
+) -> GcSet {
     let defs: HashMap<(&str, &FunName), &Fun> = mods
         .iter()
-        .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
+        .flat_map(|m| {
+            m.definitions
+                .iter()
+                .map(move |(f, b)| ((m.name.as_str(), f), b))
+        })
         .collect();
     let mut set: GcSet = GcSet::new();
     loop {
@@ -353,10 +381,17 @@ pub(crate) fn compute_may_gc_slow(mods: &[&Module], reachable: &HashSet<(String,
     }
 }
 
-pub(crate) fn compute_may_raise_slow(mods: &[&Module], reachable: &HashSet<(String, FunName)>) -> GcSet {
+pub(crate) fn compute_may_raise_slow(
+    mods: &[&Module],
+    reachable: &HashSet<(String, FunName)>,
+) -> GcSet {
     let defs: HashMap<(&str, &FunName), &Fun> = mods
         .iter()
-        .flat_map(|m| m.definitions.iter().map(move |(f, b)| ((m.name.as_str(), f), b)))
+        .flat_map(|m| {
+            m.definitions
+                .iter()
+                .map(move |(f, b)| ((m.name.as_str(), f), b))
+        })
         .collect();
     let mut set: GcSet = GcSet::new();
     loop {
@@ -446,12 +481,31 @@ pub(crate) fn expr_may_raise(
             }
             if matches!(
                 module.as_str(),
-                "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
-                    | "logger" | "ets" | "application" | "file" | "prim_file"
+                "maps"
+                    | "io"
+                    | "unicode"
+                    | "persistent_term"
+                    | "code"
+                    | "io_lib"
+                    | "logger"
+                    | "ets"
+                    | "application"
+                    | "file"
+                    | "prim_file"
                     | "erts_internal"
-                    | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
-                    | "net_kernel" | "math" | "re" | "timer" | "gen_tcp" | "inet"
-                    | "zlib" | "crypto"
+                    | "elixir_erl"
+                    | "erl_eval"
+                    | "beam_lib"
+                    | "global"
+                    | "global_group"
+                    | "net_kernel"
+                    | "math"
+                    | "re"
+                    | "timer"
+                    | "gen_tcp"
+                    | "inet"
+                    | "zlib"
+                    | "crypto"
             ) {
                 return true;
             }
@@ -521,8 +575,10 @@ pub(crate) fn expr_may_gc(
         Expr::Lit(_) => false,
         // Allocation sites. CallDyn builds its args list, and its callee is
         // unknown.
-        Expr::Tuple(_) | Expr::Cons(..)
-        | Expr::LetRec { .. } | Expr::Map { .. }
+        Expr::Tuple(_)
+        | Expr::Cons(..)
+        | Expr::LetRec { .. }
+        | Expr::Map { .. }
         | Expr::CallDyn { .. } => true,
         // Funs without captures are static constants. They do not allocate.
         Expr::FunRef { .. } => false,
@@ -538,8 +594,7 @@ pub(crate) fn expr_may_gc(
             let target_gc = match target {
                 ApplyTarget::Var(_) => true,
                 ApplyTarget::LocalFun(f) => {
-                    letrec_bound.contains(f)
-                        || gc_set.contains(&(cur_mod.to_string(), f.clone()))
+                    letrec_bound.contains(f) || gc_set.contains(&(cur_mod.to_string(), f.clone()))
                 }
             };
             target_gc
@@ -571,10 +626,24 @@ pub(crate) fn expr_may_gc(
             if module == "maps"
                 && matches!(
                     name.as_str(),
-                    "put" | "remove" | "merge" | "from_list" | "to_list" | "find"
-                        | "fold" | "keys" | "values" | "iterator" | "next"
-                        | "merge_with" | "take" | "update" | "update_with"
-                        | "foreach" | "with" | "without"
+                    "put"
+                        | "remove"
+                        | "merge"
+                        | "from_list"
+                        | "to_list"
+                        | "find"
+                        | "fold"
+                        | "keys"
+                        | "values"
+                        | "iterator"
+                        | "next"
+                        | "merge_with"
+                        | "take"
+                        | "update"
+                        | "update_with"
+                        | "foreach"
+                        | "with"
+                        | "without"
                 )
             {
                 return true;
@@ -584,8 +653,15 @@ pub(crate) fn expr_may_gc(
             // and can suspend.
             if matches!(
                 module.as_str(),
-                "io" | "unicode" | "re" | "timer" | "file" | "prim_file"
-                    | "gen_tcp" | "inet" | "crypto" | "zlib"
+                "io" | "unicode"
+                    | "re"
+                    | "timer"
+                    | "file"
+                    | "prim_file"
+                    | "gen_tcp"
+                    | "inet"
+                    | "crypto"
+                    | "zlib"
             ) {
                 return true;
             }
@@ -729,12 +805,31 @@ pub(crate) fn cond_may_raise(
         Expr::Call { module, name, args } => {
             if matches!(
                 module.as_str(),
-                "maps" | "io" | "unicode" | "persistent_term" | "code" | "io_lib"
-                    | "logger" | "ets" | "application" | "file" | "prim_file"
+                "maps"
+                    | "io"
+                    | "unicode"
+                    | "persistent_term"
+                    | "code"
+                    | "io_lib"
+                    | "logger"
+                    | "ets"
+                    | "application"
+                    | "file"
+                    | "prim_file"
                     | "erts_internal"
-                    | "elixir_erl" | "erl_eval" | "beam_lib" | "global" | "global_group"
-                    | "net_kernel" | "math" | "re" | "timer" | "gen_tcp" | "inet"
-                    | "zlib" | "crypto"
+                    | "elixir_erl"
+                    | "erl_eval"
+                    | "beam_lib"
+                    | "global"
+                    | "global_group"
+                    | "net_kernel"
+                    | "math"
+                    | "re"
+                    | "timer"
+                    | "gen_tcp"
+                    | "inet"
+                    | "zlib"
+                    | "crypto"
             ) {
                 *base = true;
                 return;
@@ -806,8 +901,10 @@ pub(crate) fn cond_may_gc(
         Expr::Lit(_) => {}
         // Allocation sites. CallDyn builds its args list, and its callee is
         // unknown.
-        Expr::Tuple(_) | Expr::Cons(..)
-        | Expr::LetRec { .. } | Expr::Map { .. }
+        Expr::Tuple(_)
+        | Expr::Cons(..)
+        | Expr::LetRec { .. }
+        | Expr::Map { .. }
         | Expr::CallDyn { .. } => *base = true,
         // Funs without captures are static constants. They do not allocate.
         Expr::FunRef { .. } => {}
@@ -857,10 +954,24 @@ pub(crate) fn cond_may_gc(
             if module == "maps"
                 && matches!(
                     name.as_str(),
-                    "put" | "remove" | "merge" | "from_list" | "to_list" | "find"
-                        | "fold" | "keys" | "values" | "iterator" | "next"
-                        | "merge_with" | "take" | "update" | "update_with"
-                        | "foreach" | "with" | "without"
+                    "put"
+                        | "remove"
+                        | "merge"
+                        | "from_list"
+                        | "to_list"
+                        | "find"
+                        | "fold"
+                        | "keys"
+                        | "values"
+                        | "iterator"
+                        | "next"
+                        | "merge_with"
+                        | "take"
+                        | "update"
+                        | "update_with"
+                        | "foreach"
+                        | "with"
+                        | "without"
                 )
             {
                 *base = true;
@@ -871,8 +982,15 @@ pub(crate) fn cond_may_gc(
             // and can suspend.
             if matches!(
                 module.as_str(),
-                "io" | "unicode" | "re" | "timer" | "file" | "prim_file"
-                    | "gen_tcp" | "inet" | "crypto" | "zlib"
+                "io" | "unicode"
+                    | "re"
+                    | "timer"
+                    | "file"
+                    | "prim_file"
+                    | "gen_tcp"
+                    | "inet"
+                    | "crypto"
+                    | "zlib"
             ) {
                 *base = true;
                 return;

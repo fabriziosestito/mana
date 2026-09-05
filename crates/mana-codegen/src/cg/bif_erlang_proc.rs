@@ -20,7 +20,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.mem_store(ctx, CTX_EXC_CLASS, argv[0], MemKind::Ctx)?;
                 self.mem_store(ctx, CTX_EXC_REASON, argv[1], MemKind::Ctx)?;
                 let target = self.unwind_target(f)?;
-                self.builder.build_unconditional_branch(target).map_err(be)?;
+                self.builder
+                    .build_unconditional_branch(target)
+                    .map_err(be)?;
                 let dead = self.ctx.append_basic_block(f, "raise3.dead");
                 self.builder.position_at_end(dead);
                 Ok(self.i64t.get_undef())
@@ -28,7 +30,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             ("self", 0) => {
                 let call = self
                     .builder
-                    .build_call(self.rt_p_i64("mana_rt_self"), &[self.ctx_val().into()], "self")
+                    .build_call(
+                        self.rt_p_i64("mana_rt_self"),
+                        &[self.ctx_val().into()],
+                        "self",
+                    )
                     .map_err(be)?;
                 Ok(call_result(call)?.into_int_value())
             }
@@ -59,14 +65,20 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
                 self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
                 let target = self.unwind_target(f)?;
-                self.builder.build_unconditional_branch(target).map_err(be)?;
+                self.builder
+                    .build_unconditional_branch(target)
+                    .map_err(be)?;
                 self.builder.position_at_end(ok_bb);
                 Ok(pid)
             }
             ("make_ref", 0) => {
                 let call = self
                     .builder
-                    .build_call(self.rt_p_i64("mana_rt_make_ref"), &[self.ctx_val().into()], "r")
+                    .build_call(
+                        self.rt_p_i64("mana_rt_make_ref"),
+                        &[self.ctx_val().into()],
+                        "r",
+                    )
                     .map_err(be)?;
                 Ok(call_result(call)?.into_int_value())
             }
@@ -144,7 +156,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
                 self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
                 let target = self.unwind_target(f)?;
-                self.builder.build_unconditional_branch(target).map_err(be)?;
+                self.builder
+                    .build_unconditional_branch(target)
+                    .map_err(be)?;
                 self.builder.position_at_end(ok_bb);
                 Ok(r)
             }
@@ -234,7 +248,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 }
             }
             ("apply", 3) | ("apply", 2) => {
-                let helper = if argv.len() == 3 { "mana_rt_apply3" } else { "mana_rt_apply_fun" };
+                let helper = if argv.len() == 3 {
+                    "mana_rt_apply3"
+                } else {
+                    "mana_rt_apply_fun"
+                };
                 let mut cargs: Vec<BasicMetadataValueEnum> = vec![self.ctx_val().into()];
                 cargs.extend(argv.iter().map(|v| BasicMetadataValueEnum::from(*v)));
                 let callee = if argv.len() == 3 {
@@ -252,7 +270,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 } else {
                     self.rt_ptt_i64(helper)
                 };
-                let call = self.builder.build_call(callee, &cargs, "apply").map_err(be)?;
+                let call = self
+                    .builder
+                    .build_call(callee, &cargs, "apply")
+                    .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
@@ -363,10 +384,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             ("get", 0) => {
                 let callee = self.rt_fn("mana_rt_pd_get_all", || {
-                    self.i64t.fn_type(
-                        &[BasicMetadataTypeEnum::PointerType(self.ptrt)],
-                        false,
-                    )
+                    self.i64t
+                        .fn_type(&[BasicMetadataTypeEnum::PointerType(self.ptrt)], false)
                 });
                 let call = self
                     .builder
@@ -494,7 +513,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
-            ("monotonic_time", 0) | ("monotonic_time", 1) | ("system_time", 0)
+            ("monotonic_time", 0)
+            | ("monotonic_time", 1)
+            | ("system_time", 0)
             | ("system_time", 1) => {
                 let helper = if name == "monotonic_time" {
                     "mana_rt_monotonic_time"
@@ -761,10 +782,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     .builder
                     .build_call(
                         self.rt_fn("mana_rt_memory", || {
-                            self.i64t.fn_type(
-                                &[BasicMetadataTypeEnum::PointerType(self.ptrt)],
-                                false,
-                            )
+                            self.i64t
+                                .fn_type(&[BasicMetadataTypeEnum::PointerType(self.ptrt)], false)
                         }),
                         &[self.ctx_val().into()],
                         "mem",

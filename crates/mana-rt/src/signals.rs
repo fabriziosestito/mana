@@ -47,7 +47,13 @@ pub(crate) fn push_and_wake(ctx: &mut ProcCtx, id: usize, msg: u64) {
 }
 
 /// Deliver an exit signal to `target`. `forced` is true for exit(Pid, kill).
-pub(crate) fn exit_signal(ctx: &mut ProcCtx, from_pid: usize, target: usize, reason: u64, forced: bool) {
+pub(crate) fn exit_signal(
+    ctx: &mut ProcCtx,
+    from_pid: usize,
+    target: usize,
+    reason: u64,
+    forced: bool,
+) {
     let g = ctx.global;
     // The reason lands in old-space tuples and in the cross-scheduler
     // pending_kill. A minor collection does not see young terms there. There
@@ -104,7 +110,13 @@ pub(crate) fn process_death(ctx: &mut ProcCtx, pid: usize, reason: u64) {
         let ref_term = (ref_id << 4) | REF_TAG4;
         let msg = shared_tuple(
             ctx,
-            &[known().down_up, ref_term, known().process, make_pid(pid), reason],
+            &[
+                known().down_up,
+                ref_term,
+                known().process,
+                make_pid(pid),
+                reason,
+            ],
         );
         push_and_wake(ctx, watcher, msg);
     }
@@ -165,10 +177,18 @@ pub extern "C" fn mana_rt_unlink(ctx: *mut ProcCtx, pid: u64) -> u64 {
     let Some(id) = pid_id(pid) else { return 0 };
     let me = ctx.current;
     if let Some(cell) = proc_ref(ctx.global, id) {
-        unsafe { proc_mut(cell) }.lstate.lock().links.retain(|&x| x != me);
+        unsafe { proc_mut(cell) }
+            .lstate
+            .lock()
+            .links
+            .retain(|&x| x != me);
     }
     if let Some(cell) = proc_ref(ctx.global, me) {
-        unsafe { proc_mut(cell) }.lstate.lock().links.retain(|&x| x != id);
+        unsafe { proc_mut(cell) }
+            .lstate
+            .lock()
+            .links
+            .retain(|&x| x != id);
     }
     1
 }
@@ -220,7 +240,11 @@ pub extern "C" fn mana_rt_demonitor(ctx: *mut ProcCtx, r: u64) -> u64 {
         let mecell = proc_ref(ctx.global, me).unwrap();
         let m = unsafe { proc_mut(mecell) };
         let mut ls = m.lstate.lock();
-        let t = ls.monitoring.iter().find(|&&(rid, _)| rid == ref_id).map(|&(_, t)| t);
+        let t = ls
+            .monitoring
+            .iter()
+            .find(|&&(rid, _)| rid == ref_id)
+            .map(|&(_, t)| t);
         ls.monitoring.retain(|&(rid, _)| rid != ref_id);
         t
     };

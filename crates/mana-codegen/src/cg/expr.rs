@@ -361,7 +361,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 self.mem_store(ctx, CTX_EXC_CLASS, argv[0], MemKind::Ctx)?;
                 self.mem_store(ctx, CTX_EXC_REASON, argv[1], MemKind::Ctx)?;
                 let target = self.unwind_target(f)?;
-                self.builder.build_unconditional_branch(target).map_err(be)?;
+                self.builder
+                    .build_unconditional_branch(target)
+                    .map_err(be)?;
                 let dead = self.ctx.append_basic_block(f, "rawraise.dead");
                 self.builder.position_at_end(dead);
                 Ok(self.i64t.get_undef())
@@ -370,9 +372,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             // append loops (for example Base.decode64). The argument is only a
             // capacity hint. Binary construction copies on append, so an empty
             // static binary is exact.
-            Expr::PrimOp { name, .. } if name == "bs_init_writable" => {
-                self.static_binary(&[])
-            }
+            Expr::PrimOp { name, .. } if name == "bs_init_writable" => self.static_binary(&[]),
             Expr::PrimOp { name, .. } => Err(format!("unsupported primop {}", name)),
             Expr::Case { arg, clauses } => {
                 let vals = self.compile_case_arg(f, arg, clauses, scope)?;
@@ -409,12 +409,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             sorted.sort_by(|a, b| lit_key_ord(a, b));
                             sorted.dedup();
                             let m2 = sorted.len();
-                            let children: Vec<&Expr> =
-                                pairs.iter().map(|(_, _, v)| v).collect();
+                            let children: Vec<&Expr> = pairs.iter().map(|(_, _, v)| v).collect();
                             let slots = self.eval_all_rooted(f, &children, scope)?;
                             let p = self.alloc_words(1 + 2 * m2 as u64)?;
-                            let header =
-                                self.i64t.const_int(((m2 as u64) << 8) | KIND_MAP, false);
+                            let header = self.i64t.const_int(((m2 as u64) << 8) | KIND_MAP, false);
                             self.store_word(p, 0, header)?;
                             for (i, l) in sorted.iter().enumerate() {
                                 let k = self.compile_literal(l)?;
@@ -445,8 +443,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         }
                         let slots = self.eval_all_rooted(f, &children, scope)?;
                         let p = self.alloc_words(1 + 2 * n as u64)?;
-                        let header =
-                            self.i64t.const_int(((n as u64) << 8) | KIND_MAP, false);
+                        let header = self.i64t.const_int(((n as u64) << 8) | KIND_MAP, false);
                         self.store_word(p, 0, header)?;
                         for i in 0..n {
                             let k = self.rooted_get(&slots[2 * i])?;
@@ -479,8 +476,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         let mut acc = self.compile_value(f, base, scope)?;
                         for (k, assoc, v) in pairs {
                             let wm = self.next_slot.get();
-                            let acc_slot =
-                                if self.framed() { Some(self.spill(acc)?) } else { None };
+                            let acc_slot = if self.framed() {
+                                Some(self.spill(acc)?)
+                            } else {
+                                None
+                            };
                             let kv = self.eval_siblings(f, &[k, v], scope)?;
                             let acc2 = match acc_slot {
                                 Some(s) => self.reload(s)?,
@@ -569,7 +569,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = self.compile_value(f, e, scope)?;
                 held.push(Held::Val(v));
             }
-        }        let out = held
+        }
+        let out = held
             .into_iter()
             .map(|h| match h {
                 Held::Val(v) => Ok(v),

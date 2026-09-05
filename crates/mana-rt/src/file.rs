@@ -225,7 +225,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
     let ok_atom = || atom_intern(b"ok");
     match op {
         F_READ_FILE => {
-            let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
+            let Ok(path) = path_of(a) else {
+                return raise_badarg(ctx);
+            };
             match std::fs::read(&path) {
                 Ok(bytes) => {
                     let bin = bytes_to_new_bin(ctx, &bytes);
@@ -235,7 +237,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             }
         }
         F_WRITE_FILE | F_WRITE_FILE3 => {
-            let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
+            let Ok(path) = path_of(a) else {
+                return raise_badarg(ctx);
+            };
             let mut data = Vec::new();
             if iolist_flatten(b, &mut data).is_err() {
                 return raise_badarg(ctx);
@@ -267,7 +271,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             }
         }
         F_OPEN => {
-            let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
+            let Ok(path) = path_of(a) else {
+                return raise_badarg(ctx);
+            };
             // The modes list holds read | write | append | exclusive | binary.
             // The code accepts and ignores raw, read_ahead, and delayed_write.
             let (mut read, mut write, mut append, mut excl, mut binary) =
@@ -314,7 +320,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             }
         }
         F_CLOSE => {
-            let Some(idx) = file_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = file_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             let mut tab = FILES.lock().unwrap();
             if idx < tab.slots.len() && tab.slots[idx].take().is_some() {
                 tab.free.push(idx);
@@ -325,7 +333,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             }
         }
         F_READ => {
-            let Some(idx) = file_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = file_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             if b & TAG_MASK != TAG_SMALL || (b as i64 >> 3) < 0 {
                 return raise_badarg(ctx);
             }
@@ -366,7 +376,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             }
         }
         F_WRITE => {
-            let Some(idx) = file_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = file_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             let mut data = Vec::new();
             if iolist_flatten(b, &mut data).is_err() {
                 return raise_badarg(ctx);
@@ -384,7 +396,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             }
         }
         F_POSITION => {
-            let Some(idx) = file_resolve(a) else { return raise_badarg(ctx) };
+            let Some(idx) = file_resolve(a) else {
+                return raise_badarg(ctx);
+            };
             // The location is N | bof | cur | eof | {bof, N} | {cur, N} | {eof, N}.
             let seek = |whence: &[u8], n: i64| -> Option<std::io::SeekFrom> {
                 match whence {
@@ -413,7 +427,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             } else {
                 None
             };
-            let Some(loc) = loc else { return raise_badarg(ctx) };
+            let Some(loc) = loc else {
+                return raise_badarg(ctx);
+            };
             let mut tab = FILES.lock().unwrap();
             let Some(entry) = tab.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
                 drop(tab);
@@ -427,7 +443,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             }
         }
         F_DELETE => {
-            let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
+            let Ok(path) = path_of(a) else {
+                return raise_badarg(ctx);
+            };
             match std::fs::remove_file(&path) {
                 Ok(()) => ok_atom(),
                 Err(e) => err_tuple(ctx, &e),
@@ -443,21 +461,27 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
             }
         }
         F_MAKE_DIR => {
-            let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
+            let Ok(path) = path_of(a) else {
+                return raise_badarg(ctx);
+            };
             match std::fs::create_dir(&path) {
                 Ok(()) => ok_atom(),
                 Err(e) => err_tuple(ctx, &e),
             }
         }
         F_DEL_DIR => {
-            let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
+            let Ok(path) = path_of(a) else {
+                return raise_badarg(ctx);
+            };
             match std::fs::remove_dir(&path) {
                 Ok(()) => ok_atom(),
                 Err(e) => err_tuple(ctx, &e),
             }
         }
         F_LIST_DIR => {
-            let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
+            let Ok(path) = path_of(a) else {
+                return raise_badarg(ctx);
+            };
             let rd = match std::fs::read_dir(&path) {
                 Ok(rd) => rd,
                 Err(e) => return err_tuple(ctx, &e),
@@ -490,7 +514,9 @@ pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u6
         }
         F_FILE_INFO | F_FILE_INFO2 => {
             use std::os::unix::fs::MetadataExt;
-            let Ok(path) = path_of(a) else { return raise_badarg(ctx) };
+            let Ok(path) = path_of(a) else {
+                return raise_badarg(ctx);
+            };
             // {time, posix} is the only option that the code honors. The universal
             // and local options return UTC calendar tuples. Local as UTC is a
             // documented divergence.

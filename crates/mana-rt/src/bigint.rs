@@ -152,7 +152,11 @@ pub fn mag_shr(a: &[u64], n: u64) -> Vec<u64> {
     }
     let mut out = Vec::with_capacity(src.len());
     for i in 0..src.len() {
-        let hi = if i + 1 < src.len() { src[i + 1] << (64 - bits) } else { 0 };
+        let hi = if i + 1 < src.len() {
+            src[i + 1] << (64 - bits)
+        } else {
+            0
+        };
         out.push((src[i] >> bits) | hi);
     }
     normalize(out)
@@ -294,7 +298,7 @@ pub fn f64_to_mag(v: f64) -> Vec<u64> {
     let bits = v.to_bits();
     let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
     let mantissa = (bits & ((1u64 << 52) - 1)) | (1u64 << 52); // Adds the implicit leading bit.
-    // value = mantissa * 2^(exp-52)
+                                                               // value = mantissa * 2^(exp-52)
     let shift = exp - 52;
     if shift >= 0 {
         mag_shl(&[mantissa], shift as u64)
@@ -367,7 +371,9 @@ mod ab_bench {
     fn ab_kernel_vs_num_bigint() {
         let one = vec![0x1234_5678_9abc_def0u64]; // 1 limb (timestamps)
         let two = vec![u64::MAX, 0x1f]; // 2 limbs (for example, ns since epoch)
-        let four = mag_from_decimal(b"123456789012345678901234567890123456789012345678901234567890").unwrap();
+        let four =
+            mag_from_decimal(b"123456789012345678901234567890123456789012345678901234567890")
+                .unwrap();
         let f200 = {
             // factorial(200), the Conf.Big stress shape (~1245 bits)
             let mut m = vec![1u64];
@@ -386,11 +392,18 @@ mod ab_bench {
         time("crate mul 2x1 (+conv)", 1_000_000, || {
             from_big(&(to_big(&two) * to_big(&one)))[0]
         });
-        time("hand divrem 2/1", 1_000_000, || mag_divrem(&two, &one).1.first().copied().unwrap_or(0));
-        time("crate divrem 2/1 (+conv)", 1_000_000, || {
-            from_big(&(to_big(&two) % to_big(&one))).first().copied().unwrap_or(0)
+        time("hand divrem 2/1", 1_000_000, || {
+            mag_divrem(&two, &one).1.first().copied().unwrap_or(0)
         });
-        time("hand to_decimal 2-limb", 200_000, || mag_to_decimal(&two).len() as u64);
+        time("crate divrem 2/1 (+conv)", 1_000_000, || {
+            from_big(&(to_big(&two) % to_big(&one)))
+                .first()
+                .copied()
+                .unwrap_or(0)
+        });
+        time("hand to_decimal 2-limb", 200_000, || {
+            mag_to_decimal(&two).len() as u64
+        });
         time("crate to_decimal 2-limb (+conv)", 200_000, || {
             to_big(&two).to_string().len() as u64
         });
@@ -427,9 +440,14 @@ mod ab_bench {
         time("crate to_decimal f200 (+conv)", 20_000, || {
             to_big(&f200).to_string().len() as u64
         });
-        time("hand divrem f200/4", 100_000, || mag_divrem(&f200, &four).1.first().copied().unwrap_or(0));
+        time("hand divrem f200/4", 100_000, || {
+            mag_divrem(&f200, &four).1.first().copied().unwrap_or(0)
+        });
         time("crate divrem f200/4 (+conv)", 100_000, || {
-            from_big(&(to_big(&f200) % to_big(&four))).first().copied().unwrap_or(0)
+            from_big(&(to_big(&f200) % to_big(&four)))
+                .first()
+                .copied()
+                .unwrap_or(0)
         });
     }
 }
@@ -455,8 +473,18 @@ mod tests {
     #[test]
     fn add_sub_mul_divrem_vs_u128() {
         let vals: Vec<u128> = vec![
-            0, 1, 2, 9, 10, 255, 1 << 60, (1 << 61) - 1, u64::MAX as u128,
-            u64::MAX as u128 + 1, 12345678901234567890, (1u128 << 100) + 12345,
+            0,
+            1,
+            2,
+            9,
+            10,
+            255,
+            1 << 60,
+            (1 << 61) - 1,
+            u64::MAX as u128,
+            u64::MAX as u128 + 1,
+            12345678901234567890,
+            (1u128 << 100) + 12345,
             u128::MAX >> 1,
         ];
         for &x in &vals {
@@ -484,7 +512,11 @@ mod tests {
     #[test]
     fn decimal_roundtrip() {
         for s in [
-            "0", "1", "10", "9223372036854775807", "18446744073709551616",
+            "0",
+            "1",
+            "10",
+            "9223372036854775807",
+            "18446744073709551616",
             "340282366920938463463374607431768211456",
             "999999999999999999999999999999999999999999999999",
             "123456789012345678901234567890123456789012345678901234567890",
@@ -518,7 +550,10 @@ mod tests {
     fn shifts() {
         let one = vec![1u64];
         assert_eq!(mag_bits(&mag_shl(&one, 127)), 128);
-        assert_eq!(mag_cmp(&mag_shr(&mag_shl(&one, 127), 127), &one), Ordering::Equal);
+        assert_eq!(
+            mag_cmp(&mag_shr(&mag_shl(&one, 127), 127), &one),
+            Ordering::Equal
+        );
         let v = mag_from_decimal(b"123456789123456789123456789").unwrap();
         assert_eq!(mag_cmp(&mag_shr(&mag_shl(&v, 67), 67), &v), Ordering::Equal);
     }
@@ -534,9 +569,18 @@ mod tests {
 
     #[test]
     fn bytes_roundtrip() {
-        for s in ["1", "255", "256", "18446744073709551616", "123456789012345678901234567890"] {
+        for s in [
+            "1",
+            "255",
+            "256",
+            "18446744073709551616",
+            "123456789012345678901234567890",
+        ] {
             let m = mag_from_decimal(s.as_bytes()).unwrap();
-            assert_eq!(mag_cmp(&mag_from_bytes_le(&mag_to_bytes_le(&m)), &m), Ordering::Equal);
+            assert_eq!(
+                mag_cmp(&mag_from_bytes_le(&mag_to_bytes_le(&m)), &m),
+                Ordering::Equal
+            );
         }
     }
 

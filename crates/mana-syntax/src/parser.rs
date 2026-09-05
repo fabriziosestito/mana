@@ -158,7 +158,11 @@ impl Parser {
     fn parse_atom(&mut self) -> PResult<String> {
         match self.bump() {
             Tok::Atom(s) => Ok(s),
-            other => Err(format!("line {}: expected atom, found {}", self.line(), other)),
+            other => Err(format!(
+                "line {}: expected atom, found {}",
+                self.line(),
+                other
+            )),
         }
     }
 
@@ -249,10 +253,7 @@ impl Parser {
                 // A string literal is sugar for a char list.
                 let mut e = Expr::Lit(Literal::Nil);
                 for c in s.chars().rev() {
-                    e = Expr::Cons(
-                        Box::new(Expr::Lit(Literal::Int(c as i64))),
-                        Box::new(e),
-                    );
+                    e = Expr::Cons(Box::new(Expr::Lit(Literal::Int(c as i64))), Box::new(e));
                 }
                 Ok(e)
             }
@@ -432,10 +433,7 @@ impl Parser {
                         Clause {
                             patterns: vec![Pattern::Lit(Literal::Atom("exit".into()))],
                             guard: Expr::Lit(Literal::Atom("true".into())),
-                            body: Expr::Tuple(vec![
-                                exit_a(),
-                                Expr::Var("_CatchReason".into()),
-                            ]),
+                            body: Expr::Tuple(vec![exit_a(), Expr::Var("_CatchReason".into())]),
                         },
                         Clause {
                             patterns: vec![Pattern::Var("_CatchOther".into())],
@@ -731,9 +729,7 @@ impl Parser {
         if self.eat(&Tok::Eq) {
             let second = self.parse_pattern()?;
             match (first, second) {
-                (Pattern::Var(v), p) | (p, Pattern::Var(v)) => {
-                    Ok(Pattern::Alias(v, Box::new(p)))
-                }
+                (Pattern::Var(v), p) | (p, Pattern::Var(v)) => Ok(Pattern::Alias(v, Box::new(p))),
                 _ => Err(format!(
                     "line {}: alias pattern without a variable side",
                     self.line()
@@ -876,7 +872,13 @@ end
         let m = parse_module(src).expect("parse");
         assert_eq!(m.name, "m");
         assert_eq!(m.definitions.len(), 1);
-        assert_eq!(m.definitions[0].0, FunName { name: "f".into(), arity: 1 });
+        assert_eq!(
+            m.definitions[0].0,
+            FunName {
+                name: "f".into(),
+                arity: 1
+            }
+        );
     }
 
     #[test]

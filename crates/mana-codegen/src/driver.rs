@@ -194,85 +194,88 @@ pub fn compile_program(
     let misses = std::sync::atomic::AtomicUsize::new(0);
     let key_ns = std::sync::atomic::AtomicU64::new(0);
     let codegen_ns = std::sync::atomic::AtomicU64::new(0);
-    let objs: Vec<PathBuf> = pool.install(|| units
-        .par_iter()
-        .map(|u| -> CgResult<Option<PathBuf>> {
-            let mname = u.summary.name.as_str();
-            let Some(include) = includes.get(mname) else {
-                return Ok(None);
-            };
-            let entry_here = (mname == entry_mod).then_some(entry);
-            let tk = std::time::Instant::now();
-            let key = cache.map(|c| {
-                action_key(
-                    c,
-                    &u.summary,
-                    &u.source_hash,
-                    include,
-                    entry_here,
-                    &gc_set,
-                    &raise_set,
-                    &missing_mods,
-                )
-            });
-            key_ns.fetch_add(
-                tk.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            if let (Some(c), Some(key)) = (cache, key.as_ref()) {
-                if let Some(cached) = c.get(key) {
-                    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(Some(cached));
-                }
-            }
-            let tc = std::time::Instant::now();
-            // Object-cache miss. Only a miss needs the AST. If this run did not
-            // parse the module, the code reads the file again, checks its hash,
-            // and parses it here.
-            let reparsed: Module;
-            let m: &Module = match &u.ast {
-                Some(m) => m,
-                None => {
-                    let src = std::fs::read_to_string(&u.path)
-                        .map_err(|e| format!("re-reading {}: {}", u.path.display(), e))?;
-                    if blake3::hash(src.as_bytes()).as_bytes() != &u.source_hash {
-                        return Err(format!(
-                            "{}: file content changed during the build",
-                            u.path.display()
-                        ));
+    let objs: Vec<PathBuf> = pool
+        .install(|| {
+            units
+                .par_iter()
+                .map(|u| -> CgResult<Option<PathBuf>> {
+                    let mname = u.summary.name.as_str();
+                    let Some(include) = includes.get(mname) else {
+                        return Ok(None);
+                    };
+                    let entry_here = (mname == entry_mod).then_some(entry);
+                    let tk = std::time::Instant::now();
+                    let key = cache.map(|c| {
+                        action_key(
+                            c,
+                            &u.summary,
+                            &u.source_hash,
+                            include,
+                            entry_here,
+                            &gc_set,
+                            &raise_set,
+                            &missing_mods,
+                        )
+                    });
+                    key_ns.fetch_add(
+                        tk.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if let (Some(c), Some(key)) = (cache, key.as_ref()) {
+                        if let Some(cached) = c.get(key) {
+                            hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(Some(cached));
+                        }
                     }
-                    reparsed = mana_syntax::parse_module(&src)
-                        .map_err(|e| format!("re-parsing {}: {}", u.path.display(), e))?;
-                    &reparsed
-                }
-            };
-            let context = Context::create();
-            let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
-            *cg.missing_modules.borrow_mut() = missing_mods.clone();
-            cg.is_entry_module.set(entry_here.is_some());
-            cg.compile(m, include, entry_here)?;
-            if dump_ir {
-                eprintln!("{}", cg.module.print_to_string().to_string());
-            }
-            cg.module
-                .verify()
-                .map_err(|e| format!("LLVM verifier ({}): {}", m.name, e))?;
-            let obj = out_dir.join(format!("{}.o", sanitize(&m.name)));
-            cg.emit_object(&obj)?;
-            codegen_ns.fetch_add(
-                tc.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if cache.map(|c| c.debug).unwrap_or(false) {
-                eprintln!("manac: cache miss: {}", m.name);
-            }
-            if let (Some(c), Some(key)) = (cache, key.as_ref()) {
-                return Ok(Some(c.put(key, &obj)?));
-            }
-            Ok(Some(obj))
-        })
-        .collect::<CgResult<Vec<_>>>())?
+                    let tc = std::time::Instant::now();
+                    // Object-cache miss. Only a miss needs the AST. If this run did not
+                    // parse the module, the code reads the file again, checks its hash,
+                    // and parses it here.
+                    let reparsed: Module;
+                    let m: &Module = match &u.ast {
+                        Some(m) => m,
+                        None => {
+                            let src = std::fs::read_to_string(&u.path)
+                                .map_err(|e| format!("re-reading {}: {}", u.path.display(), e))?;
+                            if blake3::hash(src.as_bytes()).as_bytes() != &u.source_hash {
+                                return Err(format!(
+                                    "{}: file content changed during the build",
+                                    u.path.display()
+                                ));
+                            }
+                            reparsed = mana_syntax::parse_module(&src)
+                                .map_err(|e| format!("re-parsing {}: {}", u.path.display(), e))?;
+                            &reparsed
+                        }
+                    };
+                    let context = Context::create();
+                    let cg = Cg::new(&context, &m.name, &gc_set, &raise_set);
+                    *cg.missing_modules.borrow_mut() = missing_mods.clone();
+                    cg.is_entry_module.set(entry_here.is_some());
+                    cg.compile(m, include, entry_here)?;
+                    if dump_ir {
+                        eprintln!("{}", cg.module.print_to_string().to_string());
+                    }
+                    cg.module
+                        .verify()
+                        .map_err(|e| format!("LLVM verifier ({}): {}", m.name, e))?;
+                    let obj = out_dir.join(format!("{}.o", sanitize(&m.name)));
+                    cg.emit_object(&obj)?;
+                    codegen_ns.fetch_add(
+                        tc.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if cache.map(|c| c.debug).unwrap_or(false) {
+                        eprintln!("manac: cache miss: {}", m.name);
+                    }
+                    if let (Some(c), Some(key)) = (cache, key.as_ref()) {
+                        return Ok(Some(c.put(key, &obj)?));
+                    }
+                    Ok(Some(obj))
+                })
+                .collect::<CgResult<Vec<_>>>()
+        })?
         .into_iter()
         .flatten()
         .collect();
@@ -311,7 +314,9 @@ pub(crate) fn action_key(
     raise_set: &GcSet,
     missing: &HashSet<String>,
 ) -> blake3::Hash {
-    let debug_key = std::env::var("MANA_DEBUG_KEY").ok().filter(|d| d == &m.name);
+    let debug_key = std::env::var("MANA_DEBUG_KEY")
+        .ok()
+        .filter(|d| d == &m.name);
     let mut h = blake3::Hasher::new();
     h.update(b"mana-action-v2\0");
     h.update(&cache.tool_hash);

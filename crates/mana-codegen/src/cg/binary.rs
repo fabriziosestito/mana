@@ -21,7 +21,10 @@ pub(crate) fn coalesce_bit_runs(
         Expr::Call {
             module: "erlang".to_string(),
             name: "band".to_string(),
-            args: vec![v.clone(), Expr::Lit(Literal::Int(((1i64 << bits) - 1) as i64))],
+            args: vec![
+                v.clone(),
+                Expr::Lit(Literal::Int(((1i64 << bits) - 1) as i64)),
+            ],
         }
     };
     let mut out: Vec<mana_syntax::BinSegment<Box<Expr>>> = Vec::with_capacity(segs.len());
@@ -73,7 +76,9 @@ pub(crate) fn coalesce_bit_runs(
     };
     for (seg, spec) in segs.iter().zip(specs) {
         match &spec.kind {
-            SegKind::Int { size: SegSize::Bits(b) } => run.push((seg.value.as_ref(), *b)),
+            SegKind::Int {
+                size: SegSize::Bits(b),
+            } => run.push((seg.value.as_ref(), *b)),
             _ => {
                 flush(&mut run, &mut out)?;
                 out.push(seg.clone());
@@ -86,11 +91,19 @@ pub(crate) fn coalesce_bit_runs(
 
 pub(crate) fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {
     if spec.len() != 4 {
-        return Err(format!("bitstring segment spec has {} args, want 4", spec.len()));
+        return Err(format!(
+            "bitstring segment spec has {} args, want 4",
+            spec.len()
+        ));
     }
     let ty = match &spec[2] {
         Expr::Lit(Literal::Atom(a)) => a.as_str(),
-        other => return Err(format!("bitstring segment type is not an atom: {:?}", other)),
+        other => {
+            return Err(format!(
+                "bitstring segment type is not an atom: {:?}",
+                other
+            ))
+        }
     };
     let unit = match &spec[1] {
         Expr::Lit(Literal::Int(u)) => *u,
@@ -117,9 +130,13 @@ pub(crate) fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {
         ("integer", Expr::Lit(Literal::Int(sz))) => {
             let bits = sz * unit;
             if bits >= 0 && bits % 8 != 0 && bits <= 57 && !little && !signed {
-                SegKind::Int { size: SegSize::Bits(bits as u64) }
+                SegKind::Int {
+                    size: SegSize::Bits(bits as u64),
+                }
             } else {
-                SegKind::Int { size: SegSize::Bytes(const_bytes_of(*sz)?) }
+                SegKind::Int {
+                    size: SegSize::Bytes(const_bytes_of(*sz)?),
+                }
             }
         }
         ("binary", Expr::Lit(Literal::Atom(a))) if a == "all" => {
@@ -129,15 +146,25 @@ pub(crate) fn parse_seg_spec(spec: &[Expr]) -> Result<SegSpec, String> {
             size: SegSize::Bytes(const_bytes_of(*sz)?),
         },
         ("integer", e) => SegKind::Int {
-            size: SegSize::Dyn { size: e.clone(), unit },
+            size: SegSize::Dyn {
+                size: e.clone(),
+                unit,
+            },
         },
         ("binary", e) => SegKind::Bin {
-            size: SegSize::Dyn { size: e.clone(), unit },
+            size: SegSize::Dyn {
+                size: e.clone(),
+                unit,
+            },
         },
         ("float", _) => return Err("TODO: float bitstring segments".into()),
         (other, _) => return Err(format!("unsupported bitstring segment type '{}'", other)),
     };
-    Ok(SegSpec { little, signed, kind })
+    Ok(SegSpec {
+        little,
+        signed,
+        kind,
+    })
 }
 
 /// Converts a decimal digit string to exactly `nbytes` bytes. The function
@@ -178,16 +205,26 @@ pub(crate) fn big_to_bytes(dec: &str, nbytes: usize, little: bool) -> Result<Vec
 
 /// The constant bytes of an integer segment. `None` means that the value is
 /// dynamic and the compiler cannot compute the bytes at compile time.
-pub(crate) fn seg_const_bytes(value: &Expr, nbytes: u64, little: bool) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn seg_const_bytes(
+    value: &Expr,
+    nbytes: u64,
+    little: bool,
+) -> Result<Option<Vec<u8>>, String> {
     match value {
         Expr::Lit(Literal::Int(n)) => {
             let mut out = Vec::with_capacity(nbytes as usize);
             let v = *n as u64;
             for i in 0..nbytes {
                 let shift = 8 * if little { i } else { nbytes - 1 - i };
-                out.push(if shift < 64 { (v >> shift) as u8 } else {
+                out.push(if shift < 64 {
+                    (v >> shift) as u8
+                } else {
                     // Bytes beyond 64 bits are sign extension.
-                    if *n < 0 { 0xff } else { 0 }
+                    if *n < 0 {
+                        0xff
+                    } else {
+                        0
+                    }
                 });
             }
             Ok(Some(out))
@@ -207,8 +244,13 @@ pub(crate) fn binary_all_const(segs: &[mana_syntax::BinSegment<Box<Expr>>]) -> b
                 s.value.as_ref(),
                 Expr::Lit(Literal::Int(cp)) if char::from_u32(*cp as u32).is_some()
             ),
-            SegKind::Int { size: SegSize::Bytes(n) } => {
-                matches!(seg_const_bytes(s.value.as_ref(), n, spec.little), Ok(Some(_)))
+            SegKind::Int {
+                size: SegSize::Bytes(n),
+            } => {
+                matches!(
+                    seg_const_bytes(s.value.as_ref(), n, spec.little),
+                    Ok(Some(_))
+                )
             }
             _ => false,
         },
@@ -222,7 +264,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     /// gives a single GC point. In eternal mode (the raise path), it
     /// allocates each cell on its own and chains the cells in SSA. No GC
     /// runs there.
-    pub(crate) fn build_list_from_rooted(&self, rooted: &[Rooted<'ctx>]) -> CgResult<IntValue<'ctx>> {
+    pub(crate) fn build_list_from_rooted(
+        &self,
+        rooted: &[Rooted<'ctx>],
+    ) -> CgResult<IntValue<'ctx>> {
         if rooted.is_empty() {
             return Ok(self.nil());
         }
@@ -257,11 +302,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             self.store_word(p, 2 * i as u64 + 1, head)?;
             let addr = self
                 .builder
-                .build_int_add(
-                    base,
-                    self.i64t.const_int(16 * i as u64, false),
-                    "cell.addr",
-                )
+                .build_int_add(base, self.i64t.const_int(16 * i as u64, false), "cell.addr")
                 .map_err(be)?;
             head = self
                 .builder
@@ -294,10 +335,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // original evaluation order. The band is the BEAM truncation to size.
         // A run must end byte-aligned: a true sub-byte bitstring RESULT has
         // no representation here.
-        if specs
-            .iter()
-            .any(|s| matches!(s.kind, SegKind::Int { size: SegSize::Bits(_) }))
-        {
+        if specs.iter().any(|s| {
+            matches!(
+                s.kind,
+                SegKind::Int {
+                    size: SegSize::Bits(_)
+                }
+            )
+        }) {
             let rewritten = coalesce_bit_runs(segs, &specs)?;
             return self.compile_binary_construct(f, &rewritten, scope);
         }
@@ -313,15 +358,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                     }
                     _ => None,
                 },
-                SegKind::Int { size: SegSize::Bytes(n) } => {
-                    seg_const_bytes(seg.value.as_ref(), *n, spec.little)?
-                }
-                SegKind::Int { size: SegSize::Bits(_) } => {
-                    return Err(
-                        "TODO(bitstring): sub-byte segments in construction".into()
-                    )
-                }
-                SegKind::Int { size: SegSize::Dyn { .. } } => None,
+                SegKind::Int {
+                    size: SegSize::Bytes(n),
+                } => seg_const_bytes(seg.value.as_ref(), *n, spec.little)?,
+                SegKind::Int {
+                    size: SegSize::Bits(_),
+                } => return Err("TODO(bitstring): sub-byte segments in construction".into()),
+                SegKind::Int {
+                    size: SegSize::Dyn { .. },
+                } => None,
                 SegKind::Int { size: SegSize::All } => {
                     return Err("bitstring: integer segment with size 'all'".into())
                 }
@@ -343,12 +388,18 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let nil_expr = Expr::Lit(Literal::Nil);
         let mut children: Vec<&Expr> = Vec::new();
         for ((spec, seg), cb) in specs.iter().zip(segs).zip(&const_bytes) {
-            children.push(if cb.is_some() { &nil_expr } else { seg.value.as_ref() });
+            children.push(if cb.is_some() {
+                &nil_expr
+            } else {
+                seg.value.as_ref()
+            });
             match &spec.kind {
-                SegKind::Int { size: SegSize::Dyn { size, .. } }
-                | SegKind::Bin { size: SegSize::Dyn { size, .. } } if cb.is_none() => {
-                    children.push(size)
+                SegKind::Int {
+                    size: SegSize::Dyn { size, .. },
                 }
+                | SegKind::Bin {
+                    size: SegSize::Dyn { size, .. },
+                } if cb.is_none() => children.push(size),
                 _ => children.push(&nil_expr),
             }
         }
@@ -358,7 +409,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         for (i, spec) in specs.iter().enumerate() {
             match (&const_bytes[i], &spec.kind) {
                 (Some(bytes), _) => const_total += bytes.len() as u64,
-                (None, SegKind::Int { size: SegSize::Bytes(n) }) => const_total += n,
+                (
+                    None,
+                    SegKind::Int {
+                        size: SegSize::Bytes(n),
+                    },
+                ) => const_total += n,
                 _ => {}
             }
         }
@@ -387,8 +443,12 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             .map_err(be)?,
                     )
                 }
-                SegKind::Bin { size: sz @ SegSize::Dyn { .. } }
-                | SegKind::Int { size: sz @ SegSize::Dyn { .. } } => {
+                SegKind::Bin {
+                    size: sz @ SegSize::Dyn { .. },
+                }
+                | SegKind::Int {
+                    size: sz @ SegSize::Dyn { .. },
+                } => {
                     // The size expr was evaluated earlier. Read the value from
                     // its rooted slot.
                     let szv = self.rooted_get(&rooted[2 * i + 1])?;
@@ -400,10 +460,8 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         .builder
                         .build_call(
                             self.rt_fn("mana_rt_utf8_width", || {
-                                self.i64t.fn_type(
-                                    &[BasicMetadataTypeEnum::IntType(self.i64t)],
-                                    false,
-                                )
+                                self.i64t
+                                    .fn_type(&[BasicMetadataTypeEnum::IntType(self.i64t)], false)
                             }),
                             &[v.into()],
                             "u8w",
@@ -528,7 +586,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         .map_err(be)?;
                     let r = call_result(call)?.into_int_value();
                     self.check_exc(f, r)?;
-                    off = self.builder.build_int_add(off, nbytes, "boff").map_err(be)?;
+                    off = self
+                        .builder
+                        .build_int_add(off, nbytes, "boff")
+                        .map_err(be)?;
                 }
                 SegKind::Bin { size } => {
                     let (adv, len_arg) = match size {
@@ -537,9 +598,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                             self.i64t.const_int(u64::MAX, false), // -1: the whole binary
                         ),
                         SegSize::Bits(_) => {
-                            return Err(
-                                "TODO(bitstring): sub-byte binary segment".into()
-                            )
+                            return Err("TODO(bitstring): sub-byte binary segment".into())
                         }
                         SegSize::Bytes(n) => {
                             let c = self.i64t.const_int(*n, false);
@@ -649,7 +708,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             .builder
             .build_int_compare(IntPredicate::SGE, bits, self.i64t.const_zero(), "sz.nn")
             .map_err(be)?;
-        let ok = self.builder.build_and(aligned, nonneg, "sz.ok").map_err(be)?;
+        let ok = self
+            .builder
+            .build_and(aligned, nonneg, "sz.ok")
+            .map_err(be)?;
         self.guard_badarg(f, ok)?;
         self.builder
             .build_right_shift(bits, self.i64t.const_int(3, false), false, "sz.bytes")

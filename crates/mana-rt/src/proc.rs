@@ -252,10 +252,7 @@ pub(crate) static NAME_REGISTRY: std::sync::Mutex<Option<std::collections::HashM
 #[no_mangle]
 pub extern "C" fn mana_rt_register(ctx: *mut ProcCtx, name: u64, pid: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
-    if name & TAG_MASK != TAG_ATOM
-        || atom_bytes(name) == b"undefined"
-        || pid & 0xF != PID_TAG4
-    {
+    if name & TAG_MASK != TAG_ATOM || atom_bytes(name) == b"undefined" || pid & 0xF != PID_TAG4 {
         return raise_badarg(ctx);
     }
     let id = (pid >> 4) as usize;

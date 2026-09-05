@@ -17,10 +17,9 @@ pub(crate) fn bignum_parts(t: u64) -> Option<(bool, &'static [u64])> {
     if h & 0xff != KIND_BIGNUM {
         return None;
     }
-    Some((
-        h & 0x100 != 0,
-        unsafe { std::slice::from_raw_parts(p.add(1), (h >> 9) as usize) },
-    ))
+    Some((h & 0x100 != 0, unsafe {
+        std::slice::from_raw_parts(p.add(1), (h >> 9) as usize)
+    }))
 }
 
 /// Returns true if the term is an integer (small or bignum).
@@ -82,9 +81,8 @@ pub(crate) fn make_int_mag_eternal(negative: bool, mag: &[u64]) -> u64 {
 /// text of the literal.
 #[no_mangle]
 pub extern "C" fn mana_rt_big_literal(ptr: *const u8, len: u64) -> u64 {
-    static TABLE: std::sync::Mutex<
-        Option<std::collections::HashMap<&'static [u8], u64>>,
-    > = std::sync::Mutex::new(None);
+    static TABLE: std::sync::Mutex<Option<std::collections::HashMap<&'static [u8], u64>>> =
+        std::sync::Mutex::new(None);
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     let mut guard = TABLE.lock().unwrap();
     let map = guard.get_or_insert_with(Default::default);
@@ -119,7 +117,11 @@ pub(crate) fn int_cmp_exact(a: u64, b: u64) -> i64 {
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    if na { -r } else { r }
+    if na {
+        -r
+    } else {
+        r
+    }
 }
 
 // Floats and arithmetic
@@ -409,8 +411,8 @@ pub extern "C" fn mana_rt_math(ctx: *mut ProcCtx, op: u64, a: u64, b: u64) -> u6
         10 => x.acos(),
         11 => x.atan(),
         12 => x.atan2(y),
-        13 => x % y,                     // fmod
-        14 => std::f64::consts::PI,     // pi/0
+        13 => x % y,                // fmod
+        14 => std::f64::consts::PI, // pi/0
         15 => x.floor(),
         16 => x.ceil(),
         _ => return raise_badarith(ctx),
@@ -519,7 +521,11 @@ pub(crate) fn fmt_float(f: f64) -> String {
     if let Some(epos) = s.find(['e', 'E']) {
         // Rust writes "1e20". Erlang writes "1.0e20".
         let (m, e) = s.split_at(epos);
-        let mant = if m.contains('.') { m.to_string() } else { format!("{}.0", m) };
+        let mant = if m.contains('.') {
+            m.to_string()
+        } else {
+            format!("{}.0", m)
+        };
         return format!("{}{}", mant, e);
     }
     if !s.contains('.') {
@@ -533,7 +539,12 @@ pub(crate) fn fmt_float(f: f64) -> String {
 /// :compact trims the zeros at the end. With no options, the output is %e like
 /// BEAM.
 #[no_mangle]
-pub extern "C" fn mana_rt_float_to_binary(ctx: *mut ProcCtx, t: u64, opts: u64, as_list: u64) -> u64 {
+pub extern "C" fn mana_rt_float_to_binary(
+    ctx: *mut ProcCtx,
+    t: u64,
+    opts: u64,
+    as_list: u64,
+) -> u64 {
     let ctx = unsafe { &mut *ctx };
     let Some((x, false)) = num_of(t) else {
         return raise_badarg(ctx);

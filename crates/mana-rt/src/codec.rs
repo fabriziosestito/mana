@@ -136,7 +136,9 @@ pub extern "C" fn mana_rt_crypto(
             if a & TAG_MASK != TAG_ATOM {
                 return raise_badarg(ctx);
             }
-            let Ok(data) = crypto_bin_arg(b) else { return raise_badarg(ctx) };
+            let Ok(data) = crypto_bin_arg(b) else {
+                return raise_badarg(ctx);
+            };
             match crypto_hash(atom_bytes(a), &data) {
                 Some(h) => bytes_to_new_bin(ctx, &h),
                 None => raise_badarg(ctx),
@@ -144,10 +146,7 @@ pub extern "C" fn mana_rt_crypto(
         }
         C_MAC => {
             // Argument order: mac(hmac, Alg, Key, Data).
-            if a & TAG_MASK != TAG_ATOM
-                || atom_bytes(a) != b"hmac"
-                || b & TAG_MASK != TAG_ATOM
-            {
+            if a & TAG_MASK != TAG_ATOM || atom_bytes(a) != b"hmac" || b & TAG_MASK != TAG_ATOM {
                 return raise_badarg(ctx);
             }
             let (Ok(key), Ok(data)) = (crypto_bin_arg(c), crypto_bin_arg(d)) else {
@@ -170,10 +169,7 @@ pub extern "C" fn mana_rt_crypto(
         }
         C_PBKDF2 => {
             // Argument order: pbkdf2_hmac(Alg, Pass, Salt, Iterations, KeyLen).
-            if a & TAG_MASK != TAG_ATOM
-                || d & TAG_MASK != TAG_SMALL
-                || e & TAG_MASK != TAG_SMALL
-            {
+            if a & TAG_MASK != TAG_ATOM || d & TAG_MASK != TAG_SMALL || e & TAG_MASK != TAG_SMALL {
                 return raise_badarg(ctx);
             }
             let (Ok(pass), Ok(salt)) = (crypto_bin_arg(b), crypto_bin_arg(c)) else {
@@ -198,7 +194,11 @@ pub(crate) fn crc32(bytes: &[u8]) -> u32 {
         for (i, e) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *e = c;
         }
@@ -354,8 +354,9 @@ pub(crate) enum ZStream {
     },
 }
 
-pub(crate) static ZLIB_STREAMS: std::sync::Mutex<Vec<Option<std::sync::Arc<std::sync::Mutex<ZStream>>>>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static ZLIB_STREAMS: std::sync::Mutex<
+    Vec<Option<std::sync::Arc<std::sync::Mutex<ZStream>>>>,
+> = std::sync::Mutex::new(Vec::new());
 
 pub(crate) fn zlib_handle(ctx: &mut ProcCtx, idx: usize) -> u64 {
     let p = alloc_nursery(ctx, 3);
@@ -491,8 +492,7 @@ pub extern "C" fn mana_rt_zlib_deflate_init(
     } else {
         0
     };
-    let flags =
-        miniz_oxide::deflate::core::create_comp_flags_from_zip_params(lvl, wb, strat);
+    let flags = miniz_oxide::deflate::core::create_comp_flags_from_zip_params(lvl, wb, strat);
     let mut s = arc.lock().unwrap();
     *s = ZStream::Deflate {
         comp: Box::new(miniz_oxide::deflate::core::CompressorOxide::new(flags)),

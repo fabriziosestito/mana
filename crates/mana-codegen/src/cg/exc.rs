@@ -19,7 +19,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         let bb = self.ctx.append_basic_block(f, "unwind");
         self.builder.position_at_end(bb);
         self.pop_frame()?;
-        self.builder.build_return(Some(&self.sentinel())).map_err(be)?;
+        self.builder
+            .build_return(Some(&self.sentinel()))
+            .map_err(be)?;
         if let Some(s) = saved {
             self.builder.position_at_end(s);
         }
@@ -62,7 +64,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
         self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
         let target = self.unwind_target(f)?;
-        self.builder.build_unconditional_branch(target).map_err(be)?;
+        self.builder
+            .build_unconditional_branch(target)
+            .map_err(be)?;
         let dead = self.ctx.append_basic_block(f, "dead");
         self.builder.position_at_end(dead);
         Ok(())
@@ -115,11 +119,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
     }
 
     /// If `ok` is false, branch to a fresh block that raises `error:badarg`.
-    pub(crate) fn guard_badarg(
-        &self,
-        f: FunctionValue<'ctx>,
-        ok: IntValue<'ctx>,
-    ) -> CgResult<()> {
+    pub(crate) fn guard_badarg(&self, f: FunctionValue<'ctx>, ok: IntValue<'ctx>) -> CgResult<()> {
         let bad = self.ctx.append_basic_block(f, "badarg");
         let cont = self.ctx.append_basic_block(f, "ok");
         self.builder
@@ -129,11 +129,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         // A minimal stacktrace substitute: MANA_DEBUG_BADARG names the
         // function that raises. This is a cold path. The call costs nothing
         // unless the function raises.
-        let site = format!(
-            "{}:{}",
-            self.module_name,
-            f.get_name().to_string_lossy()
-        );
+        let site = format!("{}:{}", self.module_name, f.get_name().to_string_lossy());
         let ptr = self.static_bytes(site.as_bytes())?;
         self.builder
             .build_call(
@@ -159,7 +155,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         self.mem_store(ctx, CTX_EXC_CLASS, class, MemKind::Ctx)?;
         self.mem_store(ctx, CTX_EXC_REASON, reason, MemKind::Ctx)?;
         let target = self.unwind_target(f)?;
-        self.builder.build_unconditional_branch(target).map_err(be)?;
+        self.builder
+            .build_unconditional_branch(target)
+            .map_err(be)?;
         self.builder.position_at_end(cont);
         Ok(())
     }

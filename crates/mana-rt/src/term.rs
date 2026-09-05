@@ -159,8 +159,8 @@ pub(crate) struct KnownAtoms {
     pub(crate) normal: u64,
     pub(crate) killed: u64,
     pub(crate) kill: u64,
-    pub(crate) exit_up: u64,   // 'EXIT'
-    pub(crate) down_up: u64,   // 'DOWN'
+    pub(crate) exit_up: u64, // 'EXIT'
+    pub(crate) down_up: u64, // 'DOWN'
     pub(crate) process: u64,
     pub(crate) noproc: u64,
     pub(crate) true_a: u64,
@@ -278,7 +278,7 @@ pub(crate) fn type_rank(t: u64) -> u8 {
                 KIND_MAP => 6,
                 KIND_BIN | KIND_SUBBIN => 9,
                 KIND_BIGNUM => 0, // numbers
-                _ => 5, // tuple
+                _ => 5,           // tuple
             }
         }
         _ => 10,
@@ -464,5 +464,8 @@ pub(crate) fn exit_reason_is_quiet(r: u64) -> bool {
 }
 
 pub(crate) fn interned_atom_count() -> u64 {
-    atom_table_lock().read().map(|m| m.len() as u64).unwrap_or(0)
+    atom_table_lock()
+        .read()
+        .map(|m| m.len() as u64)
+        .unwrap_or(0)
 }

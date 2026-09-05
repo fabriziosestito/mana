@@ -22,11 +22,11 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 // runtime slow path. Floats box without a GC (see
                 // box_float), so this call is NOT a may-gc site.
                 let opcode = match name {
-                    "+" => 0u64,   // AR_ADD
-                    "-" => 1,      // AR_SUB
-                    "*" => 2,      // AR_MUL
-                    "div" => 4,    // AR_IDIV (slow path = badarith)
-                    _ => 5,        // AR_REM
+                    "+" => 0u64, // AR_ADD
+                    "-" => 1,    // AR_SUB
+                    "*" => 2,    // AR_MUL
+                    "div" => 4,  // AR_IDIV (slow path = badarith)
+                    _ => 5,      // AR_REM
                 };
                 self.arith_fastslow(f, name, opcode, argv[0], Some(argv[1]))
             }
@@ -66,8 +66,14 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 phi.add_incoming(&[(&argv[0], fast_bb), (&sv, slow_end)]);
                 Ok(phi.as_basic_value().into_int_value())
             }
-            ("<", 2) | ("=<", 2) | (">", 2) | (">=", 2) | ("==", 2) | ("/=", 2)
-            | ("=:=", 2) | ("=/=", 2) => {
+            ("<", 2)
+            | ("=<", 2)
+            | (">", 2)
+            | (">=", 2)
+            | ("==", 2)
+            | ("/=", 2)
+            | ("=:=", 2)
+            | ("=/=", 2) => {
                 // The fast path compares two small integers. The tag layout
                 // keeps the integer order. The slow path uses the full
                 // Erlang term order in the runtime.
@@ -237,7 +243,9 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
-            ("float_to_binary", 1) | ("float_to_binary", 2) | ("float_to_list", 1)
+            ("float_to_binary", 1)
+            | ("float_to_binary", 2)
+            | ("float_to_list", 1)
             | ("float_to_list", 2) => {
                 let opts = if argv.len() == 2 { argv[1] } else { self.nil() };
                 let callee = self.rt_fn("mana_rt_float_to_binary", || {
@@ -359,12 +367,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let tag = self.tag_of(argv[0])?;
                 let small = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::EQ,
-                        tag,
-                        self.i64t.const_int(1, false),
-                        "ii.s",
-                    )
+                    .build_int_compare(IntPredicate::EQ, tag, self.i64t.const_int(1, false), "ii.s")
                     .map_err(be)?;
                 let isbig = self.kind_test(f, argv[0], |s, header| {
                     let k = s
@@ -492,12 +495,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let tag = self.tag_of(argv[0])?;
                 let small = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::EQ,
-                        tag,
-                        self.i64t.const_int(1, false),
-                        "n.s",
-                    )
+                    .build_int_compare(IntPredicate::EQ, tag, self.i64t.const_int(1, false), "n.s")
                     .map_err(be)?;
                 let isf = self.kind_test(f, argv[0], |s, header| {
                     let k = s
@@ -541,12 +539,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         .build_or(k, s.i64t.const_int(8, false), "k2")
                         .map_err(be)?;
                     s.builder
-                        .build_int_compare(
-                            IntPredicate::EQ,
-                            k2,
-                            s.i64t.const_int(13, false),
-                            "k.b",
-                        )
+                        .build_int_compare(IntPredicate::EQ, k2, s.i64t.const_int(13, false), "k.b")
                         .map_err(be)
                 })?;
                 self.bool_term(c)
@@ -580,8 +573,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
         argv: &[IntValue<'ctx>],
     ) -> CgResult<Option<IntValue<'ctx>>> {
         let v: CgResult<IntValue<'ctx>> = match (name, argv.len()) {
-            ("term_to_binary", 1) | ("term_to_binary", 2)
-            | ("binary_to_term", 1) | ("binary_to_term", 2) => {
+            ("term_to_binary", 1)
+            | ("term_to_binary", 2)
+            | ("binary_to_term", 1)
+            | ("binary_to_term", 2) => {
                 let helper = if name == "term_to_binary" {
                     "mana_rt_term_to_binary"
                 } else {
@@ -863,10 +858,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                                 self.ctx_val().into(),
                                 argv[0].into(),
                                 self.i64t
-                                    .const_int(
-                                        (name == "binary_to_existing_atom") as u64,
-                                        false,
-                                    )
+                                    .const_int((name == "binary_to_existing_atom") as u64, false)
                                     .into(),
                             ],
                             "b2a",
@@ -936,12 +928,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let ti = self.tag_of(i)?;
                 let i_ok = self
                     .builder
-                    .build_int_compare(
-                        IntPredicate::EQ,
-                        ti,
-                        self.i64t.const_int(1, false),
-                        "el.i",
-                    )
+                    .build_int_compare(IntPredicate::EQ, ti, self.i64t.const_int(1, false), "el.i")
                     .map_err(be)?;
                 let is_tup = self.kind_test(f, t, |s, header| {
                     let k = s
@@ -1075,12 +1062,13 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let callee = self.rt_fn(fname, || {
                     let mut params: Vec<BasicMetadataTypeEnum> =
                         vec![BasicMetadataTypeEnum::PointerType(self.ptrt)];
-                    params.extend(
-                        (1..nargs).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)),
-                    );
+                    params.extend((1..nargs).map(|_| BasicMetadataTypeEnum::IntType(self.i64t)));
                     self.i64t.fn_type(&params, false)
                 });
-                let call = self.builder.build_call(callee, &args_ll, "rtb").map_err(be)?;
+                let call = self
+                    .builder
+                    .build_call(callee, &args_ll, "rtb")
+                    .map_err(be)?;
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
