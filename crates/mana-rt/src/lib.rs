@@ -68,7 +68,8 @@
 //! * `term.rs` holds tags, kinds, atoms, allocation primitives, and error
 //!   helpers.
 //! * `sched.rs` holds `ProcCtx`, processes, and schedulers. `gc.rs` holds
-//!   minor and major collection, and promotion.
+//!   minor and major collection, promotion, and the always-on heap checks.
+//!   `gc_verify.rs` holds the `MANA_GC_VERIFY` heap walk.
 //! * `signals.rs` holds links, monitors, and exit signals. `proc.rs` holds
 //!   the spawn, send, and receive primops, the process dictionary, and the
 //!   name registry.
@@ -110,6 +111,7 @@ mod etf;
 mod ets;
 mod file;
 mod gc;
+mod gc_verify;
 mod io;
 mod maps;
 mod native;
@@ -130,6 +132,7 @@ pub(crate) use convert::*;
 pub(crate) use ets::*;
 pub(crate) use file::*;
 pub(crate) use gc::*;
+pub(crate) use gc_verify::*;
 pub(crate) use io::*;
 pub(crate) use maps::*;
 pub(crate) use proc::*;

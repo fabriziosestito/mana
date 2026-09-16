@@ -58,7 +58,8 @@ Design pillars. Do not break them without a decision from the author.
   ProcCtx/GC contract.** Read them before you touch either side. Modules:
   - `term.rs` — tags, kinds, atoms, allocation primitives, error helpers.
   - `sched.rs` — `ProcCtx`, processes, schedulers. `gc.rs` — minor and
-    major collection, promotion.
+    major collection, promotion, the always-on checks. `gc_verify.rs` —
+    the `MANA_GC_VERIFY` heap walk.
   - `signals.rs` — links, monitors, exit signals. `proc.rs` — spawn,
     send, receive primops, process dictionary, name registry.
   - `arith.rs` — numbers (`bigint.rs` holds the limb math). `compare.rs`
@@ -139,7 +140,11 @@ examples. When you add a language feature, add a conformance program for it.
 
 Stress matrix for scheduler, GC, or mailbox changes: run the suite with
 `MANA_NURSERY_WORDS=512` and `4096`, each with `MANA_SCHEDULERS=2` and `8`.
-Run `MANA_CHECK_ANALYSIS=1` when you touch the effect analysis.
+The suite links the debug runtime, so evacuated memory is poisoned
+(`MANA_GC_POISON`) and a stale term aborts at the next collection. Add
+`MANA_GC_VERIFY=1` to one run of the matrix: it walks the whole reachable
+heap after every collection and finds a missed root at once. Run
+`MANA_CHECK_ANALYSIS=1` when you touch the effect analysis.
 
 Requirements: Rust stable (`rust-toolchain.toml`), LLVM 22 (`llvm-config` on
 PATH), Erlang/OTP (`erlc`) and Elixir (`mix`), a C compiler (`cc`).
@@ -238,21 +243,21 @@ pattern that every production runtime follows: a cheap check on a path the
 collector already runs is always on and aborts. A full heap walk is a knob,
 off by default, on in stress runs. Nobody ships the walk in release.
 
-1. `TODO(gc-checks)`: always-on cheap checks in the collector. This is Go's
-   default (`invalidptr=1`: the span must be in use and the pointer inside
-   `[base, limit)`, else `throw("found bad pointer in Go heap")`). Today
-   `forward_minor` and `forward_major` abort only on an impossible tag. Add,
-   where the collector already reads the header: the kind must be one of the
-   seven valid kinds, the size must be below the chunk size, and a nursery
-   or old pointer must land inside a live chunk. Abort with the word and the
-   owner pid. A few compares per object. Never a knob.
-2. `TODO(gc-poison)`: after a minor, fill the evacuated nursery with a
-   poison word whose tag is `0b101` (the sentinel), in the stress matrix
-   (`MANA_GC_POISON=1`) and in debug builds. Go `clobberfree`, HotSpot
-   `ZapUnusedHeapArea`, and SpiderMonkey zeal 14 all do this. Today a stale
-   pointer reads the old copy, which stays valid until the next allocation
-   overwrites it. That is why our bugs surfaced late. With poison, check 1
-   aborts at the first stale read.
+1. DONE (2026-09-05): always-on cheap checks in the collector, the
+   equivalent of Go's default `invalidptr=1` (`found bad pointer in Go
+   heap`). `checked_words` in `gc.rs` runs where the collector reads the
+   header of an object it copies: the kind must be one of the seven valid
+   kinds, and the object must end before the end of its space (nursery top,
+   or the from-space chunk end). Cons cells get the same bounds test. An
+   impossible tag aborts. `gc_abort` exits with code 70 and prints the
+   phase, the address, and the word. Never a knob.
+2. DONE (2026-09-05): `MANA_GC_POISON=1`, always on in debug builds. After
+   every collection the evacuated nursery, and the old from-space before it
+   is freed, are filled with `POISON` (`0xdeadbeefdeadbee5`: tag `0b101`,
+   kind byte `0xe5`). A stale pointer reads poison and check 1 aborts at the
+   next collection. Go `clobberfree`, HotSpot `ZapUnusedHeapArea`, and
+   SpiderMonkey zeal 14 do the same. The conformance suite runs with the
+   debug runtime, so it runs with poison on.
 3. `TODO(rooted-type)`: make "term held across an allocation" a compile
    error in `mana-rt`. Use the mozjs shape, not gc-arena's: allocation needs
    `&mut` on the heap handle, a raw term read borrows a `NoGc` witness from
@@ -265,10 +270,16 @@ off by default, on in stress runs. Nobody ships the walk in release.
    `ProcCtx` word offsets, `NREG`, opcode tables): a `mana-abi` crate that
    both `mana-rt` and `mana-codegen` depend on. Delete the second copy. A
    test that compares two copies is the fallback only.
-5. `TODO(heap-verify)`: a full verifier behind `MANA_GC_VERIFY=1` (Go
-   `gccheckmark`, HotSpot `VerifyAfterGC`, SpiderMonkey zeal 15). After
-   every collection, walk every reachable term from every root and check
-   each word. O(live heap), so off by default and on in the stress matrix.
+5. DONE (2026-09-05): `MANA_GC_VERIFY=1` (`gc_verify.rs`). After every
+   collection the runtime walks every reachable term from every root: after
+   a minor, from this ctx and every process homed on this scheduler (clean
+   or dirty, so it also checks the dirty-tracking invariant); after a major,
+   from every ctx, every process, and the eternal registry. It aborts when a
+   root reaches an evacuated nursery, on an invalid header kind, or on an
+   object that runs past its chunk. Validated by an injected missed dirty
+   flag: without the verifier the bug was a `function_clause` in another
+   process plus a hang, with it a `gc_abort` at the first collection. It
+   is O(live heap), so it is a knob. Run it in the stress matrix.
 6. `TODO(sanitizers)`: run the conformance suite under AddressSanitizer
    with corosensei's `sanitizer` Cargo feature (it exists for this). Run
    Miri on the GC and term helpers over synthetic heaps in unit tests. Miri
@@ -414,7 +425,14 @@ When asked to open a PR:
   Entries expire after 30 days unused, checked at most daily. Publishes are
   atomic renames, safe for concurrent compiles. The mix task keeps a
   cross-project CORE cache (`<user cache>/mana/cores/<elixir>-otp<otp>/`)
-  of dumped standard-library Core Erlang, keyed by beam mtime.
+  of dumped standard-library Core Erlang, keyed by beam mtime. Every dumped
+  core has a `.src` sidecar that names the beam it came from. A core is
+  fresh only if it is newer than that beam AND the path matches. Without
+  the path check, a dev-env `mix mana.compile --app` left dev cores (LiveView
+  debug annotations, `debug_errors: true`) in `_mana/`, and every later
+  mana-env build kept them, because the mana beams were older. The `--app`
+  conformance test failed for days before anyone ran it. The manifest warm
+  start re-checks each memoized core the same way.
 
 - **Release-style boot: `mix mana.compile --app`.** There are no
   hand-written entry modules. `Mana.Boot.generate!` precomputes what a BEAM
@@ -600,6 +618,11 @@ When asked to open a PR:
   **Never emit code that mutates the fields of an existing heap term** after
   construction. Change any of this only in lockstep across both crates, and
   run the GC stress program (`Conf.Gc`). `MANA_GC_LOG=1` prints collections.
+  `MANA_GC_POISON=1` fills evacuated memory with `POISON` after every
+  collection (always on in debug builds). `MANA_GC_VERIFY=1` walks the
+  reachable heap after every collection. The collector aborts with exit
+  code 70 on an invalid header kind, an object that runs past its space,
+  or an impossible tag (`gc_abort`).
 
 - **Tail calls are guaranteed (uniform ABI).** Every compiled function has
   the same LLVM prototype, `tailcc i64 f(ctx, x0..x4)`: the six x86-64

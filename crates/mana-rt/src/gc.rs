@@ -11,6 +11,68 @@ use super::*;
 
 // Promotion
 
+/// The poison word for evacuated memory. Its tag is `0b101` (the exception
+/// sentinel) and its low byte `0xe5` is not a valid kind, so a stale read of
+/// it aborts through the collector checks.
+pub(crate) const POISON: u64 = 0xdead_beef_dead_bee5;
+
+/// Every valid heap header kind. Kind 7 is `TAG_FORWARD` and must never
+/// appear as a kind.
+#[inline]
+pub(crate) fn valid_kind(header: u64) -> bool {
+    matches!(
+        header & 0xff,
+        KIND_TUPLE | KIND_FLOAT | KIND_FUN | KIND_BIGNUM | KIND_MAP | KIND_BIN | KIND_SUBBIN
+    )
+}
+
+/// The always-on check of a boxed object that the collector is about to copy.
+/// Returns the object size in words. Aborts if the header kind is invalid or
+/// if the object runs past `limit`, the end of the live part of its space.
+/// The check reads the header word that the copy needs anyway. A garbage
+/// header with a large size would otherwise copy memory past the chunk.
+#[inline]
+pub(crate) unsafe fn checked_words(phase: &str, p: *const u64, limit: *const u64) -> usize {
+    let header = unsafe { *p };
+    if !valid_kind(header) {
+        gc_abort(phase, p as u64, header, "invalid header kind");
+    }
+    let words = 1 + payload_words(header);
+    if unsafe { p.add(words) } > limit {
+        gc_abort(
+            phase,
+            p as u64,
+            header,
+            "object runs past the end of its space",
+        );
+    }
+    words
+}
+
+/// Abort with the bad word. Exit code 70 is the same one that the other
+/// runtime aborts use.
+pub(crate) fn gc_abort(phase: &str, addr: u64, word: u64, why: &str) -> ! {
+    eprintln!(
+        "mana: heap corruption during {}: {} (address {:#x}, word {:#x}). \
+         A runtime helper held a term across an allocation, or stored a young \
+         term into old space without promotion.",
+        phase, why, addr, word
+    );
+    std::process::exit(70)
+}
+
+/// Fill a range with `POISON`. Used by the stress knob `MANA_GC_POISON=1`
+/// and by debug builds after every evacuation.
+pub(crate) unsafe fn poison(start: *mut u64, end: *mut u64) {
+    let mut p = start;
+    while p < end {
+        unsafe {
+            *p = POISON;
+            p = p.add(1);
+        }
+    }
+}
+
 pub(crate) fn term_in_nursery(ctx: &ProcCtx, t: u64) -> bool {
     match t & TAG_MASK {
         TAG_CONS => in_my_nursery(ctx, t & !TAG_MASK),
@@ -280,7 +342,15 @@ pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
     }
     drop(old);
 
+    if g.gc_poison {
+        // Stale pointers into the evacuated nursery now read POISON and
+        // abort at the next collection instead of reading a plausible copy.
+        unsafe { poison(ctx.nursery_start, ctx.heap_top) };
+    }
     ctx.heap_top = ctx.nursery_start;
+    if g.gc_verify {
+        verify_after_minor(ctx);
+    }
     let promoted = g.old_used.load(Ordering::Relaxed) - used_before;
     if g.gc_log {
         eprintln!(
@@ -346,6 +416,14 @@ pub(crate) unsafe fn forward_minor(
                 return t;
             }
             let p = addr as *mut u64;
+            if p.add(2) > ctx.heap_top {
+                gc_abort(
+                    "minor collection",
+                    addr,
+                    *p,
+                    "cons cell past the nursery top",
+                );
+            }
             if *p & TAG_MASK == TAG_FORWARD {
                 return (*p & !TAG_MASK) | TAG_CONS;
             }
@@ -365,7 +443,7 @@ pub(crate) unsafe fn forward_minor(
             if *p & TAG_MASK == TAG_FORWARD {
                 return *p & !TAG_MASK;
             }
-            let words = 1 + payload_words(*p);
+            let words = checked_words("minor collection", p, ctx.heap_top);
             let new = old.alloc(words, &ctx.global.old_used);
             std::ptr::copy_nonoverlapping(p, new, words);
             *p = new as u64 | TAG_FORWARD;
@@ -373,10 +451,7 @@ pub(crate) unsafe fn forward_minor(
             worklist.push(nt);
             nt
         },
-        _ => {
-            eprintln!("mana: invalid term {:#x} during minor collection", t);
-            std::process::exit(70);
-        }
+        _ => gc_abort("minor collection", t, t, "invalid term tag"),
     }
 }
 
@@ -529,6 +604,9 @@ pub(crate) fn major_collect_stw(ctx: &mut ProcCtx) {
             });
         }
         for chunk in old.chunks.iter() {
+            if g.gc_poison {
+                poison(chunk.start, chunk.top);
+            }
             free_space(chunk.start, chunk.words);
         }
     }
@@ -543,6 +621,9 @@ pub(crate) fn major_collect_stw(ctx: &mut ProcCtx) {
     g.old_used.store(live, Ordering::Relaxed);
     g.old_limit
         .store(usize::max(4 * live, OLD_LIMIT_INIT), Ordering::Relaxed);
+    if g.gc_verify {
+        verify_after_major(g, &old);
+    }
     if g.gc_log {
         eprintln!(
             "mana: major gc, {} -> {} live words (limit {})",
@@ -567,17 +648,29 @@ pub(crate) unsafe fn forward_major(
     if t == 0 {
         return 0;
     }
-    let in_from = |p: u64| {
+    // The end of the from-space chunk that holds `p`, or None when `p` is
+    // outside every from-space chunk.
+    let from_end = |p: u64| {
         let a = p as usize;
-        from.iter().any(|&(s, e)| a >= s && a < e)
+        from.iter()
+            .find(|&&(s, e)| a >= s && a < e)
+            .map(|&(_, e)| e as *const u64)
     };
     match t & TAG_MASK {
         TAG_SMALL | TAG_ATOM | TAG_PID => t,
         _ if t == NIL => t,
         TAG_CONS => unsafe {
             let p = (t & !TAG_MASK) as *mut u64;
-            if !in_from(p as u64) {
+            let Some(end) = from_end(p as u64) else {
                 return t;
+            };
+            if p.add(2) > end as *mut u64 {
+                gc_abort(
+                    "major collection",
+                    p as u64,
+                    *p,
+                    "cons cell past the end of its chunk",
+                );
             }
             if *p & TAG_MASK == TAG_FORWARD {
                 return (*p & !TAG_MASK) | TAG_CONS;
@@ -593,13 +686,13 @@ pub(crate) unsafe fn forward_major(
         },
         TAG_BOXED => unsafe {
             let p = t as *mut u64;
-            if !in_from(p as u64) {
+            let Some(end) = from_end(p as u64) else {
                 return t;
-            }
+            };
             if *p & TAG_MASK == TAG_FORWARD {
                 return *p & !TAG_MASK;
             }
-            let words = 1 + payload_words(*p);
+            let words = checked_words("major collection", p, end);
             let new = *top;
             std::ptr::copy_nonoverlapping(p, new, words);
             *top = top.add(words);
@@ -608,9 +701,33 @@ pub(crate) unsafe fn forward_major(
             worklist.push(nt);
             nt
         },
-        _ => {
-            eprintln!("mana: invalid term {:#x} during major collection", t);
-            std::process::exit(70);
+        _ => gc_abort("major collection", t, t, "invalid term tag"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poison_is_never_a_valid_term_or_header() {
+        assert_eq!(POISON & TAG_MASK, EXC_SENTINEL);
+        assert!(!valid_kind(POISON));
+    }
+
+    #[test]
+    fn forward_tag_is_not_a_kind() {
+        assert!(!valid_kind(TAG_FORWARD));
+        for k in [
+            KIND_TUPLE,
+            KIND_FLOAT,
+            KIND_FUN,
+            KIND_BIGNUM,
+            KIND_MAP,
+            KIND_BIN,
+            KIND_SUBBIN,
+        ] {
+            assert!(valid_kind(k));
         }
     }
 }
