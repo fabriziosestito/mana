@@ -152,14 +152,29 @@ defmodule Mix.Tasks.Mana.Compile do
     # locate_and_dump.
     have = MapSet.new(cores, &core_module/1)
 
+    # A memoized core must still match its beam. The `.src` sidecar names the
+    # beam it was dumped from. A core without a sidecar, or whose beam is
+    # gone, is dropped here and comes back through the chase if it is needed.
     {cores, have} =
       Enum.reduce(read_manifest(out), {cores, have}, fn core, {cs, hv} ->
         m = core_module(core)
 
-        if MapSet.member?(hv, m) or not File.exists?(core) do
-          {cs, hv}
-        else
-          {cs ++ [core], MapSet.put(hv, m)}
+        cond do
+          MapSet.member?(hv, m) or not File.exists?(core) ->
+            {cs, hv}
+
+          match?({:ok, beam} when beam != "", File.read(core <> ".src")) ->
+            {:ok, beam} = File.read(core <> ".src")
+
+            if File.exists?(beam) do
+              dump_if_stale(beam, core)
+              {cs ++ [core], MapSet.put(hv, m)}
+            else
+              {cs, hv}
+            end
+
+          true ->
+            {cs, hv}
         end
       end)
 
@@ -457,16 +472,25 @@ defmodule Mix.Tasks.Mana.Compile do
     end
   end
 
-  # Core dumps are pure functions of the beam. Skip the dump when the core is
-  # newer.
+  # A core dump is a pure function of the beam. Skip the dump when the core
+  # is newer than the beam AND came from the same beam path. The path check
+  # matters: the same module is compiled once per Mix env, under
+  # `_build/<env>/`, with different compile-time config (LiveView debug
+  # annotations, `debug_errors`). A dev-env build left dev cores in `_mana/`
+  # once, and the mtime test alone kept them for every later mana-env build.
   defp dump_if_stale(beam, core) do
+    src = core <> ".src"
+
     fresh? =
-      case {File.stat(core, time: :posix), File.stat(beam, time: :posix)} do
-        {{:ok, %{mtime: c}}, {:ok, %{mtime: b}}} -> c >= b
+      case {File.stat(core, time: :posix), File.stat(beam, time: :posix), File.read(src)} do
+        {{:ok, %{mtime: c}}, {:ok, %{mtime: b}}, {:ok, from}} -> c >= b and from == beam
         _ -> false
       end
 
-    unless fresh?, do: Mana.CoreDump.dump!(beam, core)
+    unless fresh? do
+      Mana.CoreDump.dump!(beam, core)
+      File.write!(src, beam)
+    end
   end
 
   defp core_module(core), do: Path.basename(core, ".core")
