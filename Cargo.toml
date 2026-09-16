@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/mana-abi",
     "crates/mana-syntax",
     "crates/mana-codegen",
     "crates/mana-rt",

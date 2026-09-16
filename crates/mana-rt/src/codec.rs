@@ -8,18 +8,6 @@
 
 use super::*;
 
-pub const C_RAND: u64 = 0;
-
-pub const C_HASH: u64 = 1;
-
-pub const C_MAC: u64 = 2;
-
-pub const C_EXOR: u64 = 3;
-
-pub const C_PBKDF2: u64 = 4;
-
-pub(crate) const C_HASH_EQUALS: u64 = 5;
-
 pub(crate) fn crypto_bin_arg(t: u64) -> Result<Vec<u8>, ()> {
     let mut out = Vec::new();
     iolist_flatten(t, &mut out).map(|_| out)

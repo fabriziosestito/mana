@@ -8,6 +8,7 @@ license.workspace = true
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+mana-abi = { path = "../mana-abi" }
 corosensei = "0.3"
 crossbeam-queue = "0.3.13"
 getrandom = "0.2"

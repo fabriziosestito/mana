@@ -106,16 +106,16 @@ pub(crate) unsafe fn call_fun_code(
     fun_term: u64,
 ) -> u64 {
     let n = argv.len() + 1; // The extra word is the trailing closure.
-    let mut x = [0u64; ABI_REGS];
-    if n <= ABI_REGS {
+    let mut x = [0u64; NREG];
+    if n <= NREG {
         x[..argv.len()].copy_from_slice(argv);
         x[argv.len()] = fun_term;
     } else {
-        // Arguments 0..ABI_REGS-2 go in registers. The rest, with the
+        // Arguments 0..NREG-2 go in registers. The rest, with the
         // closure, go to the spill area.
-        x[..ABI_REGS - 1].copy_from_slice(&argv[..ABI_REGS - 1]);
+        x[..NREG - 1].copy_from_slice(&argv[..NREG - 1]);
         let spill = unsafe { (*ctx).argv_spill };
-        let rest: Vec<u64> = argv[ABI_REGS - 1..]
+        let rest: Vec<u64> = argv[NREG - 1..]
             .iter()
             .copied()
             .chain(std::iter::once(fun_term))

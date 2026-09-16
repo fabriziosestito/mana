@@ -1,0 +1,8 @@
+[package]
+name = "mana-abi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The constants that the mana compiler and the mana runtime share"
+
+[dependencies]

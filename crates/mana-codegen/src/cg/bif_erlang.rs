@@ -22,15 +22,15 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 // runtime slow path. Floats box without a GC (see
                 // box_float), so this call is NOT a may-gc site.
                 let opcode = match name {
-                    "+" => 0u64, // AR_ADD
-                    "-" => 1,    // AR_SUB
-                    "*" => 2,    // AR_MUL
-                    "div" => 4,  // AR_IDIV (slow path = badarith)
-                    _ => 5,      // AR_REM
+                    "+" => AR_ADD,
+                    "-" => AR_SUB,
+                    "*" => AR_MUL,
+                    "div" => AR_IDIV, // the slow path raises badarith
+                    _ => AR_REM,
                 };
                 self.arith_fastslow(f, name, opcode, argv[0], Some(argv[1]))
             }
-            ("-", 1) => self.arith_fastslow(f, "neg", 6, argv[0], None),
+            ("-", 1) => self.arith_fastslow(f, "neg", AR_NEG, argv[0], None),
             ("+", 1) => {
                 // +X returns a number unchanged. Any other term raises badarith.
                 let both = self.small_test(argv[0], None)?;
@@ -170,7 +170,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                         self.rt_arith(),
                         &[
                             self.ctx_val().into(),
-                            self.i64t.const_int(3, false).into(), // AR_FDIV
+                            self.i64t.const_int(AR_FDIV, false).into(),
                             argv[0].into(),
                             argv[1].into(),
                         ],
@@ -182,17 +182,17 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             ("band", 2) | ("bor", 2) | ("bxor", 2) => {
                 let opcode = match name {
-                    "band" => 8u64, // AR_BAND
-                    "bor" => 9,     // AR_BOR
-                    _ => 10,        // AR_BXOR
+                    "band" => AR_BAND,
+                    "bor" => AR_BOR,
+                    _ => AR_BXOR,
                 };
                 self.arith_fastslow(f, name, opcode, argv[0], Some(argv[1]))
             }
-            ("bnot", 1) => self.arith_fastslow(f, "bnot", 13, argv[0], None),
+            ("bnot", 1) => self.arith_fastslow(f, "bnot", AR_BNOT, argv[0], None),
             ("bsl", 2) | ("bsr", 2) => {
                 // Shifts have no inline fast path. The runtime holds the
                 // shift rules: negative amounts and the 61-bit overflow abort.
-                let opcode = if name == "bsl" { 11u64 } else { 12 }; // AR_BSL/AR_BSR
+                let opcode = if name == "bsl" { AR_BSL } else { AR_BSR };
                 let call = self
                     .builder
                     .build_call(
@@ -223,10 +223,10 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
             }
             ("trunc", 1) | ("round", 1) | ("floor", 1) | ("ceil", 1) => {
                 let mode = match name {
-                    "trunc" => 0u64,
-                    "round" => 1,
-                    "floor" => 2,
-                    _ => 3,
+                    "trunc" => F2I_TRUNC,
+                    "round" => F2I_ROUND,
+                    "floor" => F2I_FLOOR,
+                    _ => F2I_CEIL,
                 };
                 let call = self
                     .builder
@@ -289,7 +289,7 @@ impl<'ctx, 'p> Cg<'ctx, 'p> {
                 let v = call_result(call)?.into_int_value();
                 self.check_exc(f, v)
             }
-            ("abs", 1) => self.arith_fastslow(f, "abs", 7, argv[0], None),
+            ("abs", 1) => self.arith_fastslow(f, "abs", AR_ABS, argv[0], None),
             ("min", 2) | ("max", 2) => {
                 let call = self
                     .builder

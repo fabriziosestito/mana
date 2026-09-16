@@ -195,33 +195,6 @@ pub(crate) fn abort_bignum(what: &str) -> ! {
 }
 
 // Arithmetic opcodes for mana_rt_arith.
-pub const AR_ADD: u64 = 0;
-
-pub const AR_SUB: u64 = 1;
-
-pub const AR_MUL: u64 = 2;
-
-pub const AR_FDIV: u64 = 3;
-
-pub const AR_IDIV: u64 = 4;
-
-pub const AR_REM: u64 = 5;
-
-pub const AR_NEG: u64 = 6;
-
-pub const AR_ABS: u64 = 7;
-
-pub const AR_BAND: u64 = 8;
-
-pub const AR_BOR: u64 = 9;
-
-pub const AR_BXOR: u64 = 10;
-
-pub const AR_BSL: u64 = 11;
-
-pub const AR_BSR: u64 = 12;
-
-pub const AR_BNOT: u64 = 13;
 
 /// Signed magnitude addition: (na, ma) + (nb, mb).
 pub(crate) fn int_signed_add(na: bool, ma: &[u64], nb: bool, mb: &[u64]) -> (bool, Vec<u64>) {
