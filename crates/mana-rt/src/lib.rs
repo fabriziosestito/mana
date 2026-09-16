@@ -3,6 +3,9 @@
 //!
 //! # Term representation (contract with mana-codegen)
 //!
+//! The numbers below live in the `mana-abi` crate, which this crate and the
+//! compiler both re-export. This table is the explanation, not the source.
+//!
 //! A term is one 64-bit word. The low 3 bits are the primary tag:
 //!
 //! | tag   | meaning                                                        |

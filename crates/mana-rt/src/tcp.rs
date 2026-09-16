@@ -242,13 +242,6 @@ pub(crate) fn clear_waiter(idx: usize, pid: usize, want_read: bool) {
 }
 
 // TCP op codes. The codegen compile dispatch mirrors these values.
-pub const T_CONNECT: u64 = 0;
-
-pub const T_LISTEN: u64 = 1;
-
-pub const T_ACCEPT: u64 = 2;
-
-pub const T_RECV: u64 = 3;
 
 /// file:sendfile/5 (RawFile, Socket, Offset, Bytes, _Opts). Reads the file at
 /// an offset and sends with a parking send loop. Bytes == 0 streams to EOF.
@@ -360,26 +353,6 @@ pub extern "C" fn mana_rt_sendfile(
     }
     t as u64
 }
-
-pub const T_SEND: u64 = 4;
-
-pub const T_CLOSE: u64 = 5;
-
-pub const T_SHUTDOWN: u64 = 6;
-
-pub const T_SETOPTS: u64 = 7;
-
-pub const T_PEERNAME: u64 = 8;
-
-pub const T_SOCKNAME: u64 = 9;
-
-pub const T_PORT: u64 = 10;
-
-pub const T_CONTROLLING: u64 = 11;
-
-pub const T_GETSTAT: u64 = 12;
-
-pub const T_GETOPTS: u64 = 13;
 
 pub(crate) fn addr_tuple(ctx: &mut ProcCtx, addr: std::net::SocketAddr) -> u64 {
     let small = |v: i64| ((v << 3) as u64) | TAG_SMALL;

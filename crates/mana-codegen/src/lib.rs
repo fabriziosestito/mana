@@ -7,8 +7,8 @@
 //!
 //! # Modules
 //!
-//! `lib.rs` holds the `Cg` struct, the term constants that mirror the
-//! runtime, and shared small types. `driver.rs` holds `compile_program`, the
+//! `lib.rs` holds the `Cg` struct, the re-export of the shared `mana-abi`
+//! constants, and shared small types. `driver.rs` holds `compile_program`, the
 //! object cache, and the action key. `effects.rs` holds the may-GC and
 //! may-raise analysis and its condensers. `reach.rs` holds reachability, the
 //! BIF module list, and the native manifest. `summary.rs` holds the analysis
@@ -106,55 +106,21 @@ pub struct ModuleUnit {
     pub ast: Option<Module>,
 }
 
-pub(crate) const TAG_SMALL: u64 = 0b001;
-
-pub(crate) const TAG_ATOM: u64 = 0b010;
-
-pub(crate) const NIL: u64 = 0b011;
-
-pub(crate) const TAG_CONS: u64 = 0b100;
-
-pub(crate) const TAG_MASK: u64 = 0b111;
-
-pub(crate) const KIND_TUPLE: u64 = 0;
-
-pub(crate) const KIND_FLOAT: u64 = 1;
-
-pub(crate) const KIND_FUN: u64 = 2;
-
-pub(crate) const KIND_MAP: u64 = 4;
-
-pub(crate) const KIND_BIN: u64 = 5;
-
-pub(crate) const KIND_SUBBIN: u64 = 13;
-
-/// ctx word offsets (the ProcCtx contract).
-pub(crate) const CTX_ROOTS: u64 = 2;
-
-pub(crate) const CTX_EXC_CLASS: u64 = 3;
-
-pub(crate) const CTX_EXC_REASON: u64 = 4;
-
-pub(crate) const CTX_REDUCTIONS: u64 = 5;
-
-/// Word 6: pointer to the per-scheduler argument spill area (uniform ABI).
-pub(crate) const CTX_ARGV_SPILL: u64 = 6;
-
-/// Uniform compiled-function signature: `ctx` + NREG term words. The value
-/// of NREG makes the ABI pass EVERY parameter in a register on x86-64 SysV
-/// (6 integer registers: ctx + 5). Every compiled function has exactly this
-/// LLVM prototype. So a `musttail` never needs stack argument space. This
-/// avoids both tailcc pitfalls that we hit. Pitfall (1): callee-cleanup
-/// popped more than a C entry reserved when the chain grew. Pitfall (2):
-/// the x86 backend emitted a bare `jmp` without a store of a constant stack
-/// argument (`c5(a,b,c,d,e) -> a6(a,b,c,d,e,[])` compiled to `jmp a6`).
-/// Arity > NREG passes args NREG-1.. through the ctx spill area. The caller
-/// writes them right before the call. The callee prologue reads them before
-/// anything else runs.
-pub(crate) const NREG: usize = 5;
-
-/// Reserved non-term word (tag 0b101). It means "an exception is unwinding".
-pub(crate) const EXC_SENTINEL: u64 = 0b101;
+/// Term tags, kinds, `ProcCtx` word offsets, `NREG`, the exception
+/// sentinel, and the runtime opcode tables. One source, shared with the
+/// runtime through the `mana-abi` crate.
+///
+/// `NREG` makes the uniform prototype `tailcc i64 f(ctx, x0..x4)` pass EVERY
+/// parameter in a register on x86-64 SysV (6 integer registers: ctx + 5). So
+/// a `musttail` never needs stack argument space. This avoids both tailcc
+/// pitfalls that we hit. Pitfall (1): callee-cleanup popped more than a C
+/// entry reserved when the chain grew. Pitfall (2): the x86 backend emitted
+/// a bare `jmp` without a store of a constant stack argument
+/// (`c5(a,b,c,d,e) -> a6(a,b,c,d,e,[])` compiled to `jmp a6`). Arity > NREG
+/// passes args NREG-1.. through the ctx spill area. The caller writes them
+/// right before the call. The callee prologue reads them before anything
+/// else runs.
+pub(crate) use mana_abi::*;
 
 pub(crate) type CgResult<T> = Result<T, String>;
 

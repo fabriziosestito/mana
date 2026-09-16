@@ -26,13 +26,16 @@ Design pillars. Do not break them without a decision from the author.
 
 ## Layout
 
+- `crates/mana-abi/` — the constants that the compiler and the runtime
+  share: tags, kinds, `ProcCtx` word offsets, `NREG`, the sentinel, opcode
+  tables. No dependencies, `no_std`.
 - `crates/mana-syntax/` — lexer, parser, and AST for Core Erlang **as
   `erlc +to_core` prints it** (annotations `-| [...]`, annotated clauses,
   `%%` comments), not only the specification grammar.
 - `crates/mana-codegen/` — LLVM codegen with inkwell (feature `llvm22-1`,
   needs system LLVM 22). Modules:
-  - `lib.rs` — the `Cg` struct, the term constants that mirror the runtime,
-    shared small types.
+  - `lib.rs` — the `Cg` struct, the re-export of `mana-abi`, shared small
+    types.
   - `driver.rs` — `compile_program`, the object cache, the action key.
   - `effects.rs` — the may-GC and may-raise analysis and its condensers.
   - `reach.rs` — reachability, BIF module list, native manifest.
@@ -107,9 +110,13 @@ Kind 7 is forbidden. `ProcCtx` words 0 to 6 are fixed: `heap_top`,
 `heap_end`, `roots_head`, `exc_class`, `exc_reason`, `reductions`,
 `argv_spill`.
 
-`crates/mana-rt/src/term.rs` and the constants at the top of
-`crates/mana-codegen/src/lib.rs` encode this **twice**. If you change one,
-change the other in the same commit. Then run the end-to-end checks below.
+These constants live ONCE, in `crates/mana-abi/src/lib.rs`, together with
+the `ProcCtx` word offsets, `NREG`, the exception sentinel, and the opcode
+tables of the runtime entry points (`AR_*`, `M_*`, `F2I_*`, `C_*`, `F_*`,
+`T_*`). `mana-rt`, `mana-codegen`, and `mana-native` re-export that crate.
+Never write one of these numbers as a literal in codegen or in the runtime.
+Use the name. A change to `mana-abi` changes the emitted code and the
+runtime in one commit. Then run the end-to-end checks below.
 
 ## Build, test, verify
 
@@ -266,10 +273,11 @@ off by default, on in stress runs. Nobody ships the walk in release.
    half (`Env`, `H`). Start with the helpers that allocate more than once
    (maps, ets, etf, decode_packet). Wasmtime's `Rooted<T>`/`RootScope` is
    the same LIFO frame idea, but it reports misuse at run time.
-4. `TODO(abi-consts)`: one source for the mirrored constants (tags, kinds,
-   `ProcCtx` word offsets, `NREG`, opcode tables): a `mana-abi` crate that
-   both `mana-rt` and `mana-codegen` depend on. Delete the second copy. A
-   test that compares two copies is the fallback only.
+4. DONE (2026-09-16): the `mana-abi` crate is the one source of the tags,
+   kinds, `ProcCtx` word offsets, `NREG`, the sentinel, and the opcode
+   tables. `mana-rt`, `mana-codegen`, and `mana-native` re-export it. The
+   three copies and the bare opcode numbers in codegen are gone. Checked
+   by byte-identical IR on 316 modules before and after.
 5. DONE (2026-09-05): `MANA_GC_VERIFY=1` (`gc_verify.rs`). After every
    collection the runtime walks every reachable term from every root: after
    a minor, from this ctx and every process homed on this scheduler (clean

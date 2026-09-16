@@ -6,69 +6,9 @@
 
 use super::*;
 
-pub const TAG_MASK: u64 = 0b111;
-
-pub const TAG_BOXED: u64 = 0b000;
-
-pub const TAG_SMALL: u64 = 0b001;
-
-pub const TAG_ATOM: u64 = 0b010;
-
-pub const NIL: u64 = 0b011;
-
-pub const TAG_CONS: u64 = 0b100;
-
-/// Identifier class. Bit 3 selects the kind: a pid is `id<<4|0110`, a ref
-/// is `id<<4|1110`. Both are immediates. Raw-word equality compares them,
-/// and the GC does not touch them.
-pub const TAG_PID: u64 = 0b110;
-
-pub const PID_TAG4: u64 = 0b0110;
-
-pub const REF_TAG4: u64 = 0b1110;
-
-pub const TAG_FORWARD: u64 = 0b111;
-
-/// This value must match the exception sentinel of mana-codegen (tag 0b101).
-pub(crate) const EXC_SENTINEL: u64 = 0b101;
-
-pub const KIND_TUPLE: u64 = 0;
-
-pub const KIND_FLOAT: u64 = 1;
-
-/// Fun object: `[header | code_ptr | captured terms...]`.
-/// Header layout: bits 0-7 hold the kind, bits 8-15 hold the arity, and
-/// bits 16 and up hold the number of captures.
-pub const KIND_FUN: u64 = 2;
-
-/// Flatmap: `[header(size<<8|4) | k1..kn | v1..vn]`. The keys are sorted in
-/// canonical term order. Exactness breaks ties: 1 sorts before 1.0.
-pub const KIND_MAP: u64 = 4;
-
-pub const KIND_BIN: u64 = 5;
-
-/// Real bignum: `[header(limbs<<9 | sign<<8 | 3) | limbs (LE u64)...]`.
-/// The value is normalized: it never fits the 61-bit small range, and it
-/// has no leading zero limbs. A set sign bit means negative. The runtime
-/// allocates bignums in the SHARED OLD SPACE with alloc_shared. That
-/// allocation is a pure bump and never a GC point, so arithmetic keeps its
-/// no-frame fast paths. A bignum has no term fields. The GC copies the
-/// limbs verbatim.
-pub const KIND_BIGNUM: u64 = 3;
-
-/// Sub-binary view: `[header(len<<8|13) | parent_term | byte_offset]`. It
-/// is a zero-copy slice of a ROOT KIND_BIN, never of another view. A slice
-/// of a view folds the offsets.
-///
-/// The header convention is the same as KIND_BIN, so the inline length
-/// preflight works for both. Kinds 5 (0b0101) and 13 (0b1101) differ only
-/// in bit 3, so `(kind | 8) == 13` accepts either. Kind 7 is FORBIDDEN for
-/// heap objects: header low bits 0b111 collide with the TAG_FORWARD marker
-/// of the GC.
-///
-/// The parent is a TERM and moves under GC. Every access recomputes the
-/// data pointer. The pointer is never cached.
-pub const KIND_SUBBIN: u64 = 13;
+// The tags, kinds, ProcCtx offsets, and opcodes are the compiler contract.
+// They live once, in the `mana-abi` crate.
+pub use mana_abi::*;
 
 pub(crate) const NURSERY_WORDS: usize = 16 * 1024; // 128 KiB
 
@@ -97,13 +37,6 @@ pub(crate) const STACK_BYTES: usize = 256 * 1024 * 1024; // TODO(stacks): make t
 pub(crate) const ROOT_STACK_BYTES: usize = 512 * 1024 * 1024;
 
 pub(crate) const REDUCTIONS_PER_SLICE: i64 = 4000;
-
-/// Uniform compiled ABI: every call passes `ctx + ABI_REGS` term words.
-/// Arguments past ABI_REGS-1 travel through `ProcCtx::argv_spill` (see
-/// codegen NREG).
-pub(crate) const ABI_REGS: usize = 5;
-
-pub(crate) const ARGV_SPILL_WORDS: usize = 64;
 
 // Memory primitives
 

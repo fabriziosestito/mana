@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mana-abi = { path = "../mana-abi" }
 mana-syntax = { path = "../mana-syntax" }
 inkwell = { version = "0.10", features = ["llvm22-1"] }
 rayon = "1.12.0"

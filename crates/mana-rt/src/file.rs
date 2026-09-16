@@ -184,39 +184,6 @@ pub(crate) fn civil_datetime(ctx: &mut ProcCtx, secs: i64) -> u64 {
 }
 
 // File op codes. The codegen function compile_file_bif mirrors these values.
-pub const F_READ_FILE: u64 = 0;
-
-pub const F_WRITE_FILE: u64 = 1;
-
-pub const F_WRITE_FILE3: u64 = 2;
-
-pub const F_OPEN: u64 = 3;
-
-pub const F_CLOSE: u64 = 4;
-
-pub const F_READ: u64 = 5;
-
-pub const F_WRITE: u64 = 6;
-
-pub const F_POSITION: u64 = 7;
-
-pub const F_DELETE: u64 = 8;
-
-pub const F_RENAME: u64 = 9;
-
-pub const F_MAKE_DIR: u64 = 10;
-
-pub const F_DEL_DIR: u64 = 11;
-
-pub const F_LIST_DIR: u64 = 12;
-
-pub const F_FILE_INFO: u64 = 13;
-
-pub const F_FILE_INFO2: u64 = 14;
-
-pub const F_COPY: u64 = 15;
-
-pub const F_GET_CWD: u64 = 16;
 
 #[no_mangle]
 pub extern "C" fn mana_rt_file(ctx: *mut ProcCtx, op: u64, a: u64, b: u64, c: u64) -> u64 {

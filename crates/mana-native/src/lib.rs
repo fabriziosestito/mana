@@ -28,20 +28,9 @@ pub struct ProcCtx {
     _private: [u64; 0],
 }
 
-// Tag and kind constants. They must match crates/mana-rt/src/lib.rs.
-pub const TAG_MASK: u64 = 0b111;
-pub const TAG_BOXED: u64 = 0b000;
-pub const TAG_SMALL: u64 = 0b001;
-pub const TAG_ATOM: u64 = 0b010;
-pub const NIL: u64 = 0b011;
-pub const TAG_CONS: u64 = 0b100;
-
-pub const KIND_TUPLE: u64 = 0;
-pub const KIND_FLOAT: u64 = 1;
-pub const KIND_BIGNUM: u64 = 3;
-pub const KIND_MAP: u64 = 4;
-pub const KIND_BIN: u64 = 5;
-pub const KIND_SUBBIN: u64 = 13;
+// The term tags, kinds, and the exception sentinel come from the shared
+// `mana-abi` crate, the same source that the compiler and the runtime use.
+pub use mana_abi::*;
 
 extern "C" {
     fn mana_rt_native_alloc(ctx: *mut ProcCtx, words: u64) -> *mut u64;
@@ -55,10 +44,6 @@ extern "C" {
     fn mana_rt_native_int_decimal(t: u64, out: *mut u8, cap: usize) -> usize;
     fn mana_rt_map_from_list(ctx: *mut ProcCtx, list: u64) -> u64;
 }
-
-/// The sentinel that a native fn returns to unwind (raise). It must match
-/// codegen.
-pub const EXC_SENTINEL: u64 = 0b101;
 
 /// Raise `badarg`. Return the result of this call to unwind out of the
 /// native fn.

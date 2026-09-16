@@ -11,3 +11,4 @@ license.workspace = true
 crate-type = ["rlib"]
 
 [dependencies]
+mana-abi = { path = "../mana-abi" }

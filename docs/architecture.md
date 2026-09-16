@@ -62,6 +62,12 @@ seeds extra roots:
 
 ## Term representation
 
+The compiler and the runtime agree on the term layout through one crate,
+`mana-abi`. It holds the tags, the object kinds, the `ProcCtx` word offsets,
+the register count of the calling convention, and the opcode tables of the
+runtime entry points. Both sides re-export it, so a number exists in one
+place.
+
 A term is one 64-bit word. The low 3 bits are the tag:
 
 | tag   | meaning |
