@@ -183,6 +183,14 @@ pointer reading a plausible old copy that fails much later. The stress
 matrix (`MANA_NURSERY_WORDS=512`, a collection at almost every allocation)
 runs with poison on.
 
+A second knob, `MANA_GC_VERIFY=1`, walks the whole reachable heap after
+every collection and aborts when a root still reaches an evacuated
+nursery, when a header kind is invalid, or when an object runs past its
+chunk. This finds a missed root at the collection that missed it. It costs
+O(live heap) per collection, so it is off by default, like the verifiers
+of Go (`gccheckmark`), HotSpot (`VerifyAfterGC`), and SpiderMonkey (zeal
+mode 15).
+
 The invariants that these checks catch, and the remaining gaps against the
 Go runtime, are listed in `AGENTS.md`, section "Memory safety".
 

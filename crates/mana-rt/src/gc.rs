@@ -348,6 +348,9 @@ pub(crate) fn minor_collect(ctx: &mut ProcCtx) -> usize {
         unsafe { poison(ctx.nursery_start, ctx.heap_top) };
     }
     ctx.heap_top = ctx.nursery_start;
+    if g.gc_verify {
+        verify_after_minor(ctx);
+    }
     let promoted = g.old_used.load(Ordering::Relaxed) - used_before;
     if g.gc_log {
         eprintln!(
@@ -618,6 +621,9 @@ pub(crate) fn major_collect_stw(ctx: &mut ProcCtx) {
     g.old_used.store(live, Ordering::Relaxed);
     g.old_limit
         .store(usize::max(4 * live, OLD_LIMIT_INIT), Ordering::Relaxed);
+    if g.gc_verify {
+        verify_after_major(g, &old);
+    }
     if g.gc_log {
         eprintln!(
             "mana: major gc, {} -> {} live words (limit {})",

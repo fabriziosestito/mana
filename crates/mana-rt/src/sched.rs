@@ -147,6 +147,8 @@ pub(crate) struct Global {
     /// Poison evacuated memory after every collection. On with
     /// `MANA_GC_POISON=1`, and always on in debug builds.
     pub(crate) gc_poison: bool,
+    /// Walk the whole reachable heap after every collection (`MANA_GC_VERIFY=1`).
+    pub(crate) gc_verify: bool,
 }
 
 #[repr(C)]
@@ -222,6 +224,7 @@ pub extern "C" fn mana_rt_init() -> *mut ProcCtx {
         shutdown: AtomicBool::new(false),
         gc_log: std::env::var_os("MANA_GC_LOG").is_some(),
         gc_poison: cfg!(debug_assertions) || std::env::var_os("MANA_GC_POISON").is_some(),
+        gc_verify: std::env::var_os("MANA_GC_VERIFY").is_some(),
     }));
     new_sched_ctx(global, 0)
 }
